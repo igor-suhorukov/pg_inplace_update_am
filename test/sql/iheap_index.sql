@@ -2,8 +2,9 @@
 -- Indexes: which updates stay in place, index builds, scans
 --
 CREATE TABLE ix (id int PRIMARY KEY, k int, tag text, doc jsonb, rng int4range,
-                 extra text, b int) USING iheap;
-CREATE INDEX ix_k ON ix (k);
+                 extra text, b int, dk int) USING iheap;
+CREATE INDEX ix_k ON ix USING btree (k);
+CREATE INDEX ix_dk ON ix USING dmbtree (dk);
 CREATE INDEX ix_tag_hash ON ix USING hash (tag);
 CREATE INDEX ix_doc ON ix USING gin (doc);
 CREATE INDEX ix_rng ON ix USING gist (rng);
@@ -13,7 +14,7 @@ CREATE INDEX ix_expr ON ix (lower(tag));
 
 INSERT INTO ix
 SELECT g, g % 50, 'Tag' || (g % 20), jsonb_build_object('a', g % 7, 'b', 'x'),
-       int4range(g, g + 10), NULL, g
+       int4range(g, g + 10), NULL, g, g % 50
 FROM generate_series(1, 2000) g;
 ANALYZE ix;
 
@@ -30,6 +31,8 @@ UPDATE ix SET tag = tag || 'x' WHERE id BETWEEN 301 AND 400;
 UPDATE ix SET doc = doc || '{"c": 1}' WHERE id BETWEEN 401 AND 500;
 UPDATE ix SET rng = int4range(lower(rng), upper(rng) + 1) WHERE id BETWEEN 501 AND 600;
 UPDATE ix SET extra = 'set' WHERE id BETWEEN 601 AND 700;
+-- dmbtree-indexed column: in place (the index keeps an entry per key)
+UPDATE ix SET dk = dk + 100 WHERE id BETWEEN 801 AND 900;
 
 SELECT CASE WHEN id <= 100 THEN 'no index'
             WHEN id <= 200 THEN 'brin only'
@@ -38,6 +41,7 @@ SELECT CASE WHEN id <= 100 THEN 'no index'
             WHEN id <= 500 THEN 'gin'
             WHEN id <= 600 THEN 'gist'
             WHEN id <= 700 THEN 'partial'
+            WHEN id BETWEEN 801 AND 900 THEN 'dmbtree'
             ELSE 'untouched' END AS what,
        count(*) FILTER (WHERE ix.ctid = t) AS stayed,
        count(*) FILTER (WHERE ix.ctid <> t) AS moved
@@ -56,6 +60,8 @@ SELECT count(*) FROM ix WHERE k = 10;
 SELECT count(*) FROM ix WHERE tag = 'Tag5x';
 SELECT count(*) FROM ix WHERE lower(tag) = 'tag5x';
 SELECT count(*) FROM ix WHERE extra = 'set';
+SELECT count(*) FROM ix WHERE dk = 110;
+SELECT count(*) FROM ix WHERE dk = 10;
 RESET enable_bitmapscan;
 SET enable_indexscan = off;
 SELECT count(*) FROM ix WHERE doc @> '{"c": 1}';

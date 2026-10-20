@@ -302,6 +302,13 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	BlockNumber vm_skipped = 0;
 	bool		skip_all_visible =
 		(params->options & VACOPT_DISABLE_PAGE_SKIPPING) == 0;
+
+	/*
+	 * INDEX_CLEANUP off, as for heap: indexes are left alone, so LP_DEAD
+	 * items keep their index entries and stay LP_DEAD (and dmbtree indexes
+	 * keep their delete-marked entries).
+	 */
+	bool		index_cleanup = params->index_cleanup != VACOPTVALUE_DISABLED;
 	int			nindexes;
 	Relation   *indrels;
 	TidStore   *dead_items;
@@ -406,8 +413,11 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 
 			if (ndead > 0)
 			{
-				TidStoreSetBlockOffsets(dead_items, blk, dead, ndead);
-				dead_info.num_items += ndead;
+				if (index_cleanup)
+				{
+					TidStoreSetBlockOffsets(dead_items, blk, dead, ndead);
+					dead_info.num_items += ndead;
+				}
 				dead_found += ndead;
 			}
 			else if (page_all_frozen(rel, page, discard))
@@ -428,7 +438,7 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 			}
 		}
 
-		if (dead_info.num_items > 0)
+		if (dead_info.num_items > 0 && index_cleanup)
 		{
 			vacuum_dead_items(rel, indrels, nindexes, istats, dead_items,
 							  &dead_info, live_tuples, bstrategy, discard,
@@ -440,7 +450,7 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	}
 
 	/* 4. index cleanup */
-	for (int i = 0; i < nindexes; i++)
+	for (int i = 0; i < nindexes && index_cleanup; i++)
 	{
 		IndexVacuumInfo ivinfo;
 

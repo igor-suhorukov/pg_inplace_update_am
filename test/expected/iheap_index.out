@@ -2,8 +2,9 @@
 -- Indexes: which updates stay in place, index builds, scans
 --
 CREATE TABLE ix (id int PRIMARY KEY, k int, tag text, doc jsonb, rng int4range,
-                 extra text, b int) USING iheap;
-CREATE INDEX ix_k ON ix (k);
+                 extra text, b int, dk int) USING iheap;
+CREATE INDEX ix_k ON ix USING btree (k);
+CREATE INDEX ix_dk ON ix USING dmbtree (dk);
 CREATE INDEX ix_tag_hash ON ix USING hash (tag);
 CREATE INDEX ix_doc ON ix USING gin (doc);
 CREATE INDEX ix_rng ON ix USING gist (rng);
@@ -12,7 +13,7 @@ CREATE INDEX ix_partial ON ix (extra) WHERE extra IS NOT NULL;
 CREATE INDEX ix_expr ON ix (lower(tag));
 INSERT INTO ix
 SELECT g, g % 50, 'Tag' || (g % 20), jsonb_build_object('a', g % 7, 'b', 'x'),
-       int4range(g, g + 10), NULL, g
+       int4range(g, g + 10), NULL, g, g % 50
 FROM generate_series(1, 2000) g;
 ANALYZE ix;
 CREATE TEMP TABLE ix_tids AS SELECT id, ctid AS t FROM ix;
@@ -27,6 +28,8 @@ UPDATE ix SET tag = tag || 'x' WHERE id BETWEEN 301 AND 400;
 UPDATE ix SET doc = doc || '{"c": 1}' WHERE id BETWEEN 401 AND 500;
 UPDATE ix SET rng = int4range(lower(rng), upper(rng) + 1) WHERE id BETWEEN 501 AND 600;
 UPDATE ix SET extra = 'set' WHERE id BETWEEN 601 AND 700;
+-- dmbtree-indexed column: in place (the index keeps an entry per key)
+UPDATE ix SET dk = dk + 100 WHERE id BETWEEN 801 AND 900;
 SELECT CASE WHEN id <= 100 THEN 'no index'
             WHEN id <= 200 THEN 'brin only'
             WHEN id <= 300 THEN 'btree'
@@ -34,6 +37,7 @@ SELECT CASE WHEN id <= 100 THEN 'no index'
             WHEN id <= 500 THEN 'gin'
             WHEN id <= 600 THEN 'gist'
             WHEN id <= 700 THEN 'partial'
+            WHEN id BETWEEN 801 AND 900 THEN 'dmbtree'
             ELSE 'untouched' END AS what,
        count(*) FILTER (WHERE ix.ctid = t) AS stayed,
        count(*) FILTER (WHERE ix.ctid <> t) AS moved
@@ -48,8 +52,9 @@ GROUP BY 1 ORDER BY min(id);
  gin       |      0 |   100
  gist      |      0 |   100
  partial   |      0 |   100
- untouched |   1300 |     0
-(8 rows)
+ untouched |   1200 |     0
+ dmbtree   |    100 |     0
+(9 rows)
 
 -- an update that sets an indexed column to the same value stays in place
 UPDATE ix SET k = k, tag = tag WHERE id BETWEEN 701 AND 750;
@@ -85,6 +90,18 @@ SELECT count(*) FROM ix WHERE extra = 'set';
  count 
 -------
    100
+(1 row)
+
+SELECT count(*) FROM ix WHERE dk = 110;
+ count 
+-------
+     2
+(1 row)
+
+SELECT count(*) FROM ix WHERE dk = 10;
+ count 
+-------
+    38
 (1 row)
 
 RESET enable_bitmapscan;

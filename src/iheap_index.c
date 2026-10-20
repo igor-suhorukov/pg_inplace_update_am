@@ -8,9 +8,10 @@
  * in the columns of every existing index, so index entries never need
  * per-version handling.  A *new* index is different: versions still kept in
  * undo for old snapshots may differ in the new index's columns.  A build
- * that sees non-frozen in-place updates therefore sets ii_BrokenHotChain,
- * which makes core set indcheckxmin so older snapshots don't use the new
- * index (§11.2).
+ * that sees in-place updates some snapshot may not see yet therefore sets
+ * ii_BrokenHotChain, which makes core set indcheckxmin so older snapshots
+ * don't use the new index (§11.2).  So is a rebuilt dmbtree index, whose
+ * key columns in-place updates change; dmbtbuild() sets indcheckxmin then.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -76,10 +77,17 @@ build_version(Relation rel, Buffer buf, Page page, OffsetNumber off,
 		return true;
 	}
 
-	if (h.infomask & IHT_INPLACE)
-		*broken = true;
-
 	st = iheap_xid_status(h.xid, buf, tup);
+
+	/*
+	 * Some snapshot may still see an older version, which can differ in the
+	 * index's columns if this one replaced it in place (or, for a deletion
+	 * or move, whose header no longer tells, the version before it did).
+	 */
+	if ((h.infomask & (IHT_INPLACE | IHT_DELETED | IHT_MOVED)) &&
+		!(st == IHX_COMMITTED &&
+		  GlobalVisTestIsRemovableXid(vistest, h.xid, true)))
+		*broken = true;
 
 	any.snapshot_type = SNAPSHOT_ANY;
 	if (!iheap_resolve_version(rel, buf, tup, ItemIdGetLength(lp), NULL, &any, v))

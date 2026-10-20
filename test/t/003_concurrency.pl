@@ -125,5 +125,50 @@ cmp_ok($pages, '<=', 20, 'data pages stay bounded');
 is($node->safe_psql('postgres', 'SELECT live_undo_pages FROM iheap_metapage_info(\'acct\')'),
 	'0', 'undo discarded after the workload');
 
+# dmbtree: concurrent renames on a unique column, in place.  Collisions
+# are caught (subtransaction rollbacks leave marked entries behind); a
+# rename to a key another transaction is giving up or taking waits for it.
+$node->safe_psql('postgres', q{
+CREATE TABLE codes (id int PRIMARY KEY, code int) USING iheap;
+CREATE UNIQUE INDEX codes_code ON codes USING dmbtree (code);
+INSERT INTO codes SELECT g, g FROM generate_series(1, 100) g;
+CREATE FUNCTION rename(a int, c int) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE codes SET code = c WHERE id = a;
+EXCEPTION WHEN unique_violation THEN
+  NULL;
+END $$;
+});
+$node->pgbench(
+	'--no-vacuum --client=8 --jobs=4 --transactions=500 --max-tries=100',
+	0,
+	[qr{processed: 4000/4000}],
+	[qr{^$}],
+	'concurrent unique renames',
+	{
+		'008_rename' => q{
+\set a random(1, 100)
+\set c random(1, 150)
+SELECT rename(:a, :c);
+},
+		'009_swap' => q{
+\set a random(1, 100)
+BEGIN;
+UPDATE codes SET code = -code WHERE id = :a;
+UPDATE codes SET code = -code WHERE id = :a;
+COMMIT;
+}
+	});
+is($node->safe_psql('postgres', 'SELECT count(*), count(DISTINCT code) FROM codes'),
+	'100|100', 'codes stay unique');
+is($node->safe_psql('postgres', q{
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SELECT count(*) FROM codes c
+WHERE (SELECT count(*) FROM codes c2 WHERE c2.code = c.code) <> 1}),
+	'0', 'every row found once through its code');
+$node->safe_psql('postgres', 'VACUUM codes');
+is($node->safe_psql('postgres', 'SELECT tids, marked FROM dmbtree_index_stats(\'codes_code\')'),
+	'100|0', 'marked entries cleaned up');
+
 $node->stop;
 done_testing();

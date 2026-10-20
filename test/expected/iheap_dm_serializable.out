@@ -1,0 +1,48 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3plan s1b s2b s2w s1r s2r s1w s1c s2c s3sel
+step s3plan: SET enable_seqscan = off; SET enable_bitmapscan = off;
+			  EXPLAIN (COSTS OFF) SELECT count(*) FROM dz WHERE k = 100;
+QUERY PLAN                            
+--------------------------------------
+Aggregate                             
+  ->  Index Only Scan using dz_k on dz
+        Index Cond: (k = 100)         
+(3 rows)
+
+step s1b: BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2b: BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2w: UPDATE dz SET k = 100 WHERE id = 1;
+step s1r: SELECT count(*) FROM dz WHERE k = 100;
+count
+-----
+    0
+(1 row)
+
+step s2r: SELECT count(*) FROM dz WHERE k = 200;
+count
+-----
+    0
+(1 row)
+
+step s1w: UPDATE dz SET k = 200 WHERE id = 2;
+step s1c: COMMIT;
+step s2c: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s3sel: SELECT id, k FROM dz WHERE id <= 2 ORDER BY id;
+id|  k
+--+---
+ 1|  1
+ 2|200
+(2 rows)
+

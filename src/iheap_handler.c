@@ -5,8 +5,8 @@
  *	  initialization of iheap.
  *
  * The module must be loaded through shared_preload_libraries: its WAL
- * resource manager has to be registered before recovery starts (DESIGN.md
- * §21 D15).
+ * resource managers (iheap's and dmbtree's) have to be registered before
+ * recovery starts (DESIGN.md §21 D15).
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -38,6 +38,7 @@
 #include "utils/snapmgr.h"
 
 #include "iheap.h"
+#include "dmbtree_api.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_inplace_update_am",.version = "0.1");
 
@@ -397,6 +398,12 @@ iheap_fake_relation_close(Relation rel)
 	FreeFakeRelcacheEntry(rel);
 }
 
+bool
+iheap_relation_is_iheap(Relation rel)
+{
+	return rel->rd_tableam == &iheap_methods;
+}
+
 PG_FUNCTION_INFO_V1(iheap_tableam_handler);
 
 Datum
@@ -447,8 +454,12 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	iheap_hooks_init();
+
 	MarkGUCPrefixReserved("iheap");
 
 	iheap_rmgr_register();
+	dmbtree_rmgr_register();
 	iheap_register_xact_callbacks();
+	iheap_dm_init();
 }

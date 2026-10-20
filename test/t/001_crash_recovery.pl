@@ -34,6 +34,7 @@ PREPARE TRANSACTION 'p1';
 my $bg = $node->background_psql('postgres');
 $bg->query_safe('BEGIN');
 $bg->query_safe("UPDATE ti SET v = v + 1000000, s = repeat('crash', 30) WHERE id <> 1");
+$bg->query_safe("UPDATE ti SET k = -k - 5000000 WHERE id % 3 = 0 AND id <> 1");
 $bg->query_safe('DELETE FROM ti WHERE id % 2 = 0');
 $bg->query_safe("INSERT INTO ti SELECT g, g, g, 'lost', NULL FROM generate_series(100001, 101000) g");
 
@@ -45,6 +46,10 @@ is(iheap_snapshot($node, 'ti'), iheap_snapshot($node, 'th', where => 'true'),
 	'committed state after crash recovery matches heap');
 is($node->safe_psql('postgres', "SELECT count(*) FROM ti WHERE s = 'lost' OR v > 1000000"),
 	'0', 'changes of the crashed transaction are invisible');
+is($node->safe_psql('postgres', q{
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SELECT count(*) FROM ti WHERE k < -1000000}),
+	'0', 'key changes of the crashed transaction are not found by the index');
 
 # the prepared transaction is still there and can commit
 $node->safe_psql('postgres', "COMMIT PREPARED 'p1'");
@@ -63,8 +68,12 @@ SELECT count(*) FROM ti WHERE k > -1000000}),
 	$node->safe_psql('postgres', 'SELECT count(*) FROM ti'),
 	'index scan finds every row');
 
-# VACUUM discards everything and freezes every row
+# VACUUM discards everything and freezes every row, and removes the
+# crashed transaction's index entries
 $node->safe_psql('postgres', 'VACUUM ti');
+is($node->safe_psql('postgres',
+	'SELECT tids = (SELECT count(*) FROM ti), marked FROM dmbtree_index_stats(\'ti_k\')'),
+	't|0', 'dmbtree entries cleaned up');
 is($node->safe_psql('postgres', 'SELECT live_undo_pages FROM iheap_metapage_info(\'ti\')'),
 	'0', 'undo discarded after VACUUM');
 is($node->safe_psql('postgres',

@@ -51,11 +51,13 @@ regress/brin_bloom         layout: as brin
 regress/brin_multi         layout: as brin
 regress/combocid           layout (TIDs); no combo command ids: cmin comes from undo records
 regress/create_am          pg_am lists iheap
+regress/amutils            lists the properties of every index AM: dmbtree's too
 regress/create_index       pg_depend lists each table's dependency on access method iheap (it is not pinned); plan
 regress/insert             largest row is 7660 bytes (heap: 8160); relation sizes include the metapage and undo extent
 regress/namespace          CLUSTER copies in index order without a sort, so the index expression is evaluated fewer times
 regress/portals            order: cursors see rows in physical order, updated rows keep their place
 regress/psql               \dA lists iheap
+regress/opr_sanity         lists the operators of every index AM: dmbtree's copies of btree's
 regress/reloptions         layout: VACUUM truncation leaves the metapage, the size never returns to 0
 regress/returning          layout (in-place updates keep ctid), plan, order
 regress/rowsecurity        layout: TABLESAMPLE picks other rows; order

@@ -8,6 +8,7 @@
 set -uo pipefail
 
 out=$1
+flavor=${2:-}
 known=$(dirname "$0")/expected_failures
 
 failed=$(
@@ -18,7 +19,9 @@ failed=$(
 		sed -nE 's/^not ok +[0-9]+ +[-+] +([^ ]+).*/\1/p' "$f" | sed "s|^|$suite/|"
 	done | sort -u
 )
-expected=$(grep -v '^#' "$known" 2>/dev/null | sed 's/[[:space:]].*//' | grep -v '^$' | sort -u)
+# a flavor (core-dm) adds the differences of its own to the table AM's
+expected=$(cat "$known" ${flavor:+"$known"_"$flavor"} 2>/dev/null | grep -v '^#' |
+	sed 's/[[:space:]].*//' | grep -v '^$' | sort -u)
 
 new=$(comm -23 <(echo "$failed" | grep -v '^$') <(echo "$expected" | grep -v '^$'))
 fixed=$(comm -13 <(echo "$failed" | grep -v '^$') <(echo "$expected" | grep -v '^$'))

@@ -1717,6 +1717,9 @@ ih_modified_attrs(TupleDesc desc, const Datum *oldv, const bool *oldn,
 		if (differ)
 			mod = bms_add_member(mod, i + 1 - FirstLowInvalidHeapAttributeNumber);
 	}
+	/* a whole-row reference (an index on f(t.*)) changes with any column */
+	if (mod != NULL)
+		mod = bms_add_member(mod, 0 - FirstLowInvalidHeapAttributeNumber);
 	return mod;
 }
 
@@ -1911,6 +1914,7 @@ typedef struct IHUpdatePlan
 	bool		key_changed;
 	bool		inplace;
 	bool		summarized;
+	bool		dm_changed;		/* a dmbtree index's key changes (§11.6) */
 	bool		valid;
 } IHUpdatePlan;
 
@@ -1935,7 +1939,7 @@ ih_plan_update(Relation rel, Buffer buf, OffsetNumber off,
 	TupleDesc	desc = RelationGetDescr(rel);
 	Page		page = BufferGetPage(buf);
 	ItemId		lp;
-	Bitmapset  *hot_attrs;
+	IHeapDmInfo *dm;
 	Bitmapset  *sum_attrs;
 	Bitmapset  *key_attrs;
 
@@ -1963,7 +1967,12 @@ ih_plan_update(Relation rel, Buffer buf, OffsetNumber off,
 	p->oldisnull = palloc(Max(desc->natts, 1) * sizeof(bool));
 	ih_deform_tuple(desc, p->oldtup, p->oldvalues, p->oldisnull);
 
-	hot_attrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_HOT_BLOCKING);
+	/*
+	 * A change of a column some index covers moves the row, unless the
+	 * column is a key column of dmbtree indexes only, which take in-place
+	 * updates of their keys (§7.4, §11.6).
+	 */
+	dm = iheap_dm_info(rel);
 	sum_attrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_SUMMARIZED);
 	key_attrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_KEY);
 
@@ -1971,11 +1980,11 @@ ih_plan_update(Relation rel, Buffer buf, OffsetNumber off,
 	p->key_changed = bms_overlap(p->modified, key_attrs);
 	p->summarized = bms_overlap(p->modified, sum_attrs);
 	p->inplace = iheap_enable_inplace &&
-		!bms_overlap(p->modified, hot_attrs) &&
+		!bms_overlap(p->modified, dm->blocking) &&
 		!ih_triggers_block_inplace(rel, desc, p->oldtup, p->oldlen, newslot);
+	p->dm_changed = p->inplace && bms_overlap(p->modified, dm->dmattrs);
 	p->valid = true;
 
-	bms_free(hot_attrs);
 	bms_free(sum_attrs);
 	bms_free(key_attrs);
 }
@@ -2475,6 +2484,15 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 	if (held_tuple_lock != NoLock)
 		UnlockTuple(rel, otid, held_tuple_lock);
 
+	/*
+	 * dmbtree indexes whose key changed get their new and marked entries now
+	 * that no table page is locked (§11.6).  The row stays ours meanwhile.
+	 */
+	if (inplace && plan.dm_changed)
+		iheap_dm_update_indexes(rel, otid, plan.modified,
+								plan.oldvalues, plan.oldisnull,
+								newvalues, newisnull);
+
 	if (ts)
 	{
 		iheap_toast_end(ts);
@@ -2594,6 +2612,77 @@ ih_store_settled(Relation rel, Buffer buf, OffsetNumber off,
 	}
 	ItemPointerSet(&slot->tts_tid, BufferGetBlockNumber(buf), off);
 	slot->tts_tableOid = RelationGetRelid(rel);
+}
+
+/*
+ * A caller that locks without following updates (ON CONFLICT DO UPDATE,
+ * logical replication's apply) found the row by a search, and heap reports
+ * TM_Updated once the version it found was updated, after which the caller
+ * searches again.  An in-place update keeps the TID, so the versions tell:
+ *
+ * - When a SnapshotDirty fetch of the same command found the row (ON
+ *   CONFLICT's conflict probe, apply's index search), the row changed if
+ *   the version to be locked is not the one found: heap's answer.  (ON
+ *   CONFLICT starts over with the same snapshot, so comparing with the
+ *   snapshot would never end; apply locks under a snapshot taken after its
+ *   search, which may see the newer version already.)
+ * - Otherwise iheap hands the caller the newest version (D20), unless the
+ *   row's key changed since the caller's snapshot (an in-place update of a
+ *   dmbtree key): the newest version may not have the key searched for.
+ *   Walks the row's versions from c->h, the one to be locked.
+ */
+static bool
+ih_probe_superseded(Relation rel, ItemPointer tid, const IHCheck *c,
+					bool *have_probe)
+{
+	UndoRecPtr	probed = InvalidUndoRecPtr;
+	IHeapHdr	h = c->h;
+
+	*have_probe = iheap_tid_found_dirty_version(rel, tid, &probed);
+	return *have_probe && iheap_version_urec(rel, &h) != probed;
+}
+
+static bool
+ih_changed_since_search(Relation rel, ItemPointer tid, const IHCheck *c,
+						Snapshot snapshot)
+{
+	bool		have_probe;
+	UndoRecPtr	discard;
+	IHeapHdr	h = c->h;
+	int			steps = 0;
+
+	if (ih_probe_superseded(rel, tid, c, &have_probe))
+		return true;
+	if (have_probe)
+		return false;
+
+	discard = iheap_discard_ptr(rel);
+	for (;;)
+	{
+		IHeapUndoRec *rec;
+
+		if (!IsMVCCSnapshot(snapshot) || h.urec < discard ||
+			(TransactionIdIsValid(h.xid) &&
+			 !XidInMVCCSnapshot(h.xid, snapshot) &&
+			 iheap_xid_status(h.xid, InvalidBuffer, NULL) == IHX_COMMITTED))
+			return false;		/* a version the caller's snapshot sees */
+		if (h.infomask & IHT_KEYS_UPDATED)
+			return true;
+		if (++steps > 100000)
+			break;
+		rec = iheap_undo_fetch_version_rec(rel, &h);
+		if (rec == NULL)
+			break;
+		if (rec->hdr.ur_type == IHU_INSERT ||
+			rec->hdr.ur_type == IHU_MULTI_INSERT)
+		{
+			pfree(rec);
+			break;
+		}
+		ih_hdr_read(rec->hdr.ur_prev_hdr, &h);
+		pfree(rec);
+	}
+	return false;
 }
 
 TM_Result
@@ -2762,7 +2851,20 @@ iheap_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot,
 				;
 			else if (follow)
 				tmfd->traversed = true;
-			else if (IsolationUsesXactSnapshot())
+			else if (IsolationUsesXactSnapshot() ||
+					 ih_changed_since_search(rel, tid, &c, snapshot))
+			{
+				result = TM_Updated;
+				c.modxid = c.h.xid;
+			}
+		}
+		else if (result == TM_Ok && !follow &&
+				 (flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) == 0)
+		{
+			bool		have_probe;
+
+			/* the snapshot sees it, but the caller's search found an older one */
+			if (ih_probe_superseded(rel, tid, &c, &have_probe))
 			{
 				result = TM_Updated;
 				c.modxid = c.h.xid;

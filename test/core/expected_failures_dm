@@ -1,0 +1,52 @@
+# Core-suite tests whose output differs with dmbtree indexes (test/run.sh
+# core-dm), on top of test/core/expected_failures.  Same format.  In core-dm
+# every index CREATE INDEX or a PRIMARY KEY/UNIQUE constraint makes on an
+# iheap table is a dmbtree index, unique ones included (test/core/core-dm.conf).
+#
+# Recurring reasons:
+#   name      the output names access method dmbtree (\d, pg_indexes,
+#             pg_index.indclass, pg_depend: dmbtree's operator classes are
+#             not pinned) where it names btree
+#   usingidx  ADD CONSTRAINT ... USING INDEX takes btree indexes only
+#             (parse_utilcmd.c: "index ... is not a btree"); the default
+#             iheap.unique_index_am = btree avoids it
+#   arbiter   ON CONFLICT naming an operator class resolves the class for
+#             btree (parse_clause.c), so no dmbtree unique index matches
+#   fk        foreign key checks against a dmbtree key take the SPI path
+#             (core's fast path is btree-only), so errors carry a CONTEXT line
+#   opclass   the test creates a btree operator class after the extension:
+#             dmbtree has no copy, and the index stays btree with a NOTICE
+#   order     an UPDATE of an indexed column is in place: the row keeps its
+#             place, where heap appends the new version
+#   family    the test adds operators to a built-in btree family after the
+#             extension copied it: dmbtree's copy lacks them, so the planner
+#             keeps to dmbtree's own operators for those indexes (as btree,
+#             they would be index conditions the executor cannot look up in
+#             the index's family)
+
+# --- regress: only in core-dm
+regress/cluster            order (updates of the clustering column); name
+regress/collate            name
+regress/compression        name
+regress/create_table       name
+regress/create_table_like  name
+regress/domain             name
+regress/equivclass         family (integer_ops gains int8alias operators)
+regress/event_trigger      usingidx: create_index's ADD PRIMARY KEY USING INDEX fails, which leaves concur_reindex_tab behind
+regress/generated_virtual  name
+regress/index_including    name
+regress/indexing           name
+regress/matview            name
+regress/publication        usingidx
+regress/replica_identity   name
+regress/tablespace         name
+regress/typed_table        name
+regress/without_overlaps   usingidx
+
+# --- regress: also in expected_failures, with these differences on top
+regress/alter_table        usingidx
+regress/constraints        usingidx
+regress/create_index       usingidx; name
+regress/foreign_key        fk; opclass
+regress/insert_conflict    arbiter; a plan (an EXISTS subquery on the small table takes a seq scan)
+regress/rules              arbiter

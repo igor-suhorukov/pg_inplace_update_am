@@ -480,11 +480,54 @@ typedef struct IHeapScanDescData
 
 typedef IHeapScanDescData *IHeapScanDesc;
 
+/*
+ * The dmbtree entry an index fetch comes from (DESIGN.md §11.5.4): the row
+ * version found is checked against its key when the entry is delete-marked
+ * or the version was rebuilt from undo, or when the snapshot is not an MVCC
+ * one and the entry may have been marked since it was read.
+ */
+typedef struct IHeapDmEntry
+{
+	Relation	index;			/* NULL: no entry to check against */
+	IndexTuple	itup;
+	bool		marked;
+	bool		locked;			/* read under the leaf page lock, still held */
+} IHeapDmEntry;
+
 typedef struct IHeapIndexFetchData
 {
 	IndexFetchTableData xs_base;
 	Buffer		xs_cbuf;		/* pinned buffer of last fetch */
+	IHeapDmEntry xs_dm;			/* set by dmbtree for each entry it returns */
 } IHeapIndexFetchData;
+
+/*
+ * Indexes whose key columns an in-place update may change (dmbtree indexes
+ * that can carry delete-marks), and the columns whose change makes an
+ * update move the row instead (§7.4).  Cached per relation, rebuilt after
+ * a relcache invalidation of the table or of one of its indexes.
+ */
+typedef struct IHeapDmIndex
+{
+	Oid			indexoid;
+	int			natts;			/* key and INCLUDE columns */
+	AttrNumber	attnums[INDEX_MAX_KEYS];	/* table column of each */
+	Bitmapset  *keyattrs;		/* key columns, as in the bitmaps below */
+	bool		unique;
+} IHeapDmIndex;
+
+typedef struct IHeapDmInfo
+{
+	Oid			relid;			/* hash key */
+	bool		valid;
+	MemoryContext cxt;			/* holds the rest */
+	Bitmapset  *blocking;		/* columns (offset by
+								 * FirstLowInvalidHeapAttributeNumber) whose
+								 * change forces a move */
+	Bitmapset  *dmattrs;		/* key columns of the indexes below */
+	int			ndm;
+	IHeapDmIndex *dm;
+} IHeapDmInfo;
 
 /* ------------------------------------------------------------------------
  * Function prototypes
@@ -665,6 +708,8 @@ extern TM_Result iheap_tuple_lock(Relation rel, ItemPointer tid,
 								  LockWaitPolicy wait_policy, uint8 flags,
 								  TM_FailureData *tmfd);
 extern bool iheap_tid_found_dirty(Relation rel, ItemPointer tid);
+extern bool iheap_tid_found_dirty_version(Relation rel, ItemPointer tid,
+										  UndoRecPtr *version);
 extern bool iheap_version_granted(Relation rel, ItemPointer tid,
 								  UndoRecPtr version, TransactionId xid,
 								  CommandId cid);
@@ -786,6 +831,21 @@ extern void iheap_index_validate_scan(Relation table_rel, Relation index_rel,
 									  ValidateIndexState *state);
 extern TransactionId iheap_index_delete_tuples(Relation rel,
 											   TM_IndexDeleteOp *delstate);
+
+/* iheap_hooks.c */
+extern void iheap_hooks_init(void);
+
+/* iheap_dm.c */
+extern void iheap_dm_init(void);
+extern IHeapDmInfo *iheap_dm_info(Relation rel);
+extern void iheap_dm_update_indexes(Relation rel, ItemPointer tid,
+									const Bitmapset *modified,
+									const Datum *oldvalues,
+									const bool *oldisnull,
+									const Datum *newvalues,
+									const bool *newisnull);
+extern int	iheap_dm_matches(Relation rel, const IHeapDmEntry *dm,
+							 const char *tuple, bool allow_external);
 
 /* iheap_toast.c */
 typedef struct IHeapToastState

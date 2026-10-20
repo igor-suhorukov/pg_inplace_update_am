@@ -4,7 +4,7 @@
 #
 #   run.sh build                    copy /src to /build, compile with -Werror
 #   run.sh test [suite...]          build, install, run suites:
-#                                   regress isolation tap core all
+#                                   regress isolation tap core core-dm all
 #                                   core:isolation/<test>,regress/<test>
 #   run.sh bench [args]             benchmarks (release image)
 #
@@ -105,12 +105,17 @@ suite_tap() {
 # test/core/expected_failures.  "core:regress/<name>,isolation/<name>,..."
 # runs only the named tests (regress ones after test_setup) into
 # /out/core-sel, for looking at one difference at a time.
+#
+# CORE_FLAVOR=dm (suite "core-dm"): the same with every index of an iheap
+# table a dmbtree index (test/core/core-dm.conf), into /out/core-dm, and
+# compared with test/core/expected_failures plus expected_failures_dm.
 suite_core() {
 	local sel=${1:-}
-	local out=$OUT/core data=$BUILD/tmp_core/data port=55432
+	local flavor=${CORE_FLAVOR:-}
+	local out=$OUT/core${flavor:+-$flavor} data=$BUILD/tmp_core/data port=55432
 	local regress_args=() isolation_args=() t items
 	if [ -n "$sel" ]; then
-		out=$OUT/core-sel
+		out=$OUT/core${flavor:+-$flavor}-sel
 		IFS=, read -ra items <<<"$sel"
 		for t in "${items[@]}"; do
 			case "$t" in
@@ -128,11 +133,14 @@ suite_core() {
 			--max-concurrent-tests=20)
 		isolation_args=(--schedule="$PGSRC/src/test/isolation/isolation_schedule")
 	fi
-	log "core${sel:+ ($sel)}"
+	log "core${flavor:+-$flavor}${sel:+ ($sel)}"
 	rm -rf "$out" "$BUILD/tmp_core"
 	mkdir -p "$out" "$BUILD/tmp_core"
 	initdb -D "$data" --no-sync -A trust -U pg >"$out/initdb.log" 2>&1
 	cat "$BUILD/test/iheap.conf" "$BUILD/test/core/core.conf" >>"$data/postgresql.conf"
+	if [ -n "$flavor" ]; then
+		cat "$BUILD/test/core/core-$flavor.conf" >>"$data/postgresql.conf"
+	fi
 	pg_ctl -D "$data" -o "-p $port" -l "$out/postmaster.log" -w start
 	trap 'pg_ctl -D "'"$data"'" -m immediate -w stop >/dev/null 2>&1 || true' RETURN
 	for db in template1 postgres; do
@@ -166,7 +174,7 @@ suite_core() {
 		# heap's expected output differs in known ways (row order, plans,
 		# page layout): the verdict is whether every difference is known
 		rc=0
-		bash "$BUILD/test/core/compare.sh" "$out" || rc=$?
+		bash "$BUILD/test/core/compare.sh" "$out" ${flavor:+"$flavor"} || rc=$?
 	fi
 	return $rc
 }
@@ -183,6 +191,8 @@ do_test() {
 		case "$s" in
 			regress|isolation|tap|core) "suite_$s" || rc=1 ;;
 			core:*) suite_core "${s#core:}" || rc=1 ;;
+			core-dm) CORE_FLAVOR=dm suite_core || rc=1 ;;
+			core-dm:*) CORE_FLAVOR=dm suite_core "${s#core-dm:}" || rc=1 ;;
 			*) echo "unknown suite: $s" >&2; return 2 ;;
 		esac
 	done
@@ -205,7 +215,7 @@ case "$cmd" in
 		bash "$BUILD/bench/run.sh" "$@"
 		;;
 	*)
-		sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
 		exit 2
 		;;
 esac

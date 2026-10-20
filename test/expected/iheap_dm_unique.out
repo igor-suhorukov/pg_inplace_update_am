@@ -1,0 +1,147 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1chg s2ins10 s1c s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2ins10: INSERT INTO dq VALUES (3, 10); <waiting ...>
+step s1c: COMMIT;
+step s2ins10: <... completed>
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  30|0
+ 2|  20|0
+ 3|  10|0
+(3 rows)
+
+
+starting permutation: s1b s1chg s2ins10 s1a s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2ins10: INSERT INTO dq VALUES (3, 10); <waiting ...>
+step s1a: ROLLBACK;
+step s2ins10: <... completed>
+ERROR:  duplicate key value violates unique constraint "dq_code"
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  10|0
+ 2|  20|0
+(2 rows)
+
+
+starting permutation: s1b s1chg s2ins30 s1c s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2ins30: INSERT INTO dq VALUES (4, 30); <waiting ...>
+step s1c: COMMIT;
+step s2ins30: <... completed>
+ERROR:  duplicate key value violates unique constraint "dq_code"
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  30|0
+ 2|  20|0
+(2 rows)
+
+
+starting permutation: s1b s1chg s2ins30 s1a s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2ins30: INSERT INTO dq VALUES (4, 30); <waiting ...>
+step s1a: ROLLBACK;
+step s2ins30: <... completed>
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  10|0
+ 2|  20|0
+ 4|  30|0
+(3 rows)
+
+
+starting permutation: s1b s1chg s2upd10 s1c s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2upd10: UPDATE dq SET code = 10 WHERE id = 2; <waiting ...>
+step s1c: COMMIT;
+step s2upd10: <... completed>
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  30|0
+ 2|  10|0
+(2 rows)
+
+
+starting permutation: s1b s1chg s2upd10 s1a s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2upd10: UPDATE dq SET code = 10 WHERE id = 2; <waiting ...>
+step s1a: ROLLBACK;
+step s2upd10: <... completed>
+ERROR:  duplicate key value violates unique constraint "dq_code"
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  10|0
+ 2|  20|0
+(2 rows)
+
+
+starting permutation: s1b s1chg s2ups10 s1c s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2ups10: INSERT INTO dq VALUES (5, 10) ON CONFLICT (code) DO UPDATE SET v = dq.v + 1; <waiting ...>
+step s1c: COMMIT;
+step s2ups10: <... completed>
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  30|0
+ 2|  20|0
+ 5|  10|0
+(3 rows)
+
+
+starting permutation: s1b s1chg s2ups10 s1a s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2ups10: INSERT INTO dq VALUES (5, 10) ON CONFLICT (code) DO UPDATE SET v = dq.v + 1; <waiting ...>
+step s1a: ROLLBACK;
+step s2ups10: <... completed>
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  10|1
+ 2|  20|0
+(2 rows)
+
+
+starting permutation: s1b s1chg s2epq s1c s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2epq: UPDATE dq SET v = 100 WHERE code = 10; <waiting ...>
+step s1c: COMMIT;
+step s2epq: <... completed>
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|v
+--+----+-
+ 1|  30|0
+ 2|  20|0
+(2 rows)
+
+
+starting permutation: s1b s1chg s2epq s1a s2sel
+step s1b: BEGIN;
+step s1chg: UPDATE dq SET code = 30 WHERE id = 1;
+step s2epq: UPDATE dq SET v = 100 WHERE code = 10; <waiting ...>
+step s1a: ROLLBACK;
+step s2epq: <... completed>
+step s2sel: SELECT id, code, v FROM dq ORDER BY id;
+id|code|  v
+--+----+---
+ 1|  10|100
+ 2|  20|  0
+(2 rows)
+

@@ -1,0 +1,204 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1rr s2key s1idx s1new s1ios s1bm s2back s1idx s1bm s2vac s1idx s1ios s2sel s1c s2vac s2marks s2sel
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2key: UPDATE ds SET k = k + 100 WHERE id <= 3;
+step s1idx: SET enable_bitmapscan = off; SELECT id, k FROM ds WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1new: SET enable_bitmapscan = off; SELECT id, k FROM ds WHERE k >= 100 ORDER BY k;
+id|k
+--+-
+(0 rows)
+
+step s1ios: SET enable_bitmapscan = off; SELECT k FROM ds WHERE k <= 1000 ORDER BY k;
+k
+-
+1
+2
+3
+4
+5
+6
+(6 rows)
+
+step s1bm: SET enable_indexscan = off; SET enable_bitmapscan = on; SELECT id, k FROM ds WHERE k IN (1, 2, 101, 102) ORDER BY id; RESET enable_indexscan;
+id|k
+--+-
+ 1|1
+ 2|2
+(2 rows)
+
+step s2back: UPDATE ds SET k = k - 100 WHERE id = 1;
+step s1idx: SET enable_bitmapscan = off; SELECT id, k FROM ds WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1bm: SET enable_indexscan = off; SET enable_bitmapscan = on; SELECT id, k FROM ds WHERE k IN (1, 2, 101, 102) ORDER BY id; RESET enable_indexscan;
+id|k
+--+-
+ 1|1
+ 2|2
+(2 rows)
+
+step s2vac: VACUUM ds;
+step s1idx: SET enable_bitmapscan = off; SELECT id, k FROM ds WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1ios: SET enable_bitmapscan = off; SELECT k FROM ds WHERE k <= 1000 ORDER BY k;
+k
+-
+1
+2
+3
+4
+5
+6
+(6 rows)
+
+step s2sel: SELECT id, k FROM ds WHERE k BETWEEN 0 AND 1000 ORDER BY k;
+id|  k
+--+---
+ 1|  1
+ 4|  4
+ 5|  5
+ 6|  6
+ 2|102
+ 3|103
+(6 rows)
+
+step s1c: COMMIT;
+step s2vac: VACUUM ds;
+step s2marks: SELECT tids, marked FROM dmbtree_index_stats('ds_k');
+tids|marked
+----+------
+   6|     0
+(1 row)
+
+step s2sel: SELECT id, k FROM ds WHERE k BETWEEN 0 AND 1000 ORDER BY k;
+id|  k
+--+---
+ 1|  1
+ 4|  4
+ 5|  5
+ 6|  6
+ 2|102
+ 3|103
+(6 rows)
+
+
+starting permutation: s1rr s2key s2reindex s1idx s1ios s1c s2sel
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2key: UPDATE ds SET k = k + 100 WHERE id <= 3;
+step s2reindex: REINDEX INDEX ds_k;
+step s1idx: SET enable_bitmapscan = off; SELECT id, k FROM ds WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1ios: SET enable_bitmapscan = off; SELECT k FROM ds WHERE k <= 1000 ORDER BY k;
+k
+-
+1
+2
+3
+4
+5
+6
+(6 rows)
+
+step s1c: COMMIT;
+step s2sel: SELECT id, k FROM ds WHERE k BETWEEN 0 AND 1000 ORDER BY k;
+id|  k
+--+---
+ 4|  4
+ 5|  5
+ 6|  6
+ 1|101
+ 2|102
+ 3|103
+(6 rows)
+
+
+starting permutation: s1rr s2key s2vacfull s1idx s1ios s1c s2sel
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2key: UPDATE ds SET k = k + 100 WHERE id <= 3;
+step s2vacfull: VACUUM FULL ds;
+step s1idx: SET enable_bitmapscan = off; SELECT id, k FROM ds WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1ios: SET enable_bitmapscan = off; SELECT k FROM ds WHERE k <= 1000 ORDER BY k;
+k
+-
+1
+2
+3
+4
+5
+6
+(6 rows)
+
+step s1c: COMMIT;
+step s2sel: SELECT id, k FROM ds WHERE k BETWEEN 0 AND 1000 ORDER BY k;
+id|  k
+--+---
+ 4|  4
+ 5|  5
+ 6|  6
+ 1|101
+ 2|102
+ 3|103
+(6 rows)
+

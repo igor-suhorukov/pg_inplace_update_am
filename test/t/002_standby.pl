@@ -1,6 +1,8 @@
-# Streaming replication with wal_consistency_checking: every iheap record
-# is replayed on a standby and the result compared with the primary's page
-# image.  Queries on the standby see the same data.
+# Streaming replication with wal_consistency_checking: every iheap and
+# dmbtree record is replayed on a standby and the result compared with the
+# primary's page image.  Queries on the standby see the same data.  (The
+# tables' secondary indexes are dmbtree indexes, iheap.default_index_am,
+# so the workload's key changes are in-place updates.)
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
@@ -8,10 +10,10 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use IheapTest;
 
-# 'iheap' is a custom resource manager: named explicitly ("all" is
-# expanded before shared_preload_libraries are loaded)
+# 'iheap' and 'dmbtree' are custom resource managers: named explicitly
+# ("all" is expanded before shared_preload_libraries are loaded)
 my $primary = iheap_node('primary', allows_streaming => 1,
-	extra_conf => "wal_consistency_checking = 'all,iheap'");
+	extra_conf => "wal_consistency_checking = 'all,iheap,dmbtree'");
 $primary->backup('b1');
 
 my $standby = PostgreSQL::Test::Cluster->new('standby');
@@ -42,6 +44,19 @@ BEGIN; TRUNCATE tt; INSERT INTO tt VALUES (1, 1); COMMIT;
 COPY tf (id, v, s) FROM PROGRAM 'seq 3001 4000 | sed "s/$/\t1\tc/"';
 });
 iheap_workload($primary, 7);
+
+# dmbtree: a unique index whose keys change in place (marks set and
+# cleared, entries removed by VACUUM and when leaf pages fill)
+$primary->safe_psql('postgres', q{
+CREATE TABLE tu (id int, code int, pad text) USING iheap;
+CREATE UNIQUE INDEX tu_code ON tu USING dmbtree (code);
+INSERT INTO tu SELECT g, g, repeat('p', 20) FROM generate_series(1, 3000) g;
+UPDATE tu SET code = code + 10000 WHERE id % 2 = 0;
+BEGIN; UPDATE tu SET code = -code WHERE id % 3 = 0; ROLLBACK;
+UPDATE tu SET code = code - 10000 WHERE id % 4 = 0;
+VACUUM tu;
+UPDATE tu SET code = code + 20000 WHERE id % 5 = 0;
+});
 $primary->safe_psql('postgres', 'VACUUM');
 
 $primary->wait_for_catchup($standby);
@@ -58,6 +73,14 @@ SET enable_seqscan = off; SET enable_bitmapscan = off;
 SELECT count(*) FROM ti WHERE k > -1000000}),
 	$primary->safe_psql('postgres', 'SELECT count(*) FROM ti'),
 	'index scans on the standby');
+is($standby->safe_psql('postgres', q{
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SELECT count(*), sum(code) FROM tu WHERE code > -100000}),
+	$primary->safe_psql('postgres', 'SELECT count(*), sum(code) FROM tu'),
+	'dmbtree index scans on the standby');
+is($standby->safe_psql('postgres', 'SELECT * FROM dmbtree_index_stats(\'tu_code\')'),
+	$primary->safe_psql('postgres', 'SELECT * FROM dmbtree_index_stats(\'tu_code\')'),
+	'dmbtree index replicated with its marks');
 
 # a long query on the standby while the primary discards: either it
 # finishes or it is canceled by a recovery conflict, never wrong results

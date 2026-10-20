@@ -8,3 +8,6 @@ iheap_abort_concurrent
 iheap_serializable
 iheap_fk_keyshare
 iheap_epq
+iheap_dm_snapshot
+iheap_dm_unique
+iheap_dm_serializable

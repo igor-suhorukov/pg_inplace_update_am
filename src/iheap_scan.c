@@ -715,14 +715,17 @@ item_dead_to_all(Relation rel, Buffer buf, Page page, OffsetNumber off)
 
 /*
  * TIDs that SnapshotDirty index fetches found lately (a uniqueness or
- * ON CONFLICT probe).  The executor goes on to fetch the conflicting row by
- * TID with SnapshotAny and means the version the probe saw: the newest.
+ * ON CONFLICT probe), with the version found.  The executor goes on to
+ * fetch the conflicting row by TID with SnapshotAny and means the version
+ * the probe saw: the newest.  ON CONFLICT DO UPDATE then locks the row,
+ * which must start over if its key changed since the probe (D20).
  */
 typedef struct DirtyFound
 {
 	Oid			relid;
 	ItemPointerData tid;
 	CommandId	cid;
+	UndoRecPtr	version;		/* iheap_version_urec() of the version */
 } DirtyFound;
 
 #define N_DIRTY_FOUND 4
@@ -731,7 +734,7 @@ static DirtyFound dirty_found[N_DIRTY_FOUND];
 static int	dirty_found_next;
 
 static void
-note_dirty_found(Relation rel, ItemPointer tid)
+note_dirty_found(Relation rel, ItemPointer tid, UndoRecPtr version)
 {
 	DirtyFound *d = &dirty_found[dirty_found_next];
 
@@ -739,6 +742,29 @@ note_dirty_found(Relation rel, ItemPointer tid)
 	d->relid = RelationGetRelid(rel);
 	d->tid = *tid;
 	d->cid = GetCurrentCommandId(false);
+	d->version = version;
+}
+
+/* as iheap_tid_found_dirty(), and which version the latest probe found */
+bool
+iheap_tid_found_dirty_version(Relation rel, ItemPointer tid,
+							  UndoRecPtr *version)
+{
+	CommandId	cid = GetCurrentCommandId(false);
+
+	for (int n = 1; n <= N_DIRTY_FOUND; n++)
+	{
+		DirtyFound *d = &dirty_found[(dirty_found_next + N_DIRTY_FOUND - n) %
+									 N_DIRTY_FOUND];
+
+		if (d->relid == RelationGetRelid(rel) &&
+			ItemPointerEquals(&d->tid, tid) && d->cid == cid)
+		{
+			*version = d->version;
+			return true;
+		}
+	}
+	return false;
 }
 
 bool
@@ -757,12 +783,57 @@ iheap_tid_found_dirty(Relation rel, ItemPointer tid)
 }
 
 /*
+ * Does version *v of the row at off have the key of entry dm?  For
+ * fetch_in_buffer(), which holds buf share-locked and saw the row's header
+ * "seen" on the page.  A key value stored out of line is fetched with the
+ * page unlocked (TOAST access takes locks and may read), from a copy of
+ * the version that *v then holds; *changed tells that the row changed
+ * meanwhile, and the caller must start over.
+ */
+static int
+dm_matches_on_page(Relation rel, Buffer buf, OffsetNumber off,
+				   const IHeapHdr *seen, const IHeapDmEntry *dm,
+				   IHeapVersion *v, bool *changed)
+{
+	Page		page;
+	ItemId		lp;
+	IHeapHdr	h;
+	int			match = iheap_dm_matches(rel, dm, v->tuple, false);
+
+	*changed = false;
+	if (match >= 0)
+		return match;
+
+	if (v->mem == NULL)
+		v->tuple = ih_copy_tuple_aligned(CurrentMemoryContext, v->tuple,
+										 v->len, &v->mem);
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	match = iheap_dm_matches(rel, dm, v->tuple, true);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+	page = BufferGetPage(buf);
+	if (off > PageGetMaxOffsetNumber(page) ||
+		!ItemIdIsNormal(lp = PageGetItemId(page, off)))
+		*changed = true;
+	else
+	{
+		ih_hdr_read((char *) page + ItemIdGetOffset(lp), &h);
+		*changed = h.xid != seen->xid || h.urec != seen->urec ||
+			((h.infomask ^ seen->infomask) & ~IHT_XID_HINTS) != 0;
+	}
+	return match;
+}
+
+/*
  * Fetch the version of tid visible to snapshot into slot; buffer is
  * pinned by the caller.  settled_only: see iheap_resolve_version_ext().
+ * dm: the dmbtree entry that led here, or NULL.  found_version, if not
+ * NULL, is set to the identity (iheap_version_urec) of the version found.
  */
 static bool
 fetch_in_buffer(Relation rel, Buffer buf, ItemPointer tid, Snapshot snapshot,
-				TupleTableSlot *slot, bool *all_dead, bool settled_only)
+				TupleTableSlot *slot, bool *all_dead, bool settled_only,
+				const IHeapDmEntry *dm, UndoRecPtr *found_version)
 {
 	Page		page;
 	OffsetNumber off = ItemPointerGetOffsetNumber(tid);
@@ -772,6 +843,7 @@ fetch_in_buffer(Relation rel, Buffer buf, ItemPointer tid, Snapshot snapshot,
 	bool		ssi = snapshot && IsMVCCSnapshot(snapshot) &&
 		CheckForSerializableConflictOutNeeded(rel, snapshot);
 
+retry:
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	if (!IHeapPageIsData(page) || off < FirstOffsetNumber ||
@@ -785,9 +857,10 @@ fetch_in_buffer(Relation rel, Buffer buf, ItemPointer tid, Snapshot snapshot,
 	if (ItemIdIsNormal(lp))
 	{
 		char	   *tup = (char *) page + ItemIdGetOffset(lp);
-
+		IHeapHdr	seen;
 		TransactionId newest;
 
+		ih_hdr_read(tup, &seen);
 		visible = iheap_resolve_version_ext(rel, buf, tup, ItemIdGetLength(lp),
 											NULL, snapshot, &v, settled_only,
 											ssi);
@@ -825,11 +898,93 @@ fetch_in_buffer(Relation rel, Buffer buf, ItemPointer tid, Snapshot snapshot,
 				v = sv;
 			}
 		}
+
+		/*
+		 * dmbtree: a delete-marked entry may not match the row, and an
+		 * unmarked one matches its newest committed version only, so the
+		 * version found is checked against the entry's key when the entry
+		 * is marked or the version came from undo (DESIGN.md §11.5.4).
+		 * The scan copied the entry from its page earlier: an MVCC snapshot
+		 * that sees a change of the key sees its mark too, but a SnapshotDirty
+		 * probe sees changes made since, so other snapshots always check.
+		 */
+		if (visible && dm != NULL &&
+			(dm->marked || v.from_undo ||
+			 (!IsMVCCSnapshot(snapshot) && !dm->locked)))
+		{
+			bool		changed;
+
+			if (dm_matches_on_page(rel, buf, off, &seen, dm, &v,
+								   &changed) == 0 && !changed)
+			{
+				TransactionId running = InvalidTransactionId;
+
+				if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
+					running = TransactionIdIsValid(snapshot->xmin) ?
+						snapshot->xmin : snapshot->xmax;
+				if (v.mem)
+					pfree(v.mem);
+				v.mem = NULL;
+				visible = false;
+
+				/*
+				 * A uniqueness check found a running transaction's version
+				 * with another key.  If the version before it has the
+				 * entry's key, the row conflicts until that transaction
+				 * commits: report that version as being changed by it (as
+				 * heap reports the old version of a row a running
+				 * transaction updates), so that the caller waits.
+				 */
+				if (TransactionIdIsValid(running))
+				{
+					IHeapVersion sv;
+
+					/* the row is unchanged, but may have moved on the page */
+					lp = PageGetItemId(page, off);
+					tup = (char *) page + ItemIdGetOffset(lp);
+					if (iheap_resolve_version_ext(rel, buf, tup, ItemIdGetLength(lp),
+												  NULL, SnapshotAny, &sv, true,
+												  false))
+					{
+						if (!TransactionIdIsValid(sv.xmax) &&
+							dm_matches_on_page(rel, buf, off, &seen, dm, &sv,
+											   &changed) == 1 && !changed)
+						{
+							v = sv;
+							v.xmax = running;
+							snapshot->xmin = InvalidTransactionId;
+							snapshot->xmax = running;
+							snapshot->speculativeToken = 0;
+							visible = true;
+						}
+						else if (sv.mem)
+							pfree(sv.mem);
+					}
+				}
+			}
+			if (changed)
+			{
+				/* a value stored out of line was fetched, and the row changed */
+				if (visible && v.mem)
+					pfree(v.mem);
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				visible = false;
+				goto retry;
+			}
+		}
+
 		if (visible)
 		{
 			/* the SIREAD lock is taken before any writer can get in */
 			if (snapshot && IsMVCCSnapshot(snapshot))
 				PredicateLockTID(rel, tid, snapshot, v.xmin);
+			if (found_version)
+			{
+				IHeapHdr	vh;
+
+				ih_hdr_read(v.tuple, &vh);
+				*found_version = iheap_version_urec(rel, &vh);
+			}
 			/* copy out while the content lock is held */
 			iheap_store_version(slot, &v, true);
 			if (v.mem)
@@ -853,6 +1008,7 @@ iheap_index_fetch_begin(Relation rel, uint32 flags)
 	f->xs_base.rel = rel;
 	f->xs_base.flags = flags;
 	f->xs_cbuf = InvalidBuffer;
+	f->xs_dm.index = NULL;
 	(void) iheap_relcache(rel, false);
 	return &f->xs_base;
 }
@@ -867,6 +1023,7 @@ iheap_index_fetch_reset(IndexFetchTableData *scan)
 		ReleaseBuffer(f->xs_cbuf);
 		f->xs_cbuf = InvalidBuffer;
 	}
+	f->xs_dm.index = NULL;
 }
 
 void
@@ -884,6 +1041,7 @@ iheap_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid,
 	IHeapIndexFetchData *f = (IHeapIndexFetchData *) scan;
 	Relation	rel = f->xs_base.rel;
 	BlockNumber blk = ItemPointerGetBlockNumber(tid);
+	UndoRecPtr	version = InvalidUndoRecPtr;
 	bool		found;
 
 	*call_again = false;
@@ -898,12 +1056,15 @@ iheap_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid,
 	}
 
 	found = fetch_in_buffer(rel, f->xs_cbuf, tid, snapshot, slot, all_dead,
-							false);
+							false, f->xs_dm.index ? &f->xs_dm : NULL,
+							snapshot->snapshot_type == SNAPSHOT_DIRTY ?
+							&version : NULL);
+	f->xs_dm.index = NULL;		/* each entry is good for one fetch */
 	if (found)
 	{
 		pgstat_count_heap_fetch(rel);
 		if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
-			note_dirty_found(rel, tid);
+			note_dirty_found(rel, tid, version);
 	}
 	return found;
 }
@@ -925,7 +1086,7 @@ iheap_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot,
 	 * TID: for us the newest settled one.
 	 */
 	found = fetch_in_buffer(rel, buf, tid, snapshot, slot, NULL,
-							snapshot->snapshot_type == SNAPSHOT_ANY);
+							snapshot->snapshot_type == SNAPSHOT_ANY, NULL, NULL);
 	ReleaseBuffer(buf);
 	return found;
 }
@@ -1068,7 +1229,12 @@ iheap_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot,
 			(*exact_pages)++;
 	}
 
-	*recheck = scan->rs_bm_recheck;
+	/*
+	 * An older version of a row may have other values in the columns of a
+	 * dmbtree index than its newest one, which index entries without a
+	 * delete-mark match (DESIGN.md §11.5.4): the quals are rechecked.
+	 */
+	*recheck = scan->rs_bm_recheck || scan->rs_vis[scan->rs_cindex].from_undo;
 	return_current(scan, slot);
 	scan->rs_cindex++;
 	pgstat_count_heap_fetch(scan->rs_base.rs_rd);
