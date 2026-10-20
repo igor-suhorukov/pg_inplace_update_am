@@ -8,6 +8,7 @@ iheap_ddl
 iheap_bloat
 iheap_stats
 iheap_check
+iheap_parallel_vacuum
 iheap_logical
 iheap_wal
 iheap_compact

@@ -69,7 +69,7 @@ regress/tidscan            layout
 regress/triggers           order: per-row trigger notices; the self-referencing DELETE meets the parent first and no longer fails with "already modified"
 regress/tuplesort          layout: ORDER BY ctid
 regress/update             order; RETURNING xmax after ON CONFLICT DO UPDATE is 0 (heap's own test calls its nonzero value "probably not good")
-regress/vacuum             no parallel index vacuum, so no warning for temp tables; layout: truncation leaves the metapage
+regress/vacuum             layout: truncation leaves the metapage
 
 # --- isolation
 isolation/eval-plan-qual   layout: rows start at block 1, steps updating WHERE ctid = '(0,1)' find nothing

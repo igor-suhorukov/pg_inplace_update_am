@@ -131,6 +131,51 @@ cmp_ok($pages, '<=', 20, 'data pages stay bounded');
 is($node->safe_psql('postgres', 'SELECT live_undo_pages FROM iheap_metapage_info(\'acct\')'),
 	'0', 'undo discarded after the workload');
 
+# parallel VACUUM (§21 D44) concurrently with key changes in place, whose
+# marked entries of acct_branch the workers clean up, and with rows that
+# grow and move: the checks run alongside
+$node->pgbench(
+	'--no-vacuum --client=6 --jobs=3 --transactions=150 --max-tries=100',
+	0,
+	[qr{processed: 900/900}],
+	[qr{^$}],
+	'key changes while vacuuming in parallel',
+	{
+		'013_branch@3' => q{
+\set a random(1, 200)
+\set br random(0, 9)
+UPDATE acct SET branch = :br WHERE id = :a;
+},
+		'014_grow@3' => q{
+\set a random(1, 200)
+\set n random(0, 90)
+UPDATE acct SET note = repeat('g', :n) WHERE id = :a;
+},
+		'015_vacuum_parallel@1' => q{
+SET min_parallel_index_scan_size = 0;
+VACUUM (PARALLEL 2) acct;
+},
+		'016_verify@1' => q{
+SELECT iheap_verify_strict('acct');
+}
+	});
+is($node->safe_psql('postgres', 'SELECT sum(balance), count(*) FROM acct'),
+	'200000|200', 'balance preserved with concurrent parallel vacuum');
+
+# the worker is launched (two indexes: one worker beside the leader)
+my ($stdout, $stderr);
+$node->psql('postgres', q{
+UPDATE acct SET branch = (branch + 1) % 10;
+SET min_parallel_index_scan_size = 0;
+VACUUM (PARALLEL 2, VERBOSE) acct;
+}, stdout => \$stdout, stderr => \$stderr);
+like($stderr,
+	qr/launched 1 parallel vacuum worker for index (?:vacuuming|cleanup)/,
+	'parallel vacuum launches a worker');
+is($node->safe_psql('postgres', 'SELECT marked FROM dmbtree_index_stats(\'acct_branch\')'),
+	'0', 'marked entries cleaned up by a parallel vacuum');
+is(iheap_verify($node, 'acct'), '', 'structure checks after the parallel vacuums');
+
 # dmbtree: concurrent renames on a unique column, in place.  Collisions
 # are caught (subtransaction rollbacks leave marked entries behind); a
 # rename to a key another transaction is giving up or taking waits for it.

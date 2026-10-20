@@ -26,9 +26,11 @@ for my $round (1 .. 6)
 	iheap_workload($primary, $round);
 }
 
-# maintenance: prune, vacuum (visibility map), discard, rewrite, truncate
+# maintenance: prune, vacuum (visibility map; the indexes by parallel
+# workers, §21 D44), discard, rewrite, truncate
 $primary->safe_psql('postgres', q{
-VACUUM ti;
+SET min_parallel_index_scan_size = 0;
+VACUUM (PARALLEL 3) ti;
 UPDATE ti SET v = v + 1;
 UPDATE th SET v = v + 1;
 SELECT iheap_discard('ti');

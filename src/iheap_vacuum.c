@@ -14,6 +14,10 @@
  *	6. advance relfrozenxid to the oldest xid referenced by live undo --
  *	   no freezing pass is ever needed (§10.6).
  *
+ * Steps 3 and 4 run the index AMs' bulk deletion and cleanup, in parallel
+ * workers when VACUUM's PARALLEL option and the indexes allow it, through
+ * core's parallel vacuum as for heap (§21 D44).
+ *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
  *-------------------------------------------------------------------------
@@ -31,6 +35,7 @@
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "optimizer/clauses.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "storage/bufmgr.h"
@@ -42,6 +47,22 @@
 
 #include "iheap.h"
 #include "iheap_xlog.h"
+#include "dmbtree_api.h"
+
+/*
+ * The indexes VACUUM works on.  With a parallel vacuum (pvs, §21 D44) their
+ * bulk deletion and cleanup are shared between parallel workers and this
+ * backend, the dead items are in shared memory, and the indexes' statistics
+ * stay there until parallel_vacuum_end() copies them to istats.
+ */
+typedef struct VacIndexes
+{
+	Relation   *indrels;
+	int			nindexes;
+	IndexBulkDeleteResult **istats;
+	ParallelVacuumState *pvs;	/* NULL: this backend does it all */
+	int			nscans;			/* bulk deletion passes so far */
+} VacIndexes;
 
 /* mark LP_DEAD items unused (vacuum second pass, also used by redo) */
 void
@@ -223,12 +244,80 @@ truncate_tail(Relation rel, BlockNumber nblocks)
 }
 
 /*
+ * Start a parallel vacuum of the indexes if one can be had (§21 D44), else
+ * return NULL.  The conditions are heap's (dead_items_alloc() in
+ * vacuumlazy.c), and one of iheap's own: dmbtree's cleanup of marked
+ * entries evaluates an index's expressions and predicate on table rows
+ * (§11.5.6), in parallel workers and in this backend, which is in parallel
+ * mode until parallel_vacuum_end().  They must be parallel safe then, as
+ * for a parallel build of the index.
+ */
+static ParallelVacuumState *
+begin_parallel_vacuum(Relation rel, VacIndexes *vi, int nworkers,
+					  int vac_work_mem, int elevel,
+					  BufferAccessStrategy bstrategy)
+{
+	PlannerInfo *root;
+
+	/* parallel workers cannot read temporary tables */
+	if (RelationUsesLocalBuffers(rel))
+	{
+		/* warn only if workers were asked for, as heap does */
+		if (nworkers > 0)
+			ereport(WARNING,
+					(errmsg("disabling parallel option of vacuum on \"%s\" --- cannot vacuum temporary tables in parallel",
+							RelationGetRelationName(rel))));
+		return NULL;
+	}
+
+	/* is_parallel_safe() looks at planner state: a dummy one, as for builds */
+	root = makeNode(PlannerInfo);
+	root->glob = makeNode(PlannerGlobal);
+	for (int i = 0; i < vi->nindexes; i++)
+	{
+		Relation	index = vi->indrels[i];
+
+		if (!dmbtree_is_dmbtree(index))
+			continue;
+		if (!is_parallel_safe(root, (Node *) RelationGetIndexExpressions(index)) ||
+			!is_parallel_safe(root, (Node *) RelationGetIndexPredicate(index)))
+		{
+			/* as for temporary tables, but autovacuum would warn every run */
+			if (nworkers > 0 && !AmAutoVacuumWorkerProcess())
+				ereport(WARNING,
+						(errmsg("disabling parallel option of vacuum on \"%s\" --- index \"%s\" has expressions or a predicate that are not parallel safe",
+								RelationGetRelationName(rel),
+								RelationGetRelationName(index))));
+			return NULL;
+		}
+	}
+
+	return parallel_vacuum_init(rel, vi->indrels, vi->nindexes, nworkers,
+								vac_work_mem, elevel, bstrategy);
+}
+
+/* for an index's bulk deletion or cleanup by this backend alone */
+static void
+init_ivinfo(IndexVacuumInfo *ivinfo, Relation rel, Relation index,
+			double live_tuples, BufferAccessStrategy bstrategy)
+{
+	ivinfo->index = index;
+	ivinfo->heaprel = rel;
+	ivinfo->analyze_only = false;
+	ivinfo->is_autovacuum = AmAutoVacuumWorkerProcess();
+	ivinfo->report_progress = false;
+	ivinfo->estimated_count = true;
+	ivinfo->message_level = DEBUG2;
+	ivinfo->num_heap_tuples = live_tuples;
+	ivinfo->strategy = bstrategy;
+}
+
+/*
  * Remove the index entries of the collected LP_DEAD items, then mark the
  * items unused (and the pages all-visible where possible).
  */
 static void
-vacuum_dead_items(Relation rel, Relation *indrels, int nindexes,
-				  IndexBulkDeleteResult **istats, TidStore *dead_items,
+vacuum_dead_items(Relation rel, VacIndexes *vi, TidStore *dead_items,
 				  VacDeadItemsInfo *dead_info, double live_tuples,
 				  BufferAccessStrategy bstrategy, UndoRecPtr discard,
 				  Buffer *vmbuf, BlockNumber *nallvisible)
@@ -236,22 +325,21 @@ vacuum_dead_items(Relation rel, Relation *indrels, int nindexes,
 	TidStoreIter *iter;
 	TidStoreIterResult *res;
 
-	for (int i = 0; i < nindexes; i++)
+	if (vi->pvs != NULL)
+		parallel_vacuum_bulkdel_all_indexes(vi->pvs, live_tuples, vi->nscans,
+											NULL);
+	else
 	{
-		IndexVacuumInfo ivinfo;
+		for (int i = 0; i < vi->nindexes; i++)
+		{
+			IndexVacuumInfo ivinfo;
 
-		ivinfo.index = indrels[i];
-		ivinfo.heaprel = rel;
-		ivinfo.analyze_only = false;
-		ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
-		ivinfo.report_progress = false;
-		ivinfo.estimated_count = true;
-		ivinfo.message_level = DEBUG2;
-		ivinfo.num_heap_tuples = live_tuples;
-		ivinfo.strategy = bstrategy;
-		istats[i] = vac_bulkdel_one_index(&ivinfo, istats[i], dead_items,
-										  dead_info);
+			init_ivinfo(&ivinfo, rel, vi->indrels[i], live_tuples, bstrategy);
+			vi->istats[i] = vac_bulkdel_one_index(&ivinfo, vi->istats[i],
+												  dead_items, dead_info);
+		}
 	}
+	vi->nscans++;
 
 	iter = TidStoreBeginIterate(dead_items);
 	while ((res = TidStoreIterateNext(iter)) != NULL)
@@ -309,11 +397,13 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	 * keep their delete-marked entries).
 	 */
 	bool		index_cleanup = params->index_cleanup != VACOPTVALUE_DISABLED;
-	int			nindexes;
-	Relation   *indrels;
+	int			elevel = (params->options & VACOPT_VERBOSE) ? INFO : DEBUG2;
+	int			vac_work_mem = AmAutoVacuumWorkerProcess() &&
+		autovacuum_work_mem != -1 ?
+		autovacuum_work_mem : maintenance_work_mem;
+	VacIndexes	vi;
 	TidStore   *dead_items;
-	VacDeadItemsInfo dead_info;
-	IndexBulkDeleteResult **istats;
+	VacDeadItemsInfo *dead_info;
 	double		live_tuples = 0;
 	int64		dead_found = 0;
 	Buffer		vmbuf = InvalidBuffer;
@@ -334,12 +424,30 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	(void) iheap_discard_all(rel, true);
 	discard = iheap_relcache(rel, true)->rc_discard;
 
-	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &indrels);
-	istats = palloc0(sizeof(IndexBulkDeleteResult *) * Max(nindexes, 1));
+	vac_open_indexes(rel, RowExclusiveLock, &vi.nindexes, &vi.indrels);
+	vi.istats = palloc0(sizeof(IndexBulkDeleteResult *) * Max(vi.nindexes, 1));
+	vi.nscans = 0;
 
-	dead_info.max_bytes = (size_t) maintenance_work_mem * 1024;
-	dead_info.num_items = 0;
-	dead_items = TidStoreCreateLocal(dead_info.max_bytes, true);
+	/*
+	 * A parallel vacuum (§21 D44) when PARALLEL does not turn it off and two
+	 * indexes at least can share the work (one process vacuums an index),
+	 * as for heap.  From here to parallel_vacuum_end() this backend is in
+	 * parallel mode: the scan below writes pages and WAL only, which
+	 * parallel mode allows; catalog updates and truncation come after.
+	 */
+	vi.pvs = NULL;
+	if (params->nworkers >= 0 && vi.nindexes > 1 && index_cleanup)
+		vi.pvs = begin_parallel_vacuum(rel, &vi, params->nworkers,
+									   vac_work_mem, elevel, bstrategy);
+	if (vi.pvs != NULL)
+		dead_items = parallel_vacuum_get_dead_items(vi.pvs, &dead_info);
+	else
+	{
+		dead_info = palloc_object(VacDeadItemsInfo);
+		dead_info->max_bytes = vac_work_mem * (Size) 1024;
+		dead_info->num_items = 0;
+		dead_items = TidStoreCreateLocal(dead_info->max_bytes, true);
+	}
 
 	/*
 	 * 2. prune the data pages, collecting LP_DEAD items; 3. whenever the
@@ -416,7 +524,7 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 				if (index_cleanup)
 				{
 					TidStoreSetBlockOffsets(dead_items, blk, dead, ndead);
-					dead_info.num_items += ndead;
+					dead_info->num_items += ndead;
 				}
 				dead_found += ndead;
 			}
@@ -431,49 +539,62 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 			RecordPageWithFreeSpace(rel, blk, freespace);
 
 			/* keep memory bounded: vacuum the indexes when the store is full */
-			if (TidStoreMemoryUsage(dead_items) > dead_info.max_bytes)
+			if (TidStoreMemoryUsage(dead_items) > dead_info->max_bytes)
 			{
 				blk++;
 				break;
 			}
 		}
 
-		if (dead_info.num_items > 0 && index_cleanup)
+		if (dead_info->num_items > 0 && index_cleanup)
 		{
-			vacuum_dead_items(rel, indrels, nindexes, istats, dead_items,
-							  &dead_info, live_tuples, bstrategy, discard,
-							  &vmbuf, &nallvisible);
-			TidStoreDestroy(dead_items);
-			dead_items = TidStoreCreateLocal(dead_info.max_bytes, true);
-			dead_info.num_items = 0;
+			vacuum_dead_items(rel, &vi, dead_items, dead_info, live_tuples,
+							  bstrategy, discard, &vmbuf, &nallvisible);
+			if (vi.pvs != NULL)
+			{
+				parallel_vacuum_reset_dead_items(vi.pvs);
+				dead_items = parallel_vacuum_get_dead_items(vi.pvs, &dead_info);
+			}
+			else
+			{
+				TidStoreDestroy(dead_items);
+				dead_items = TidStoreCreateLocal(dead_info->max_bytes, true);
+				dead_info->num_items = 0;
+			}
 		}
 	}
 
 	/* 4. index cleanup */
-	for (int i = 0; i < nindexes && index_cleanup; i++)
+	if (vi.pvs != NULL)
+		parallel_vacuum_cleanup_all_indexes(vi.pvs, live_tuples, vi.nscans,
+											true, NULL);
+	else
 	{
-		IndexVacuumInfo ivinfo;
+		for (int i = 0; i < vi.nindexes && index_cleanup; i++)
+		{
+			IndexVacuumInfo ivinfo;
 
-		ivinfo.index = indrels[i];
-		ivinfo.heaprel = rel;
-		ivinfo.analyze_only = false;
-		ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
-		ivinfo.report_progress = false;
-		ivinfo.estimated_count = true;
-		ivinfo.message_level = DEBUG2;
-		ivinfo.num_heap_tuples = live_tuples;
-		ivinfo.strategy = bstrategy;
-		istats[i] = vac_cleanup_one_index(&ivinfo, istats[i]);
-		if (istats[i] && !istats[i]->estimated_count)
-			vac_update_relstats(indrels[i], istats[i]->num_pages,
-								istats[i]->num_index_tuples, 0, 0, false,
+			init_ivinfo(&ivinfo, rel, vi.indrels[i], live_tuples, bstrategy);
+			vi.istats[i] = vac_cleanup_one_index(&ivinfo, vi.istats[i]);
+		}
+	}
+
+	/* out of parallel mode, where the catalogs can be updated */
+	if (vi.pvs != NULL)
+		parallel_vacuum_end(vi.pvs, vi.istats);	/* frees dead_items */
+	else
+		TidStoreDestroy(dead_items);
+	for (int i = 0; i < vi.nindexes && index_cleanup; i++)
+	{
+		if (vi.istats[i] && !vi.istats[i]->estimated_count)
+			vac_update_relstats(vi.indrels[i], vi.istats[i]->num_pages,
+								vi.istats[i]->num_index_tuples, 0, 0, false,
 								InvalidTransactionId, InvalidMultiXactId,
 								NULL, NULL, false);
 	}
 
 	if (BufferIsValid(vmbuf))
 		ReleaseBuffer(vmbuf);
-	TidStoreDestroy(dead_items);
 	FreeSpaceMapVacuum(rel);
 
 	/* 5. truncate empty tail */
@@ -488,14 +609,14 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	/* 6. relfrozenxid: oldest xid that live undo may make us look up */
 	frozenxid = iheap_oldest_live_xid(rel, cutoffs.OldestXmin);
 	vac_update_relstats(rel, RelationGetNumberOfBlocks(rel), live_tuples,
-						nallvisible, nallvisible, nindexes > 0,
+						nallvisible, nallvisible, vi.nindexes > 0,
 						frozenxid, cutoffs.OldestMxact,
 						&frozenxid_updated, &minmulti_updated, false);
 
 	pgstat_report_vacuum(rel, (PgStat_Counter) live_tuples,
 						 (PgStat_Counter) dead_found, starttime);
 
-	vac_close_indexes(nindexes, indrels, NoLock);
+	vac_close_indexes(vi.nindexes, vi.indrels, NoLock);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 }

@@ -1,0 +1,149 @@
+--
+-- Parallel index vacuum (DESIGN.md §10.2, §21 D44): through core's parallel
+-- vacuum, parallel workers share the indexes' bulk deletion and cleanup
+-- with the backend running VACUUM, which scans the table.  VERBOSE reports
+-- the workers launched.
+--
+CREATE EXTENSION amcheck;
+
+-- every problem found in a table: iheap_check(), and its btree and dmbtree
+-- indexes checked with every option (which raise an error)
+CREATE FUNCTION pv_check(rel regclass) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN SELECT * FROM iheap_check(rel) LOOP
+    RETURN NEXT format('block %s, offset %s: %s', r.blkno, r.offnum, r.msg);
+  END LOOP;
+  FOR r IN
+    SELECT i.indexrelid::regclass AS idx, a.amname, i.indisunique
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+         JOIN pg_am a ON a.oid = c.relam
+    WHERE i.indrelid = rel
+  LOOP
+    IF r.amname = 'dmbtree' THEN
+      PERFORM dmbtree_parent_check(r.idx, true, true, r.indisunique, true);
+    ELSIF r.amname = 'btree' THEN
+      PERFORM bt_index_parent_check(r.idx, true, true, r.indisunique);
+    END IF;
+  END LOOP;
+END $$;
+
+SET max_parallel_maintenance_workers = 2;
+SET min_parallel_index_scan_size = 0;
+
+-- a primary key (btree), a dmbtree index, one with an expression and a
+-- predicate (parallel safe), and a btree index
+CREATE TABLE pv (id int PRIMARY KEY, k int, v int) USING iheap
+  WITH (autovacuum_enabled = off);
+CREATE INDEX pv_k ON pv (k);
+CREATE INDEX pv_kx ON pv (abs(k)) WHERE v > 0;
+CREATE INDEX pv_v ON pv USING btree (v);
+INSERT INTO pv SELECT g, g, g FROM generate_series(1, 3000) g;
+
+-- key changes in place (marked entries), deletions and moves (dead items):
+-- one bulk deletion pass, by two workers and this backend
+UPDATE pv SET k = k + 10000 WHERE id % 4 = 0;
+DELETE FROM pv WHERE id % 10 = 1;
+UPDATE pv SET v = v + 10000 WHERE id % 10 = 2;
+SELECT marked > 0 AS marked FROM dmbtree_index_stats('pv_k');
+VACUUM (PARALLEL 2, VERBOSE) pv;
+SELECT tids = (SELECT count(*) FROM pv) AS one_entry_a_row, marked
+FROM dmbtree_index_stats('pv_k');
+SELECT * FROM pv_check('pv');
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM pv WHERE id > 0;
+SELECT count(*) FROM pv WHERE k > 0;
+SELECT count(*) FROM pv WHERE abs(k) > 0 AND v > 0;
+SELECT count(*) FROM pv WHERE v > 0;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- key changes in place only: no dead items, no bulk deletion, and the
+-- cleanup, which takes the marked entries out, is shared by two workers
+UPDATE pv SET k = k + 10000 WHERE id % 3 = 0;
+VACUUM (PARALLEL 2, VERBOSE) pv;
+SELECT tids = (SELECT count(*) FROM pv) AS one_entry_a_row, marked
+FROM dmbtree_index_stats('pv_k');
+SELECT * FROM pv_check('pv');
+
+-- INDEX_CLEANUP off leaves the indexes alone, without a parallel vacuum;
+-- the next VACUUM removes the entries of the items it left dead
+DELETE FROM pv WHERE id % 10 = 3;
+VACUUM (PARALLEL 2, INDEX_CLEANUP off, VERBOSE) pv;
+VACUUM (PARALLEL 2, VERBOSE) pv;
+SELECT * FROM pv_check('pv');
+-- PARALLEL 0: this backend alone
+DELETE FROM pv WHERE id % 10 = 4;
+VACUUM (PARALLEL 0, VERBOSE) pv;
+SELECT * FROM pv_check('pv');
+SELECT count(*) FROM pv;
+
+-- maintenance_work_mem below the first segment of the shared dead item
+-- store (256kB): a bulk deletion pass after each page with dead items, as
+-- for heap.  A row deleted on each data page.
+CREATE TABLE pv2 (id int PRIMARY KEY, k int) USING iheap
+  WITH (autovacuum_enabled = off);
+CREATE INDEX pv2_k ON pv2 (k);
+INSERT INTO pv2 SELECT g, g FROM generate_series(1, 873) g;
+UPDATE pv2 SET k = -k WHERE id % 2 = 0;
+DELETE FROM pv2
+WHERE ctid IN (SELECT min(ctid) FROM pv2 GROUP BY (ctid::text::point)[0]);
+SELECT data_pages FROM iheap_relation_stats('pv2');
+SET maintenance_work_mem = '64kB';
+VACUUM (PARALLEL 2, VERBOSE) pv2;
+RESET maintenance_work_mem;
+SELECT tids, marked FROM dmbtree_index_stats('pv2_k');
+SELECT * FROM pv_check('pv2');
+
+-- BRIN's cleanup summarizes new ranges through the table AM's index build
+-- scan, in a parallel worker or this backend
+CREATE TABLE pvb (id int, k int) USING iheap WITH (autovacuum_enabled = off);
+CREATE INDEX pvb_id ON pvb USING brin (id) WITH (pages_per_range = 1);
+CREATE INDEX pvb_k ON pvb (k);
+INSERT INTO pvb SELECT g, g FROM generate_series(1, 1000) g;
+VACUUM (PARALLEL 2, VERBOSE) pvb;
+SELECT brin_summarize_new_values('pvb_id');
+SET enable_seqscan = off;
+SELECT count(*) FROM pvb WHERE id BETWEEN 100 AND 199;
+RESET enable_seqscan;
+SELECT * FROM pv_check('pvb');
+
+-- a dmbtree index whose expression is not parallel safe (a function's
+-- default): dmbtree's cleanup evaluates it, so this backend vacuums the
+-- indexes alone, out of parallel mode, as a parallel build would not run
+CREATE FUNCTION pv_twice(int) RETURNS int IMMUTABLE LANGUAGE plpgsql
+  AS $$ BEGIN RETURN $1 * 2; END $$;
+CREATE TABLE pvu (id int PRIMARY KEY, k int) USING iheap
+  WITH (autovacuum_enabled = off);
+CREATE INDEX pvu_k2 ON pvu (pv_twice(k));
+INSERT INTO pvu SELECT g, g FROM generate_series(1, 100) g;
+UPDATE pvu SET k = k + 1000;
+VACUUM (PARALLEL 2, VERBOSE) pvu;
+SELECT tids, marked FROM dmbtree_index_stats('pvu_k2');
+VACUUM pvu;  -- no warning when PARALLEL is not given
+ALTER FUNCTION pv_twice(int) PARALLEL SAFE;
+UPDATE pvu SET k = k + 1000;
+VACUUM (PARALLEL 2, VERBOSE) pvu;
+SELECT tids, marked FROM dmbtree_index_stats('pvu_k2');
+SELECT * FROM pv_check('pvu');
+
+-- temporary tables: never in parallel, with a warning when asked for, as
+-- for heap
+CREATE TEMP TABLE pvt (id int PRIMARY KEY, k int) USING iheap;
+CREATE INDEX pvt_k ON pvt (k);
+INSERT INTO pvt SELECT g, g FROM generate_series(1, 100) g;
+DELETE FROM pvt WHERE id % 2 = 0;
+VACUUM (PARALLEL 1, VERBOSE) pvt;
+VACUUM (PARALLEL 0) pvt;
+VACUUM pvt;
+SELECT * FROM pv_check('pvt');
+
+RESET max_parallel_maintenance_workers;
+RESET min_parallel_index_scan_size;
+DROP TABLE pv, pv2, pvb, pvu, pvt;
+DROP FUNCTION pv_twice(int);
+DROP FUNCTION pv_check(regclass);
+DROP EXTENSION amcheck;
