@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * iheap_xlog.c
- *	  The iheap custom WAL resource manager: redo, desc, identify, mask,
- *	  decode.
+ *	  The iheap custom WAL resource manager: redo, desc, identify, mask
+ *	  (decode is in iheap_logical.c).
  *
  * Redo is deterministic: it applies the same page routines the primary
  * used (item placement, compaction, undo record placement), so standbys
@@ -19,9 +19,6 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
-#include "replication/decode.h"
-#include "replication/logical.h"
-#include "replication/snapbuild.h"
 #include "storage/bufmgr.h"
 #include "storage/standby.h"
 #include "utils/rel.h"
@@ -29,7 +26,7 @@
 #include "iheap.h"
 #include "iheap_xlog.h"
 
-int			iheap_logical_decoding = 0;	/* 0 = error, 1 = ignore */
+int			iheap_logical_decoding = IHEAP_LOGICAL_ON;
 
 /* ------------------------------------------------------------------------
  * Redo helpers
@@ -551,7 +548,7 @@ redo_spec_finish(XLogReaderState *record)
 		Page		page = BufferGetPage(buf);
 		ItemId		lp = PageGetItemId(page, xlrec->offnum);
 
-		if (xlrec->succeeded)
+		if (xlrec->flags & XLIH_SPEC_SUCCEEDED)
 		{
 			Size		len;
 			char	   *hdr = XLogRecGetBlockData(record, IH_BLK_DATA, &len);
@@ -747,9 +744,9 @@ iheap_desc(StringInfo buf, XLogReaderState *record)
 							 ((xl_iheap_discard *) rec)->snapshotConflictHorizon);
 			break;
 		case XLOG_IHEAP_SPEC_FINISH:
-			appendStringInfo(buf, "off: %u, succeeded: %u",
+			appendStringInfo(buf, "off: %u, flags: 0x%02X",
 							 ((xl_iheap_spec_finish *) rec)->offnum,
-							 ((xl_iheap_spec_finish *) rec)->succeeded);
+							 ((xl_iheap_spec_finish *) rec)->flags);
 			break;
 		case XLOG_IHEAP_UNUSED:
 			appendStringInfo(buf, "noffsets: %u", ((xl_iheap_unused *) rec)->noffsets);
@@ -809,47 +806,6 @@ iheap_mask(char *pagedata, BlockNumber blkno)
 	}
 	else if (IHeapPageGetType(page) == IHEAP_PAGE_UNDO)
 		IHeapPageGetOpaque(page)->ihp_flags &= ~IHU_DISCARDED;
-}
-
-/* ------------------------------------------------------------------------
- * Logical decoding (not supported yet: fail loudly, DESIGN.md §9.5)
- * ------------------------------------------------------------------------
- */
-static void
-iheap_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
-{
-	uint8		info = XLogRecGetInfo(buf->record) & XLOG_IHEAP_OPMASK;
-	RelFileLocator rlocator;
-
-	if (iheap_logical_decoding != 0)
-		return;
-
-	switch (info)
-	{
-		case XLOG_IHEAP_INSERT:
-		case XLOG_IHEAP_MULTI_INSERT:
-		case XLOG_IHEAP_DELETE:
-		case XLOG_IHEAP_UPDATE:
-		case XLOG_IHEAP_MOVE:
-			break;
-		default:
-			return;
-	}
-
-	if (!XLogRecGetBlockTagExtended(buf->record, IH_BLK_DATA, &rlocator, NULL, NULL, NULL))
-		return;
-	if (rlocator.dbOid != ctx->slot->data.database)
-		return;
-	if (SnapBuildCurrentState(ctx->snapshot_builder) < SNAPBUILD_FULL_SNAPSHOT)
-		return;
-
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("logical decoding of iheap tables is not supported"),
-			 errdetail("WAL record %s for relation %u/%u/%u.",
-					   iheap_identify(info), rlocator.spcOid, rlocator.dbOid,
-					   rlocator.relNumber),
-			 errhint("Set iheap.logical_decoding = ignore to skip changes of iheap tables.")));
 }
 
 static const RmgrData iheap_rmgr = {

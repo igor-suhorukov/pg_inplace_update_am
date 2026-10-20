@@ -2,8 +2,10 @@ iheap_basic
 iheap_mvcc
 iheap_index
 iheap_dmbtree
+iheap_dm_expr
 iheap_toast
 iheap_ddl
 iheap_bloat
 iheap_stats
 iheap_check
+iheap_logical

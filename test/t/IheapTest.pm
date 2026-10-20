@@ -116,8 +116,13 @@ sub setup_tables
 	$node->safe_psql('postgres', q{
 CREATE TABLE ti (id int PRIMARY KEY, k int, v int, s text, big text) USING iheap;
 CREATE INDEX ti_k ON ti (k);
+-- dmbtree with an expression, and with a predicate and an INCLUDE column
+CREATE INDEX ti_ls ON ti (lower(s));
+CREATE INDEX ti_kv ON ti (k) INCLUDE (v) WHERE v % 2 = 0;
 CREATE TABLE th (id int PRIMARY KEY, k int, v int, s text, big text) USING heap;
 CREATE INDEX th_k ON th (k);
+CREATE INDEX th_ls ON th (lower(s));
+CREATE INDEX th_kv ON th (k) INCLUDE (v) WHERE v % 2 = 0;
 INSERT INTO ti SELECT g, g, g, 's' || g, NULL FROM generate_series(1, 1000) g;
 INSERT INTO th SELECT g, g, g, 's' || g, NULL FROM generate_series(1, 1000) g;
 });

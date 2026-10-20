@@ -1018,11 +1018,36 @@ dmbtree_xlog_mark(XLogReaderState *record)
 	{
 		Page		page = BufferGetPage(buffer);
 		Size		len;
+		char	   *data;
 		DmbtMarkItem *items;
 
-		items = (DmbtMarkItem *) XLogRecGetBlockData(record, 0, &len);
-		Assert(len == xlrec->nitems * sizeof(DmbtMarkItem));
-		_dmbt_apply_marks(page, items, xlrec->nitems, xlrec->marked);
+		data = XLogRecGetBlockData(record, 0, &len);
+		items = (DmbtMarkItem *) data;
+		if (xlrec->op == DMBT_MARK_REPLACE)
+		{
+			char	   *p = data + xlrec->nitems * sizeof(DmbtMarkItem);
+			PGAlignedBlock tup;
+
+			for (int i = 0; i < xlrec->nitems; i++)
+			{
+				IndexTupleData hdr;
+				Size		sz;
+
+				memcpy(&hdr, p, sizeof(IndexTupleData));
+				sz = IndexTupleSize(&hdr);
+				memcpy(tup.data, p, sz);
+				if (!PageIndexTupleOverwrite(page, items[i].offnum, tup.data, sz))
+					elog(PANIC, "dmbtree: failed to replace entry");
+				p += sz;
+			}
+			Assert(p == data + len);
+		}
+		else
+		{
+			Assert(len == xlrec->nitems * sizeof(DmbtMarkItem));
+			_dmbt_apply_marks(page, items, xlrec->nitems,
+							  xlrec->op == DMBT_MARK_SET);
+		}
 
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(buffer);

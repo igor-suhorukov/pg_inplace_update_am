@@ -2,8 +2,8 @@
 # changed are found through the keys the snapshot sees -- by index,
 # index-only and bitmap scans -- also after a key comes back and while
 # VACUUM cleans up entries nobody else needs.  An index rebuilt meanwhile
-# (REINDEX, VACUUM FULL) has the newest keys only, and the old snapshot
-# does not use it.
+# (REINDEX, VACUUM FULL) has the older keys too, marked (§21 D32 B;
+# iheap_dm_rebuild.spec shows the plans).
 
 setup
 {

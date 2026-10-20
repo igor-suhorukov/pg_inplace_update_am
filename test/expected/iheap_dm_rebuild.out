@@ -1,0 +1,437 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1rr s2upd s2reindex s2xmin s2marks s2check s1plan s1k s1lower s1part s1incplan s1inc s1c s2vac s2marks s2sel
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2upd: UPDATE dr SET k = k + 100, s = 'X' || s, inc = inc + 1000 WHERE id <= 3;
+			  UPDATE dr SET flag = false WHERE id = 4;
+step s2reindex: REINDEX TABLE dr;
+step s2xmin: SELECT c.relname, i.indcheckxmin
+			  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			  WHERE i.indrelid = 'dr'::regclass ORDER BY 1;
+relname |indcheckxmin
+--------+------------
+dr_inc  |f           
+dr_k    |f           
+dr_lower|f           
+dr_part |f           
+dr_pkey |f           
+(5 rows)
+
+step s2marks: SELECT 'dr_k' AS idx, * FROM dmbtree_index_stats('dr_k')
+			  UNION ALL SELECT 'dr_lower', * FROM dmbtree_index_stats('dr_lower')
+			  UNION ALL SELECT 'dr_part', * FROM dmbtree_index_stats('dr_part')
+			  UNION ALL SELECT 'dr_inc', * FROM dmbtree_index_stats('dr_inc');
+idx     |leaf_pages|items|tids|marked|dead_items
+--------+----------+-----+----+------+----------
+dr_k    |         1|    9|   9|     3|         0
+dr_lower|         1|    9|   9|     3|         0
+dr_part |         1|    9|   9|     4|         0
+dr_inc  |         1|    6|   6|     3|         0
+(4 rows)
+
+step s2check: SELECT dmbtree_check('dr_k', true, false, true),
+				 dmbtree_check('dr_lower', true, false, true),
+				 dmbtree_check('dr_part', true, false, true),
+				 dmbtree_check('dr_inc', true, false, true);
+dmbtree_check|dmbtree_check|dmbtree_check|dmbtree_check
+-------------+-------------+-------------+-------------
+             |             |             |             
+(1 row)
+
+step s1plan: EXPLAIN (COSTS OFF) SELECT id, k FROM dr WHERE k BETWEEN 1 AND 6;
+QUERY PLAN                           
+-------------------------------------
+Index Scan using dr_k on dr          
+  Index Cond: ((k >= 1) AND (k <= 6))
+(2 rows)
+
+step s1k: SELECT id, k FROM dr WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1lower: SELECT id FROM dr WHERE lower(s) IN ('s1', 's2', 's3', 'xs1') ORDER BY id;
+id
+--
+ 1
+ 2
+ 3
+(3 rows)
+
+step s1part: SELECT id FROM dr WHERE flag AND k BETWEEN 1 AND 6 ORDER BY id;
+id
+--
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+(6 rows)
+
+step s1incplan: EXPLAIN (COSTS OFF) SELECT id, inc FROM dr WHERE id BETWEEN 1 AND 3;
+QUERY PLAN                             
+---------------------------------------
+Index Only Scan using dr_inc on dr     
+  Index Cond: ((id >= 1) AND (id <= 3))
+(2 rows)
+
+step s1inc: SELECT id, inc FROM dr WHERE id BETWEEN 1 AND 3 ORDER BY id;
+id|inc
+--+---
+ 1|  1
+ 2|  2
+ 3|  3
+(3 rows)
+
+step s1c: COMMIT;
+step s2vac: VACUUM dr;
+step s2marks: SELECT 'dr_k' AS idx, * FROM dmbtree_index_stats('dr_k')
+			  UNION ALL SELECT 'dr_lower', * FROM dmbtree_index_stats('dr_lower')
+			  UNION ALL SELECT 'dr_part', * FROM dmbtree_index_stats('dr_part')
+			  UNION ALL SELECT 'dr_inc', * FROM dmbtree_index_stats('dr_inc');
+idx     |leaf_pages|items|tids|marked|dead_items
+--------+----------+-----+----+------+----------
+dr_k    |         1|    6|   6|     0|         0
+dr_lower|         1|    6|   6|     0|         0
+dr_part |         1|    5|   5|     0|         0
+dr_inc  |         1|    6|   6|     0|         0
+(4 rows)
+
+step s2sel: SELECT id, k, s, flag, inc FROM dr ORDER BY id;
+id|  k|s  |flag| inc
+--+---+---+----+----
+ 1|101|XS1|t   |1001
+ 2|102|XS2|t   |1002
+ 3|103|XS3|t   |1003
+ 4|  4|S4 |f   |   4
+ 5|  5|S5 |t   |   5
+ 6|  6|S6 |t   |   6
+(6 rows)
+
+
+starting permutation: s1rr s2upd s2vacfull s2xmin s1k s1lower s1part s1inc s2check s1c s2vac s2marks
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2upd: UPDATE dr SET k = k + 100, s = 'X' || s, inc = inc + 1000 WHERE id <= 3;
+			  UPDATE dr SET flag = false WHERE id = 4;
+step s2vacfull: VACUUM FULL dr;
+step s2xmin: SELECT c.relname, i.indcheckxmin
+			  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			  WHERE i.indrelid = 'dr'::regclass ORDER BY 1;
+relname |indcheckxmin
+--------+------------
+dr_inc  |f           
+dr_k    |f           
+dr_lower|f           
+dr_part |f           
+dr_pkey |f           
+(5 rows)
+
+step s1k: SELECT id, k FROM dr WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1lower: SELECT id FROM dr WHERE lower(s) IN ('s1', 's2', 's3', 'xs1') ORDER BY id;
+id
+--
+ 1
+ 2
+ 3
+(3 rows)
+
+step s1part: SELECT id FROM dr WHERE flag AND k BETWEEN 1 AND 6 ORDER BY id;
+id
+--
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+(6 rows)
+
+step s1inc: SELECT id, inc FROM dr WHERE id BETWEEN 1 AND 3 ORDER BY id;
+id|inc
+--+---
+ 1|  1
+ 2|  2
+ 3|  3
+(3 rows)
+
+step s2check: SELECT dmbtree_check('dr_k', true, false, true),
+				 dmbtree_check('dr_lower', true, false, true),
+				 dmbtree_check('dr_part', true, false, true),
+				 dmbtree_check('dr_inc', true, false, true);
+dmbtree_check|dmbtree_check|dmbtree_check|dmbtree_check
+-------------+-------------+-------------+-------------
+             |             |             |             
+(1 row)
+
+step s1c: COMMIT;
+step s2vac: VACUUM dr;
+step s2marks: SELECT 'dr_k' AS idx, * FROM dmbtree_index_stats('dr_k')
+			  UNION ALL SELECT 'dr_lower', * FROM dmbtree_index_stats('dr_lower')
+			  UNION ALL SELECT 'dr_part', * FROM dmbtree_index_stats('dr_part')
+			  UNION ALL SELECT 'dr_inc', * FROM dmbtree_index_stats('dr_inc');
+idx     |leaf_pages|items|tids|marked|dead_items
+--------+----------+-----+----+------+----------
+dr_k    |         1|    6|   6|     0|         0
+dr_lower|         1|    6|   6|     0|         0
+dr_part |         1|    5|   5|     0|         0
+dr_inc  |         1|    6|   6|     0|         0
+(4 rows)
+
+
+starting permutation: s1rr s2upd s2cluster s2xmin s1k s1lower s1part s1inc s1c s2vac s2marks
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2upd: UPDATE dr SET k = k + 100, s = 'X' || s, inc = inc + 1000 WHERE id <= 3;
+			  UPDATE dr SET flag = false WHERE id = 4;
+step s2cluster: CLUSTER dr USING dr_pkey;
+step s2xmin: SELECT c.relname, i.indcheckxmin
+			  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			  WHERE i.indrelid = 'dr'::regclass ORDER BY 1;
+relname |indcheckxmin
+--------+------------
+dr_inc  |f           
+dr_k    |f           
+dr_lower|f           
+dr_part |f           
+dr_pkey |f           
+(5 rows)
+
+step s1k: SELECT id, k FROM dr WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1lower: SELECT id FROM dr WHERE lower(s) IN ('s1', 's2', 's3', 'xs1') ORDER BY id;
+id
+--
+ 1
+ 2
+ 3
+(3 rows)
+
+step s1part: SELECT id FROM dr WHERE flag AND k BETWEEN 1 AND 6 ORDER BY id;
+id
+--
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+(6 rows)
+
+step s1inc: SELECT id, inc FROM dr WHERE id BETWEEN 1 AND 3 ORDER BY id;
+id|inc
+--+---
+ 1|  1
+ 2|  2
+ 3|  3
+(3 rows)
+
+step s1c: COMMIT;
+step s2vac: VACUUM dr;
+step s2marks: SELECT 'dr_k' AS idx, * FROM dmbtree_index_stats('dr_k')
+			  UNION ALL SELECT 'dr_lower', * FROM dmbtree_index_stats('dr_lower')
+			  UNION ALL SELECT 'dr_part', * FROM dmbtree_index_stats('dr_part')
+			  UNION ALL SELECT 'dr_inc', * FROM dmbtree_index_stats('dr_inc');
+idx     |leaf_pages|items|tids|marked|dead_items
+--------+----------+-----+----+------+----------
+dr_k    |         1|    6|   6|     0|         0
+dr_lower|         1|    6|   6|     0|         0
+dr_part |         1|    5|   5|     0|         0
+dr_inc  |         1|    6|   6|     0|         0
+(4 rows)
+
+
+starting permutation: s1rr s2upd s2create s2xmin s1plan s1k s1c s2vac s2marks
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2upd: UPDATE dr SET k = k + 100, s = 'X' || s, inc = inc + 1000 WHERE id <= 3;
+			  UPDATE dr SET flag = false WHERE id = 4;
+step s2create: DROP INDEX dr_k; CREATE INDEX dr_k ON dr USING dmbtree (k);
+step s2xmin: SELECT c.relname, i.indcheckxmin
+			  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			  WHERE i.indrelid = 'dr'::regclass ORDER BY 1;
+relname |indcheckxmin
+--------+------------
+dr_inc  |f           
+dr_k    |f           
+dr_lower|f           
+dr_part |f           
+dr_pkey |f           
+(5 rows)
+
+step s1plan: EXPLAIN (COSTS OFF) SELECT id, k FROM dr WHERE k BETWEEN 1 AND 6;
+QUERY PLAN                           
+-------------------------------------
+Index Scan using dr_k on dr          
+  Index Cond: ((k >= 1) AND (k <= 6))
+(2 rows)
+
+step s1k: SELECT id, k FROM dr WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1c: COMMIT;
+step s2vac: VACUUM dr;
+step s2marks: SELECT 'dr_k' AS idx, * FROM dmbtree_index_stats('dr_k')
+			  UNION ALL SELECT 'dr_lower', * FROM dmbtree_index_stats('dr_lower')
+			  UNION ALL SELECT 'dr_part', * FROM dmbtree_index_stats('dr_part')
+			  UNION ALL SELECT 'dr_inc', * FROM dmbtree_index_stats('dr_inc');
+idx     |leaf_pages|items|tids|marked|dead_items
+--------+----------+-----+----+------+----------
+dr_k    |         1|    6|   6|     0|         0
+dr_lower|         1|    6|   6|     0|         0
+dr_part |         1|    5|   5|     0|         0
+dr_inc  |         1|    6|   6|     0|         0
+(4 rows)
+
+
+starting permutation: s1rr s2upd s2reindexpar s2xmin s2marks s1k s1lower s1part s1inc s2check s1c s2vac s2marks
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2upd: UPDATE dr SET k = k + 100, s = 'X' || s, inc = inc + 1000 WHERE id <= 3;
+			  UPDATE dr SET flag = false WHERE id = 4;
+step s2reindexpar: ALTER TABLE dr SET (parallel_workers = 2);
+			  SET max_parallel_maintenance_workers = 2;
+			  SET min_parallel_table_scan_size = 0;
+			  REINDEX TABLE dr;
+			  RESET max_parallel_maintenance_workers;
+			  RESET min_parallel_table_scan_size;
+step s2xmin: SELECT c.relname, i.indcheckxmin
+			  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			  WHERE i.indrelid = 'dr'::regclass ORDER BY 1;
+relname |indcheckxmin
+--------+------------
+dr_inc  |f           
+dr_k    |f           
+dr_lower|f           
+dr_part |f           
+dr_pkey |f           
+(5 rows)
+
+step s2marks: SELECT 'dr_k' AS idx, * FROM dmbtree_index_stats('dr_k')
+			  UNION ALL SELECT 'dr_lower', * FROM dmbtree_index_stats('dr_lower')
+			  UNION ALL SELECT 'dr_part', * FROM dmbtree_index_stats('dr_part')
+			  UNION ALL SELECT 'dr_inc', * FROM dmbtree_index_stats('dr_inc');
+idx     |leaf_pages|items|tids|marked|dead_items
+--------+----------+-----+----+------+----------
+dr_k    |         1|    9|   9|     3|         0
+dr_lower|         1|    9|   9|     3|         0
+dr_part |         1|    9|   9|     4|         0
+dr_inc  |         1|    6|   6|     3|         0
+(4 rows)
+
+step s1k: SELECT id, k FROM dr WHERE k BETWEEN 1 AND 6 ORDER BY k;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+ 5|5
+ 6|6
+(6 rows)
+
+step s1lower: SELECT id FROM dr WHERE lower(s) IN ('s1', 's2', 's3', 'xs1') ORDER BY id;
+id
+--
+ 1
+ 2
+ 3
+(3 rows)
+
+step s1part: SELECT id FROM dr WHERE flag AND k BETWEEN 1 AND 6 ORDER BY id;
+id
+--
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+(6 rows)
+
+step s1inc: SELECT id, inc FROM dr WHERE id BETWEEN 1 AND 3 ORDER BY id;
+id|inc
+--+---
+ 1|  1
+ 2|  2
+ 3|  3
+(3 rows)
+
+step s2check: SELECT dmbtree_check('dr_k', true, false, true),
+				 dmbtree_check('dr_lower', true, false, true),
+				 dmbtree_check('dr_part', true, false, true),
+				 dmbtree_check('dr_inc', true, false, true);
+dmbtree_check|dmbtree_check|dmbtree_check|dmbtree_check
+-------------+-------------+-------------+-------------
+             |             |             |             
+(1 row)
+
+step s1c: COMMIT;
+step s2vac: VACUUM dr;
+step s2marks: SELECT 'dr_k' AS idx, * FROM dmbtree_index_stats('dr_k')
+			  UNION ALL SELECT 'dr_lower', * FROM dmbtree_index_stats('dr_lower')
+			  UNION ALL SELECT 'dr_part', * FROM dmbtree_index_stats('dr_part')
+			  UNION ALL SELECT 'dr_inc', * FROM dmbtree_index_stats('dr_inc');
+idx     |leaf_pages|items|tids|marked|dead_items
+--------+----------+-----+----+------+----------
+dr_k    |         1|    6|   6|     0|         0
+dr_lower|         1|    6|   6|     0|         0
+dr_part |         1|    5|   5|     0|         0
+dr_inc  |         1|    6|   6|     0|         0
+(4 rows)
+

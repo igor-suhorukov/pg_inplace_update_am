@@ -164,14 +164,17 @@ write_bytes($file{c_urec}, $urec_at + 5,
 my $lpw = unpack('V', read_bytes($file{c_lp}, $lp_at, 4));
 write_bytes($file{c_lp}, $lp_at, pack('V', ($lpw & 0x1ffff) | (8000 << 17)));
 
-# an undo record of an unknown type: the first record of the first undo page
+# an undo record of an unknown type: the first record of the first undo
+# page, whose compact header starts with the type in its low four bits
+# (the flags in the high ones, kept)
 {
 	my $size = -s $file{c_undo};
 	my $done = 0;
 	for (my $b = 1; $b * $BLCKSZ < $size && !$done; $b++)
 	{
 		next unless unpack('v', read_bytes($file{c_undo}, ($b + 1) * $BLCKSZ - 8, 2)) == 0x6903;
-		write_bytes($file{c_undo}, $b * $BLCKSZ + 48 + 24, chr(99));
+		my $first = ord(read_bytes($file{c_undo}, $b * $BLCKSZ + 48, 1));
+		write_bytes($file{c_undo}, $b * $BLCKSZ + 48, chr(($first & 0xf0) | 0x0f));
 		$done = 1;
 	}
 	ok($done, 'found an undo page to corrupt');
@@ -224,7 +227,7 @@ like(problems('c_urec'), qr/: undo pointer \d+ is beyond the end of the undo str
 	'undo pointer beyond the stream');
 like(problems('c_lp'), qr/: line pointer to \d+ of 8000 bytes is outside the tuple space/m,
 	'line pointer beyond the page');
-like(problems('c_undo'), qr/: undo record \d+ has type 99$/m, 'undo record type');
+like(problems('c_undo'), qr/: undo record \d+ has type 15$/m, 'undo record type');
 my $meta = problems('c_meta');
 like($meta, qr/^0,-: discard pointer \d+ is not the start of an undo page$/m,
 	'discard pointer inside a page');

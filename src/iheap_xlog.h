@@ -44,6 +44,22 @@
 #define XLIH_NEW_VM_CLEARED		0x08	/* MOVE: VM bits of new page cleared */
 #define XLIH_SAME_PAGE			0x10	/* MOVE: new tuple on the same page */
 #define XLIH_RELOCATED			0x20	/* UPDATE: tuple moved within the page */
+#define XLIH_LOGICAL			0x40	/* INSERT, MULTI_INSERT, UPDATE, MOVE,
+										 * DELETE: main data carries what
+										 * logical decoding needs (below) */
+#define XLIH_LAST_IN_MULTI		0x80	/* MULTI_INSERT: the last record of a
+										 * multi_insert call */
+
+/*
+ * With XLIH_LOGICAL, the record's struct is followed in main data by a flags
+ * byte and the parts it names (iheap_logical.c): the layout of the
+ * relation's attributes, for the iheap tuple the record carries anyway
+ * (whole, and kept with a full-page image: REGBUF_KEEP_DATA), and the old
+ * row's replica identity in heap's layout.
+ */
+#define XLIL_LAYOUT				0x01
+#define XLIL_OLD_KEY			0x02	/* the identity columns */
+#define XLIL_OLD_TUPLE			0x04	/* the whole row (REPLICA IDENTITY FULL) */
 
 /* block ids */
 #define IH_BLK_DATA			0
@@ -88,6 +104,7 @@ typedef struct xl_iheap_hdrchange
  * XLOG_IHEAP_UPDATE: block DATA data =
  *		header (16) + new body bytes between prefix and suffix
  * The new tuple is old_body[0:prefix] + mid + old_body[old_len-suffix:].
+ * With XLIH_LOGICAL, prefix and suffix are 0: the whole new tuple.
  */
 typedef struct xl_iheap_update
 {
@@ -180,10 +197,14 @@ typedef struct xl_iheap_discard
 typedef struct xl_iheap_spec_finish
 {
 	OffsetNumber offnum;
-	uint8		succeeded;
+	uint8		flags;
 } xl_iheap_spec_finish;
 
-#define SizeOfIHeapSpecFinish	(offsetof(xl_iheap_spec_finish, succeeded) + sizeof(uint8))
+#define XLIH_SPEC_SUCCEEDED		0x01	/* confirmed (else super-deleted) */
+#define XLIH_SPEC_LOGICAL		0x02	/* the insertion was logged for logical
+										 * decoding: decode this too */
+
+#define SizeOfIHeapSpecFinish	(offsetof(xl_iheap_spec_finish, flags) + sizeof(uint8))
 
 /* XLOG_IHEAP_UNUSED: block DATA data = OffsetNumber[noffsets] */
 typedef struct xl_iheap_unused

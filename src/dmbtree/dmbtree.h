@@ -1198,6 +1198,13 @@ typedef struct BTScanOpaqueData
 	bool		dmVerify;
 
 	/*
+	 * dmbtree: holds the entry an index-only scan returns in place of a
+	 * marked one whose row has other INCLUDE values (§21 D39); created when
+	 * first needed.
+	 */
+	MemoryContext dmSubstCxt;
+
+	/*
 	 * If we are doing an index-only scan (dmbtree: or dmVerify), these are
 	 * the tuple storage workspaces for the currPos and markPos respectively.
 	 * Each is of size BLCKSZ, so it can hold as much as a full page's worth
@@ -1403,6 +1410,7 @@ extern void _dmbt_apply_marks(Page page, const DmbtMarkItem *items, int nitems,
 							  bool marked);
 extern void _dmbt_mark_items(Relation rel, Buffer buf, DmbtMarkItem *items,
 							 int nitems, bool marked);
+extern void _dmbt_note_marking(Page page);
 extern void _dmbt_dm_set_pending(Relation rel, bool force);
 extern bool _dmbt_dm_take_pending(Relation rel);
 extern int	_dmbt_dm_cleanup_page(Relation rel, Relation heapRel, Buffer buf,

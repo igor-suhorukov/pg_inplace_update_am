@@ -1,0 +1,360 @@
+--
+-- dmbtree indexes with expressions, predicates and INCLUDE columns take
+-- in-place updates of the columns they read (DESIGN.md §21 D39)
+--
+CREATE TABLE dx (id int PRIMARY KEY, s text, n int, flag bool, inc text,
+                 pad text)
+  USING iheap WITH (autovacuum_enabled = off, fillfactor = 50);
+CREATE INDEX dx_lower ON dx (lower(s));           -- expression
+CREATE INDEX dx_part ON dx (n) WHERE flag;        -- predicate
+CREATE INDEX dx_inc ON dx (n) INCLUDE (inc);      -- INCLUDE column
+SELECT c.relname, a.amname
+FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+     JOIN pg_am a ON a.oid = c.relam
+WHERE i.indrelid = 'dx'::regclass ORDER BY 1;
+ relname  | amname  
+----------+---------
+ dx_inc   | dmbtree
+ dx_lower | dmbtree
+ dx_part  | dmbtree
+ dx_pkey  | btree
+(4 rows)
+
+INSERT INTO dx SELECT g, 'S' || g, g, g % 2 = 0, 'i' || g, 'p'
+FROM generate_series(1, 300) g;
+VACUUM dx;
+CREATE TEMP TABLE dx_tids AS SELECT id, ctid AS t FROM dx;
+SELECT tids, marked FROM dmbtree_index_stats('dx_lower');
+ tids | marked 
+------+--------
+  300 |      0
+(1 row)
+
+-- an expression: a change that keeps lower(s) touches no entry; one that
+-- changes it marks the old entry and adds the new one
+UPDATE dx SET s = lower(s) WHERE id <= 50;
+SELECT tids, marked FROM dmbtree_index_stats('dx_lower');
+ tids | marked 
+------+--------
+  300 |      0
+(1 row)
+
+UPDATE dx SET s = 'X' || s WHERE id BETWEEN 51 AND 100;
+SELECT tids, marked FROM dmbtree_index_stats('dx_lower');
+ tids | marked 
+------+--------
+  350 |    100
+(1 row)
+
+-- a predicate: rows leave the index and enter it, and change keys within
+UPDATE dx SET flag = NOT flag WHERE id BETWEEN 101 AND 150;
+UPDATE dx SET n = n + 1000 WHERE id BETWEEN 151 AND 200 AND flag;
+SELECT tids, marked FROM dmbtree_index_stats('dx_part');
+ tids | marked 
+------+--------
+  200 |    100
+(1 row)
+
+-- INCLUDE values: the entry is marked and keeps its values
+UPDATE dx SET inc = 'new' || id WHERE id BETWEEN 201 AND 250;
+SELECT tids, marked FROM dmbtree_index_stats('dx_inc');
+ tids | marked 
+------+--------
+  325 |    100
+(1 row)
+
+SELECT count(*) FILTER (WHERE dx.ctid = t) AS stayed,
+       count(*) FILTER (WHERE dx.ctid <> t) AS moved
+FROM dx JOIN dx_tids USING (id);
+ stayed | moved 
+--------+-------
+    300 |     0
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT inplace_updates, inplace_key_updates, moved_updates
+FROM iheap_stat('dx');
+ inplace_updates | inplace_key_updates | moved_updates 
+-----------------+---------------------+---------------
+             225 |                 175 |             0
+(1 row)
+
+-- every scan finds each row through its current entry only
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM dx WHERE lower(s) = 's10';
+               QUERY PLAN               
+----------------------------------------
+ Index Scan using dx_lower on dx
+   Index Cond: (lower(s) = 's10'::text)
+(2 rows)
+
+SELECT id FROM dx WHERE lower(s) = 's10';
+ id 
+----
+ 10
+(1 row)
+
+SELECT id FROM dx WHERE lower(s) = 'xs60';
+ id 
+----
+ 60
+(1 row)
+
+SELECT id FROM dx WHERE lower(s) = 's60';
+ id 
+----
+(0 rows)
+
+SELECT count(*) FROM dx WHERE lower(s) LIKE 'x%';
+ count 
+-------
+    50
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT id FROM dx WHERE n = 102 AND flag;
+           QUERY PLAN           
+--------------------------------
+ Index Scan using dx_part on dx
+   Index Cond: (n = 102)
+(2 rows)
+
+SELECT id FROM dx WHERE n = 102 AND flag;
+ id 
+----
+(0 rows)
+
+SELECT id FROM dx WHERE n = 101 AND flag;
+ id  
+-----
+ 101
+(1 row)
+
+SELECT count(*), min(n), max(n) FROM dx WHERE flag AND n > 1000;
+ count | min  | max  
+-------+------+------
+    25 | 1152 | 1200
+(1 row)
+
+SELECT count(*) FROM dx WHERE flag;
+ count 
+-------
+   150
+(1 row)
+
+-- index-only scans return the row's INCLUDE values, not the marked entry's
+EXPLAIN (COSTS OFF) SELECT n, inc FROM dx WHERE n BETWEEN 201 AND 203;
+                QUERY PLAN                 
+-------------------------------------------
+ Index Only Scan using dx_inc on dx
+   Index Cond: ((n >= 201) AND (n <= 203))
+(2 rows)
+
+SELECT n, inc FROM dx WHERE n BETWEEN 201 AND 203;
+  n  |  inc   
+-----+--------
+ 201 | new201
+ 202 | new202
+ 203 | new203
+(3 rows)
+
+SELECT count(*) FROM dx WHERE n BETWEEN 201 AND 250 AND inc LIKE 'new%';
+ count 
+-------
+    50
+(1 row)
+
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+SELECT count(*) FROM dx WHERE lower(s) IN ('xs60', 's60', 's10');
+ count 
+-------
+     2
+(1 row)
+
+SELECT count(*) FROM dx WHERE flag AND n BETWEEN 100 AND 120;
+ count 
+-------
+    11
+(1 row)
+
+RESET enable_indexscan;
+-- with the marks kept and the pages all-visible (VACUUM without index
+-- cleanup), index-only scans skip the table except for marked entries
+VACUUM (INDEX_CLEANUP off) dx;
+SELECT tids, marked FROM dmbtree_index_stats('dx_inc');
+ tids | marked 
+------+--------
+  325 |    100
+(1 row)
+
+SET enable_bitmapscan = off;
+SELECT n, inc FROM dx WHERE n BETWEEN 201 AND 203;
+  n  |  inc   
+-----+--------
+ 201 | new201
+ 202 | new202
+ 203 | new203
+(3 rows)
+
+SELECT n, inc FROM dx WHERE n BETWEEN 251 AND 252;
+  n  | inc  
+-----+------
+ 251 | i251
+ 252 | i252
+(2 rows)
+
+RESET enable_bitmapscan;
+-- the structure checks agree, marks too
+SELECT * FROM iheap_check('dx');
+ blkno | offnum | msg 
+-------+--------+-----
+(0 rows)
+
+SELECT dmbtree_check('dx_lower', true, false, true),
+       dmbtree_check('dx_part', true, false, true),
+       dmbtree_check('dx_inc', true, false, true);
+ dmbtree_check | dmbtree_check | dmbtree_check 
+---------------+---------------+---------------
+               |               | 
+(1 row)
+
+-- VACUUM removes the old entries, clears the marks of the new ones, and
+-- gives entries of the INCLUDE index their rows' values
+VACUUM dx;
+SELECT tids, marked FROM dmbtree_index_stats('dx_lower');
+ tids | marked 
+------+--------
+  300 |      0
+(1 row)
+
+SELECT tids, marked FROM dmbtree_index_stats('dx_part');
+ tids | marked 
+------+--------
+  150 |      0
+(1 row)
+
+SELECT tids, marked FROM dmbtree_index_stats('dx_inc');
+ tids | marked 
+------+--------
+  300 |      0
+(1 row)
+
+SELECT dmbtree_check('dx_lower', true, false, true),
+       dmbtree_check('dx_part', true, false, true),
+       dmbtree_check('dx_inc', true, false, true);
+ dmbtree_check | dmbtree_check | dmbtree_check 
+---------------+---------------+---------------
+               |               | 
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT n, inc FROM dx WHERE n BETWEEN 201 AND 203;
+  n  |  inc   
+-----+--------
+ 201 | new201
+ 202 | new202
+ 203 | new203
+(3 rows)
+
+SELECT id FROM dx WHERE lower(s) = 'xs60';
+ id 
+----
+ 60
+(1 row)
+
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+-- an INCLUDE value too large for an entry is refused, as when the row moves
+UPDATE dx SET inc = (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 100) g)
+WHERE id = 300;
+ERROR:  index row size 3216 exceeds btree version 4 maximum 2704 for index "dx_inc"
+DETAIL:  Index row references tuple (8,7) in relation "dx".
+HINT:  Values larger than 1/3 of a buffer page cannot be indexed.
+Consider a function index of an MD5 hash of the value, or use full text indexing.
+UPDATE dx SET inc = (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 400) g)
+WHERE id = 300;
+ERROR:  index row requires 12616 bytes, maximum size is 8191
+-- uniqueness of an expression, and of a partial index (unique indexes are
+-- btree by default: iheap.unique_index_am)
+CREATE UNIQUE INDEX dx_ulower ON dx USING dmbtree (lower(s));
+UPDATE dx SET s = upper(s) WHERE id = 3;          -- same key: in place
+UPDATE dx SET s = 's2' WHERE id = 1;              -- another row has it
+ERROR:  duplicate key value violates unique constraint "dx_ulower"
+DETAIL:  Key (lower(s))=(s2) already exists.
+UPDATE dx SET s = 'S1001' WHERE id = 1;
+SELECT id, s FROM dx WHERE lower(s) IN ('s1', 's1001', 's2', 's3') ORDER BY id;
+ id |   s   
+----+-------
+  1 | S1001
+  2 | s2
+  3 | S3
+(3 rows)
+
+SELECT dmbtree_check('dx_ulower', true, true, true);
+ dmbtree_check 
+---------------
+ 
+(1 row)
+
+DROP INDEX dx_ulower;
+CREATE UNIQUE INDEX dx_upart ON dx USING dmbtree (n) WHERE flag;
+UPDATE dx SET n = 4 WHERE id = 3;                 -- row 3 is out of the index
+UPDATE dx SET flag = true WHERE id = 3;           -- now it enters it: conflict
+ERROR:  duplicate key value violates unique constraint "dx_upart"
+DETAIL:  Key (n)=(4) already exists.
+UPDATE dx SET n = 3 WHERE id = 3;
+UPDATE dx SET flag = true WHERE id = 3;
+SELECT id, n, flag FROM dx WHERE id IN (3, 4) ORDER BY id;
+ id | n | flag 
+----+---+------
+  3 | 3 | t
+  4 | 4 | t
+(2 rows)
+
+SELECT dmbtree_check('dx_upart', true, true, true);
+ dmbtree_check 
+---------------
+ 
+(1 row)
+
+-- an expression that reads values stored out of line
+CREATE TABLE dxt (id int PRIMARY KEY, big text) USING iheap;
+ALTER TABLE dxt ALTER COLUMN big SET STORAGE EXTERNAL;
+CREATE INDEX dxt_len ON dxt (length(big));
+INSERT INTO dxt SELECT g, repeat(md5(g::text), 100) FROM generate_series(1, 20) g;
+UPDATE dxt SET big = big || 'x' WHERE id <= 10;
+SET enable_seqscan = off;
+SELECT count(*) FROM dxt WHERE length(big) = 3201;
+ count 
+-------
+    10
+(1 row)
+
+SELECT count(*) FROM dxt WHERE length(big) = 3200;
+ count 
+-------
+    10
+(1 row)
+
+RESET enable_seqscan;
+SELECT dmbtree_check('dxt_len', true, false, true);
+ dmbtree_check 
+---------------
+ 
+(1 row)
+
+VACUUM dxt;
+SELECT tids, marked FROM dmbtree_index_stats('dxt_len');
+ tids | marked 
+------+--------
+   20 |      0
+(1 row)
+
+DROP TABLE dx, dxt;

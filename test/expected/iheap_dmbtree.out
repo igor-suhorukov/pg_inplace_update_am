@@ -50,10 +50,10 @@ CREATE INDEX dm_ks ON dm (k, s);
 CREATE INDEX dm_s ON dm (s);
 CREATE INDEX dm_b ON dm (b);
 CREATE INDEX dm_n ON dm (n);                    -- numeric: not "equalimage"
-CREATE INDEX dm_kinc ON dm (k) INCLUDE (inc);   -- INCLUDE columns
+CREATE INDEX dm_kinc ON dm (k) INCLUDE (inc);   -- INCLUDE columns (§21 D39)
 CREATE INDEX dm_pad ON dm USING btree (pad);    -- explicitly btree
-CREATE INDEX dm_e ON dm ((e + 1));              -- expression
-CREATE INDEX dm_p ON dm (p) WHERE p > 0;        -- partial
+CREATE INDEX dm_e ON dm ((e + 1));              -- expression (§21 D39)
+CREATE INDEX dm_p ON dm (p) WHERE p > 0;        -- partial (§21 D39)
 SELECT c.relname, a.amname
 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
      JOIN pg_am a ON a.oid = c.relam
@@ -106,16 +106,17 @@ GROUP BY 1 ORDER BY min(id);
  bool key       |    100 |     0
  two keys       |    100 |     0
  numeric key    |      0 |   100
- INCLUDE column |      0 |   100
+ INCLUDE column |    100 |     0
  btree key      |      0 |   100
- expression     |      0 |   100
- predicate      |      0 |   100
+ expression     |    100 |     0
+ predicate      |    100 |     0
  none           |    100 |     0
 (10 rows)
 
 -- an index on the whole row (through a function that is not inlined, so
 -- that the expression keeps the whole-row reference): a change of any
--- column changes its key, and the row moves
+-- column changes its key; the row stays, and iheap computes the old and
+-- the new key (§21 D39)
 CREATE TABLE dwr (id int, b text) USING iheap;
 CREATE FUNCTION dm_rowkey(r dwr) RETURNS text IMMUTABLE LANGUAGE plpgsql
   AS $$ BEGIN RETURN r.id || ':' || r.b; END $$;
@@ -125,7 +126,7 @@ UPDATE dwr SET b = 'x';
 SELECT ctid, * FROM dwr;
  ctid  | id | b 
 -------+----+---
- (1,2) |  1 | x
+ (1,1) |  1 | x
 (1 row)
 
 SET enable_seqscan = off;
@@ -1005,3 +1006,47 @@ DROP FUNCTION dm_bigkey(int);
 DROP OPERATOR FAMILY dm_fam USING dmbtree;
 DROP OPERATOR FAMILY dm_fam USING btree;
 DROP COLLATION dm_ci;
+-- ------------------------------------------------------------------------
+-- A leaf page notes the oldest xid that delete-marked an entry on it, in
+-- pd_prune_xid (§21 D27): until every snapshot sees that transaction no
+-- marked entry can go, and cleanup passes skip the page
+-- ------------------------------------------------------------------------
+CREATE TABLE dpx (id int, k int) USING iheap WITH (autovacuum_enabled = off);
+CREATE INDEX dpx_k ON dpx (k);
+INSERT INTO dpx SELECT g, g FROM generate_series(1, 50) g;
+SELECT prune_xid FROM page_header(get_raw_page('dpx_k', 1));
+ prune_xid 
+-----------
+         0
+(1 row)
+
+BEGIN;
+UPDATE dpx SET k = k + 100 WHERE id <= 5;
+CREATE TEMP TABLE dpx_xid AS SELECT xid(pg_current_xact_id()) AS x;
+COMMIT;
+SELECT prune_xid = (SELECT x FROM dpx_xid) AS noted
+FROM page_header(get_raw_page('dpx_k', 1));
+ noted 
+-------
+ t
+(1 row)
+
+-- a later marker leaves the oldest one
+UPDATE dpx SET k = k + 100 WHERE id BETWEEN 6 AND 10;
+SELECT prune_xid = (SELECT x FROM dpx_xid) AS oldest
+FROM page_header(get_raw_page('dpx_k', 1));
+ oldest 
+--------
+ t
+(1 row)
+
+-- a pass that decides every marked entry leaves no note
+VACUUM dpx;
+SELECT prune_xid, (SELECT marked FROM dmbtree_index_stats('dpx_k')) AS marked
+FROM page_header(get_raw_page('dpx_k', 1));
+ prune_xid | marked 
+-----------+--------
+         0 |      0
+(1 row)
+
+DROP TABLE dpx;

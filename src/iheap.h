@@ -287,9 +287,18 @@ typedef struct IHeapUndoPageHeaderData
 	TransactionId uph_min_xid;	/* oldest xid referenced by records */
 	TransactionId uph_max_xid;	/* newest record xid */
 	uint16		uph_nrecs;
-	uint16		uph_reserved;
+	uint16		uph_format;		/* IHEAP_UNDO_FORMAT_* of its records */
 	uint32		uph_reserved2;
 } IHeapUndoPageHeaderData;
+
+/*
+ * Record formats of undo pages.  Pages initialized before compact headers
+ * (§21 D37) have format 0: each record starts with IHeapUndoRecHeader as it
+ * is laid out in memory (IHEAP_UNDOREC_V1_HDRSZ bytes).  Records are only
+ * appended in the format of their page.
+ */
+#define IHEAP_UNDO_FORMAT_V1		0
+#define IHEAP_UNDO_FORMAT_COMPACT	1
 
 #define IHEAP_UNDO_DATA_START \
 	(MAXALIGN(SizeOfPageHeaderData) + MAXALIGN(sizeof(IHeapUndoPageHeaderData)))
@@ -317,10 +326,17 @@ IHeapUndoPageGetHeader(Page page)
 #define IHUF_MOVED_IN		0x08	/* INSERT is the new home of a moved row */
 
 /*
- * Undo record header, stored unaligned (read and written with memcpy).
- * ur_prev_hdr is the target item's tuple header before the operation (all
- * zeroes for inserts); walking a version chain means taking ur_prev_hdr as
- * the header of the previous version.
+ * Undo record header, decoded.  ur_prev_hdr is the target item's tuple
+ * header before the operation (all zeroes for inserts); walking a version
+ * chain means taking ur_prev_hdr as the header of the previous version.
+ * Its undo pointer is 0 when that version was frozen already when the
+ * record was written (iheap_undo_write): a frozen version needs no undo,
+ * and 0 is below every discard pointer.
+ *
+ * On an undo page of format IHEAP_UNDO_FORMAT_COMPACT a record starts with
+ * the compact form of its header (iheap_undo.c, §21 D37), between 12 and
+ * IHEAP_UNDOREC_MAXHDRSZ bytes; format IHEAP_UNDO_FORMAT_V1 has the struct
+ * as it is, unaligned.
  */
 typedef struct IHeapUndoRecHeader
 {
@@ -336,7 +352,11 @@ typedef struct IHeapUndoRecHeader
 	char		ur_prev_hdr[IHEAP_TUPHDR_SIZE];
 } IHeapUndoRecHeader;
 
-#define IHEAP_UNDOREC_HDRSZ	(offsetof(IHeapUndoRecHeader, ur_prev_hdr) + IHEAP_TUPHDR_SIZE)
+#define IHEAP_UNDOREC_V1_HDRSZ	(offsetof(IHeapUndoRecHeader, ur_prev_hdr) + IHEAP_TUPHDR_SIZE)
+#define IHEAP_UNDOREC_MAXHDRSZ	(2 + 2 + 4 + 4 + 4 + 2 + 7 + 5 + 4 + 7)
+
+/* room a record header may take on a page, either format */
+#define IHEAP_UNDOREC_HDRSZ		Max(IHEAP_UNDOREC_V1_HDRSZ, IHEAP_UNDOREC_MAXHDRSZ)
 
 /* lockers carried by INSERT/UPDATE/LOCK records */
 typedef struct IHeapLocker
@@ -348,12 +368,12 @@ typedef struct IHeapLocker
 #define IHEAP_LOCKER_SIZE	(sizeof(TransactionId) + 1)
 #define IHEAP_MAX_LOCKERS	64
 
-/* in-memory copy of a record */
+/* in-memory copy of a record: its decoded header and its payload */
 typedef struct IHeapUndoRec
 {
 	UndoRecPtr	urp;			/* where it lives */
 	IHeapUndoRecHeader hdr;
-	char	   *payload;		/* points into data */
+	char	   *payload;		/* points to data */
 	uint32		payload_len;
 	char		data[FLEXIBLE_ARRAY_MEMBER];
 } IHeapUndoRec;
@@ -503,7 +523,7 @@ typedef struct IHeapIndexFetchData
 } IHeapIndexFetchData;
 
 /*
- * Indexes whose key columns an in-place update may change (dmbtree indexes
+ * Indexes whose entries an in-place update may change (dmbtree indexes
  * that can carry delete-marks), and the columns whose change makes an
  * update move the row instead (§7.4).  Cached per relation, rebuilt after
  * a relcache invalidation of the table or of one of its indexes.
@@ -512,8 +532,13 @@ typedef struct IHeapDmIndex
 {
 	Oid			indexoid;
 	int			natts;			/* key and INCLUDE columns */
-	AttrNumber	attnums[INDEX_MAX_KEYS];	/* table column of each */
-	Bitmapset  *keyattrs;		/* key columns, as in the bitmaps below */
+	int			nkeyatts;
+	AttrNumber	attnums[INDEX_MAX_KEYS];	/* table column of each, 0 for
+											 * an expression */
+	Bitmapset  *keyattrs;		/* columns the key and the predicate read, as
+								 * in the bitmaps below */
+	Bitmapset  *incattrs;		/* INCLUDE columns */
+	bool		computed;		/* has expressions or a predicate */
 	bool		unique;
 } IHeapDmIndex;
 
@@ -525,10 +550,19 @@ typedef struct IHeapDmInfo
 	Bitmapset  *blocking;		/* columns (offset by
 								 * FirstLowInvalidHeapAttributeNumber) whose
 								 * change forces a move */
-	Bitmapset  *dmattrs;		/* key columns of the indexes below */
+	Bitmapset  *dmattrs;		/* columns the indexes below read */
 	int			ndm;
 	IHeapDmIndex *dm;
 } IHeapDmInfo;
+
+/* what iheap_dm_matches() may do, and compare */
+#define IHEAP_DM_EVAL		0x01	/* evaluate index expressions and a
+									 * predicate (no buffer is locked) */
+#define IHEAP_DM_FETCH		0x02	/* fetch values stored out of line (no
+									 * buffer locked, a snapshot is set, the
+									 * TOAST data is live) */
+#define IHEAP_DM_INCLUDE	0x04	/* compare INCLUDE values too */
+#define IHEAP_DM_UNLOCKED	(IHEAP_DM_EVAL | IHEAP_DM_FETCH)
 
 /* ------------------------------------------------------------------------
  * Function prototypes
@@ -619,6 +653,8 @@ typedef struct IHeapUndoReservation
 	uint64		lpage;
 	bool		init;			/* page initialized by this operation */
 	uint32		offset;			/* where the next record goes */
+	UndoRecPtr	discard;		/* the discard pointer when reserved: prev
+								 * headers below it are written frozen */
 	int			nwal;			/* records written, for WAL registration */
 	IHeapUndoWalEnt wal[4];
 	char		walhdr[4][IHEAP_UNDOWAL_MAXHDR];	/* their compact headers */
@@ -644,8 +680,16 @@ extern void iheap_undo_forget_relation(RelFileLocator rlocator);
 extern void iheap_undo_reset_backend(void);
 extern uint32 iheap_undo_take_alloc_count(Relation rel);
 extern void iheap_undo_init_page(Page page, uint64 lpage);
-extern void iheap_undo_put_record(Page page, uint32 offset, const char *rec,
-								  uint32 len);
+extern uint32 iheap_undo_put_record(Page page, uint32 offset,
+									IHeapUndoRecHeader *hdr,
+									const char *payload, uint32 payload_len);
+extern bool iheap_undo_read_record(Page page, uint32 off, uint32 limit,
+								   IHeapUndoRecHeader *hdr,
+								   const char **payload,
+								   uint32 *payload_len);
+extern bool iheap_undo_page_next(Page page, uint32 *off,
+								 IHeapUndoRecHeader *hdr,
+								 const char **payload, uint32 *payload_len);
 extern int	iheap_undo_lockers(const IHeapUndoRec *rec, IHeapLocker *lockers);
 extern uint32 iheap_undo_payload_core_len(const IHeapUndoRec *rec);
 extern uint32 iheap_lockers_size(int nlockers);
@@ -766,6 +810,31 @@ extern void iheap_desc(StringInfo buf, XLogReaderState *record);
 extern const char *iheap_identify(uint8 info);
 extern void iheap_mask(char *pagedata, BlockNumber blkno);
 
+/* iheap_logical.c */
+#define IHEAP_LOGICAL_ON		0	/* iheap.logical_decoding */
+#define IHEAP_LOGICAL_IGNORE	1
+
+/* what a record logged for logical decoding adds to its main data */
+typedef struct IHeapLogicalPart
+{
+	char	   *data;
+	uint32		len;
+} IHeapLogicalPart;
+
+struct LogicalDecodingContext;
+struct XLogRecordBuffer;
+
+extern bool iheap_logically_logged(Relation rel, bool no_logical);
+extern bool iheap_logical_key_required(Relation rel, const Bitmapset *modified,
+									   const Datum *oldvalues,
+									   const bool *oldisnull);
+extern void iheap_logical_prepare(IHeapLogicalPart *lp, Relation rel,
+								  bool layout, const Datum *oldvalues,
+								  const bool *oldisnull, bool key_required);
+extern void iheap_logical_free(IHeapLogicalPart *lp);
+extern void iheap_decode(struct LogicalDecodingContext *ctx,
+						 struct XLogRecordBuffer *buf);
+
 /* iheap_scan.c */
 extern TableScanDesc iheap_beginscan(Relation rel, Snapshot snapshot,
 									 int nkeys, ScanKeyData *key,
@@ -843,14 +912,17 @@ extern void iheap_hooks_init(void);
 /* iheap_dm.c */
 extern void iheap_dm_init(void);
 extern IHeapDmInfo *iheap_dm_info(Relation rel);
-extern void iheap_dm_update_indexes(Relation rel, ItemPointer tid,
+extern bool iheap_dm_update_indexes(Relation rel, ItemPointer tid,
 									const Bitmapset *modified,
 									const Datum *oldvalues,
 									const bool *oldisnull,
 									const Datum *newvalues,
 									const bool *newisnull);
 extern int	iheap_dm_matches(Relation rel, const IHeapDmEntry *dm,
-							 const char *tuple, bool allow_external);
+							 const char *tuple, int flags);
+extern bool iheap_dm_entry_values(Relation rel, Relation index,
+								  const char *tuple, Datum *ivalues,
+								  bool *iisnull);
 
 /* iheap_stats.c */
 typedef enum IHeapMoveReason

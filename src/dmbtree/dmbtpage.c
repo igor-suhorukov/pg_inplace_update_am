@@ -28,6 +28,7 @@
 #include "dmbtxlog.h"
 #include "access/tableam.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "common/int.h"
@@ -3216,6 +3217,31 @@ _dmbt_apply_marks(Page page, const DmbtMarkItem *items, int nitems,
 }
 
 /*
+ * Note in leaf page "page" that the current transaction delete-marked an
+ * entry on it (DESIGN.md §21 D36): pd_prune_xid, which index pages do not
+ * use otherwise, keeps the oldest such xid.  An entry marked by a
+ * transaction some snapshot may not see yet cannot be removed (only its
+ * mark cleared, which frees no room), so a cleanup pass is futile until
+ * the horizon passes that xid, and _dmbt_dm_cleanup_page() skips it.  A
+ * hint, like LP_DEAD bits: not WAL-logged (redo leaves the field alone),
+ * masked by wal_consistency_checking, kept through deduplication and
+ * splits.  Called with the page exclusively locked, in the critical section
+ * of the change.
+ */
+void
+_dmbt_note_marking(Page page)
+{
+	PageHeader	phdr = (PageHeader) page;
+	TransactionId xid = GetCurrentTransactionIdIfAny();
+
+	if (!TransactionIdIsNormal(xid))
+		return;
+	if (!TransactionIdIsValid(phdr->pd_prune_xid) ||
+		TransactionIdPrecedes(xid, phdr->pd_prune_xid))
+		phdr->pd_prune_xid = xid;
+}
+
+/*
  * Set (marked) or clear the delete-mark of the heap TIDs at the given
  * positions of leaf page buf, which the caller holds exclusively locked.
  * Marks are part of the index's content, so this is WAL-logged.  Positions
@@ -3233,6 +3259,8 @@ _dmbt_mark_items(Relation rel, Buffer buf, DmbtMarkItem *items, int nitems,
 	START_CRIT_SECTION();
 
 	_dmbt_apply_marks(page, items, nitems, marked);
+	if (marked)
+		_dmbt_note_marking(page);
 	MarkBufferDirty(buf);
 
 	if (RelationNeedsWAL(rel))
@@ -3240,7 +3268,7 @@ _dmbt_mark_items(Relation rel, Buffer buf, DmbtMarkItem *items, int nitems,
 		xl_dmbt_mark xlrec;
 
 		xlrec.nitems = nitems;
-		xlrec.marked = marked;
+		xlrec.op = marked ? DMBT_MARK_SET : DMBT_MARK_CLEAR;
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
 		XLogRegisterData(&xlrec, SizeOfDmbtMark);
@@ -3253,6 +3281,70 @@ _dmbt_mark_items(Relation rel, Buffer buf, DmbtMarkItem *items, int nitems,
 	PageSetLSN(page, recptr);
 
 	END_CRIT_SECTION();
+}
+
+/*
+ * Put tuples[i] in the place of the plain tuple at items[i] of leaf page
+ * buf, which the caller holds exclusively locked and has checked them to
+ * fit in (_dmbt_dm_cleanup_page): an entry of an index with INCLUDE
+ * columns takes its row's values, keeping its key and heap TID, so its
+ * place in the order (§21 D39).  The new tuples are unmarked.
+ */
+static void
+_dmbt_replace_items(Relation rel, Buffer buf, DmbtMarkItem *items,
+					IndexTuple *tuples, int nitems)
+{
+	Page		page = BufferGetPage(buf);
+	XLogRecPtr	recptr;
+	char	   *walbuf;
+	char	   *p;
+	Size		total = 0;
+
+	Assert(nitems > 0);
+
+	/* the new tuples, one after the other, for WAL (one buffer data entry) */
+	for (int i = 0; i < nitems; i++)
+		total += IndexTupleSize(tuples[i]);
+	walbuf = p = palloc(total);
+	for (int i = 0; i < nitems; i++)
+	{
+		memcpy(p, tuples[i], IndexTupleSize(tuples[i]));
+		p += IndexTupleSize(tuples[i]);
+	}
+
+	START_CRIT_SECTION();
+
+	for (int i = 0; i < nitems; i++)
+	{
+		Assert(items[i].postingidx == DMBT_PLAIN_TUPLE);
+		if (!PageIndexTupleOverwrite(page, items[i].offnum, tuples[i],
+									 IndexTupleSize(tuples[i])))
+			elog(PANIC, "dmbtree: failed to replace entry in index \"%s\"",
+				 RelationGetRelationName(rel));
+	}
+	MarkBufferDirty(buf);
+
+	if (RelationNeedsWAL(rel))
+	{
+		xl_dmbt_mark xlrec;
+
+		xlrec.nitems = nitems;
+		xlrec.op = DMBT_MARK_REPLACE;
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+		XLogRegisterData(&xlrec, SizeOfDmbtMark);
+		XLogRegisterBufData(0, items, nitems * sizeof(DmbtMarkItem));
+		XLogRegisterBufData(0, walbuf, total);
+		recptr = XLogInsert(RM_DMBTREE_ID, XLOG_DMBT_MARK);
+	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(page, recptr);
+
+	END_CRIT_SECTION();
+
+	pfree(walbuf);
 }
 
 /* set or clear btm_dm_pending; metabuf is write-locked */
@@ -3431,8 +3523,13 @@ _dmbt_dm_cleanup_page(Relation rel, Relation heapRel, Buffer buf, int *nkept)
 	DmbtMarkItem *where;
 	DmbtEntryStatus *status;
 	DmbtMarkItem *unmark;
+	IndexTuple *newtups;
+	DmbtMarkItem *rewrite;
+	IndexTuple *rewritetups;
 	int			nchecks = 0;
 	int			nunmark = 0;
+	int			nrewrite = 0;
+	int			room;
 	OffsetNumber deletable[MaxIndexTuplesPerPage];
 	int			ndeletable = 0;
 	BTVacuumPosting updatable[MaxIndexTuplesPerPage];
@@ -3441,7 +3538,9 @@ _dmbt_dm_cleanup_page(Relation rel, Relation heapRel, Buffer buf, int *nkept)
 	int			nkeep = 0;
 	TransactionId horizon;
 	TransactionId visible = iheap_dm_horizon(heapRel);
+	TransactionId waitfor = InvalidTransactionId;
 	PageHeader	phdr = (PageHeader) page;
+	TransactionId hint = phdr->pd_prune_xid;
 
 	Assert(P_ISLEAF(opaque));
 
@@ -3449,17 +3548,20 @@ _dmbt_dm_cleanup_page(Relation rel, Relation heapRel, Buffer buf, int *nkept)
 		*nkept = 0;
 
 	/*
-	 * A pass that keeps entries notes the horizon it decided by in
-	 * pd_prune_xid, which index pages do not use otherwise.  A kept entry
-	 * stays kept until the horizon moves past the change that replaced its
-	 * key (or a running transaction ends), so until then another pass
-	 * would remove nothing: while a long-lived snapshot holds the horizon,
-	 * each fill of the page would walk the rows of all its marked entries
-	 * again.  (Entries of transactions that abort meanwhile wait for the
-	 * horizon to move.)
+	 * pd_prune_xid holds the oldest xid the page's undecided marked entries
+	 * wait for (_dmbt_note_marking(), and the end of this function): an
+	 * entry marked by a transaction some snapshot may not see yet can be
+	 * unmarked at best, which frees no room, so until the horizon passes
+	 * that xid a pass would remove nothing.  While a long-lived snapshot
+	 * holds the horizon, each fill of the page would otherwise walk the
+	 * rows of all its marked entries.  Not skipped when that transaction
+	 * aborted (its new entries are dead at once), nor for a value that is
+	 * not a recent xid (a hint left long ago, wrapped around).
 	 */
-	if (TransactionIdIsValid(phdr->pd_prune_xid) &&
-		!TransactionIdFollows(visible, phdr->pd_prune_xid))
+	if (TransactionIdIsNormal(hint) &&
+		!TransactionIdFollows(visible, hint) &&
+		TransactionIdPrecedes(hint, ReadNextTransactionId()) &&
+		!TransactionIdDidAbort(hint))
 	{
 		if (nkept)
 			*nkept = 1;
@@ -3518,12 +3620,54 @@ _dmbt_dm_cleanup_page(Relation rel, Relation heapRel, Buffer buf, int *nkept)
 	horizon = iheap_dm_check_entries(heapRel, rel, checks, nchecks);
 
 	status = palloc(nchecks * sizeof(DmbtEntryStatus));
+	newtups = palloc(nchecks * sizeof(IndexTuple));
 	for (int i = 0; i < nchecks; i++)
+	{
 		status[checks[i].id] = checks[i].status;
+		newtups[checks[i].id] = checks[i].newtup;
+	}
+
+	/*
+	 * Entries of an index with INCLUDE columns that take their row's values
+	 * (§21 D39), where they fit: in the page's free space, and under the
+	 * size limit of an entry (the row's values were checked against it when
+	 * the update changed them, but not those of an older version).  Others
+	 * are kept, marked.
+	 */
+	rewrite = palloc(nchecks * sizeof(DmbtMarkItem));
+	rewritetups = palloc(nchecks * sizeof(IndexTuple));
+	room = (int) phdr->pd_upper - (int) phdr->pd_lower;
+	for (int i = 0; i < nchecks; i++)
+	{
+		IndexTuple	cur;
+		int			grow;
+
+		if (status[i] != DMBT_ENTRY_REWRITE)
+			continue;
+		cur = (IndexTuple) PageGetItem(page, PageGetItemId(page, where[i].offnum));
+		grow = (int) MAXALIGN(IndexTupleSize(newtups[i])) -
+			(int) MAXALIGN(IndexTupleSize(cur));
+		if (where[i].postingidx != DMBT_PLAIN_TUPLE ||
+			MAXALIGN(IndexTupleSize(newtups[i])) > BTMaxItemSize ||
+			grow > room)
+		{
+			status[i] = DMBT_ENTRY_KEEP;
+			continue;
+		}
+		room -= grow;
+		newtups[i]->t_tid = DmbtTidUnmarked(&cur->t_tid);
+		rewrite[nrewrite] = where[i];
+		rewritetups[nrewrite++] = newtups[i];
+	}
 
 	unmark = palloc(nchecks * sizeof(DmbtMarkItem));
 	for (int i = 0; i < nchecks; i++)
 	{
+		if (checks[i].status == DMBT_ENTRY_KEEP &&
+			TransactionIdIsNormal(checks[i].wait) &&
+			(!TransactionIdIsValid(waitfor) ||
+			 TransactionIdPrecedes(checks[i].wait, waitfor)))
+			waitfor = checks[i].wait;
 		if (status[i] == DMBT_ENTRY_CURRENT)
 			unmark[nunmark++] = where[i];
 		else if (status[i] == DMBT_ENTRY_KEEP)
@@ -3533,6 +3677,8 @@ _dmbt_dm_cleanup_page(Relation rel, Relation heapRel, Buffer buf, int *nkept)
 		*nkept = nkeep;
 	if (nunmark > 0)
 		_dmbt_mark_items(rel, buf, unmark, nunmark, false);
+	if (nrewrite > 0)
+		_dmbt_replace_items(rel, buf, rewrite, rewritetups, nrewrite);
 
 	/* where[] is in page order: group the dead TIDs by tuple */
 	for (int i = 0; i < nchecks;)
@@ -3587,15 +3733,37 @@ _dmbt_dm_cleanup_page(Relation rel, Relation heapRel, Buffer buf, int *nkept)
 							  RelationIsAccessibleInLogicalDecoding(heapRel),
 							  deletable, ndeletable, updatable, nupdatable);
 
-	/* a hint, like LP_DEAD bits: masked by wal_consistency_checking */
+	/*
+	 * The kept entries wait for the oldest of their rows' newest writers to
+	 * become visible to all; one kept for another reason (a value out of
+	 * line that cannot be fetched here) waits for the horizon to move at
+	 * all.  Without kept entries no mark is left.  A hint, like LP_DEAD
+	 * bits: masked by wal_consistency_checking.
+	 */
 	if (nkeep > 0)
 	{
-		phdr->pd_prune_xid = visible;
+		if (!TransactionIdIsValid(waitfor) ||
+			TransactionIdPrecedes(waitfor, visible))
+			waitfor = visible;
+		phdr->pd_prune_xid = waitfor;
+		MarkBufferDirtyHint(buf, true);
+	}
+	else if (TransactionIdIsValid(phdr->pd_prune_xid))
+	{
+		phdr->pd_prune_xid = InvalidTransactionId;
 		MarkBufferDirtyHint(buf, true);
 	}
 
 	for (int i = 0; i < nupdatable; i++)
 		pfree(updatable[i]);
+	for (int i = 0; i < nchecks; i++)
+	{
+		if (newtups[i] != NULL)
+			pfree(newtups[i]);
+	}
+	pfree(newtups);
+	pfree(rewrite);
+	pfree(rewritetups);
 	pfree(unmark);
 	pfree(status);
 	pfree(checks);

@@ -1386,6 +1386,7 @@ _dmbt_insertonpg(Relation rel,
 	IndexTuple	origitup = NULL;
 	IndexTuple	nposting = NULL;
 	XLogRecPtr	recptr;
+	bool		newmarked;
 
 	page = BufferGetPage(buf);
 	opaque = BTPageGetOpaque(page);
@@ -1393,6 +1394,8 @@ _dmbt_insertonpg(Relation rel,
 	isroot = P_ISROOT(opaque);
 	isrightmost = P_RIGHTMOST(opaque);
 	isonly = P_LEFTMOST(opaque) && P_RIGHTMOST(opaque);
+	/* dmbtree: a marked entry is noted in the page header, see below */
+	newmarked = isleaf && DmbtTidIsMarked(&itup->t_tid);
 
 	/* child buffer must be given iff inserting on an internal page */
 	Assert(isleaf == !BufferIsValid(cbuf));
@@ -1476,6 +1479,14 @@ _dmbt_insertonpg(Relation rel,
 
 		Assert(!split_only_page);
 
+		/*
+		 * dmbtree: both halves take the original page's note of the oldest
+		 * marking xid (_dmbt_note_marking()), a hint: it may be set before
+		 * the split's critical section.
+		 */
+		if (newmarked)
+			_dmbt_note_marking(page);
+
 		/* split the buffer into left and right halves */
 		rbuf = _dmbt_split(rel, heaprel, itup_key, buf, cbuf, newitemoff, itemsz,
 						 itup, origitup, nposting, postingoff);
@@ -1550,6 +1561,8 @@ _dmbt_insertonpg(Relation rel,
 		if (PageAddItem(page, itup, itemsz, newitemoff, false, false) == InvalidOffsetNumber)
 			elog(PANIC, "failed to add new item to block %u in index \"%s\"",
 				 BufferGetBlockNumber(buf), RelationGetRelationName(rel));
+		if (newmarked)
+			_dmbt_note_marking(page);
 
 		MarkBufferDirty(buf);
 

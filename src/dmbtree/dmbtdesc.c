@@ -137,8 +137,12 @@ dmbtree_desc(StringInfo buf, XLogReaderState *record)
 			{
 				xl_dmbt_mark *xlrec = (xl_dmbt_mark *) rec;
 
-				appendStringInfo(buf, "nitems: %u, marked: %c",
-								 xlrec->nitems, xlrec->marked ? 'T' : 'F');
+				appendStringInfo(buf, "nitems: %u, op: %s",
+								 xlrec->nitems,
+								 xlrec->op == DMBT_MARK_SET ? "mark" :
+								 xlrec->op == DMBT_MARK_CLEAR ? "unmark" :
+								 xlrec->op == DMBT_MARK_REPLACE ? "replace" :
+								 "?");
 				break;
 			}
 	}

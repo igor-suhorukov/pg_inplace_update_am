@@ -15,6 +15,7 @@ OBJS = \
 	src/iheap_handler.o \
 	src/iheap_hooks.o \
 	src/iheap_index.o \
+	src/iheap_logical.o \
 	src/iheap_meta.o \
 	src/iheap_prune.o \
 	src/iheap_rewrite.o \

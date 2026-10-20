@@ -890,7 +890,7 @@ heap_entry_is_visible(BtreeCheckState *state, ItemPointer tid, IndexTuple itup)
 
 	if (state->iheaprel)
 		return iheap_dm_entry_visible(state->heaprel, &htid, state->snapshot,
-									  state->rel, itup);
+									  state->rel, itup, NULL);
 
 	slot = table_slot_create(state->heaprel, NULL);
 	tid_visible = table_tuple_fetch_row_version(state->heaprel,
@@ -3107,6 +3107,24 @@ bt_normalize_tuple(BtreeCheckState *state, IndexTuple itup)
 		memcpy(copy, itup, IndexTupleSize(itup));
 		DmbtTidSetMarked(&copy->t_tid, false);
 		itup = copy;
+	}
+
+	/*
+	 * dmbtree: a marked entry keeps the INCLUDE values it was made with when
+	 * an in-place update changes them (§21 D39), so entries are fingerprinted
+	 * without them, on both sides; checkmarks compares the unmarked ones'
+	 * with their rows.
+	 */
+	if (IndexRelationGetNumberOfKeyAttributes(state->rel) < tupleDescriptor->natts)
+	{
+		ItemPointerData tid = itup->t_tid;
+
+		index_deform_tuple(itup, tupleDescriptor, normalized, isnull);
+		for (i = IndexRelationGetNumberOfKeyAttributes(state->rel);
+			 i < tupleDescriptor->natts; i++)
+			isnull[i] = true;
+		itup = index_form_tuple(tupleDescriptor, normalized, isnull);
+		itup->t_tid = tid;
 	}
 
 	/* Easy case: It's immediately clear that tuple has no varlena datums */

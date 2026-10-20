@@ -9,7 +9,7 @@ CREATE INDEX ix_tag_hash ON ix USING hash (tag);
 CREATE INDEX ix_doc ON ix USING gin (doc);
 CREATE INDEX ix_rng ON ix USING gist (rng);
 CREATE INDEX ix_b_brin ON ix USING brin (b);
-CREATE INDEX ix_partial ON ix (extra) WHERE extra IS NOT NULL;
+CREATE INDEX ix_partial ON ix USING btree (extra) WHERE extra IS NOT NULL;
 CREATE INDEX ix_expr ON ix (lower(tag));
 
 INSERT INTO ix
@@ -26,7 +26,7 @@ UPDATE ix SET extra = NULL WHERE id <= 100;
 UPDATE ix SET b = b + 1 WHERE id BETWEEN 101 AND 200;
 -- btree-indexed column: moves
 UPDATE ix SET k = k + 1 WHERE id BETWEEN 201 AND 300;
--- hash / gin / gist / expression / partial index columns: move
+-- hash / gin / gist / expression / partial btree index columns: move
 UPDATE ix SET tag = tag || 'x' WHERE id BETWEEN 301 AND 400;
 UPDATE ix SET doc = doc || '{"c": 1}' WHERE id BETWEEN 401 AND 500;
 UPDATE ix SET rng = int4range(lower(rng), upper(rng) + 1) WHERE id BETWEEN 501 AND 600;

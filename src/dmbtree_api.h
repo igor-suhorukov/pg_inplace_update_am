@@ -30,15 +30,16 @@
 extern bool dmbtree_is_dmbtree(Relation index);
 
 /*
- * Can "index" take in-place updates of its key columns?  A dmbtree index
- * whose key columns are plain table columns, without a predicate, and
- * whose opclasses all have "equality implies image equality" (the
- * metapage's allequalimage, as for deduplication).
+ * Can "index" take in-place updates of the columns it reads?  A dmbtree
+ * index whose key columns' opclasses all have "equality implies image
+ * equality" (computed at build time for the key columns, as for
+ * deduplication); expressions, a predicate and INCLUDE columns are fine
+ * (§21 D24, D39).
  */
 extern bool dmbtree_dm_capable(Relation index);
 
 /*
- * After an in-place update of row "tid" changed the key of "index": add the
+ * After an in-place update of row "tid" changed the entry of "index": add the
  * entry for the new key, delete-marked (with a uniqueness check if
  * "unique"), and delete-mark the entry for the old key.
  */
@@ -48,6 +49,28 @@ extern void dmbtree_inplace_insert(Relation index, Relation heaprel,
 extern void dmbtree_inplace_mark(Relation index, Relation heaprel,
 								 Datum *values, bool *isnull,
 								 ItemPointer tid);
+
+/*
+ * An in-place update changed only the INCLUDE values of row "tid"'s entry,
+ * which is marked and keeps its values (§21 D39): raise the error an
+ * insertion of the new entry would raise if it is too large.
+ */
+extern void dmbtree_check_entry_size(Relation index, Relation heaprel,
+									 Datum *values, bool *isnull,
+									 ItemPointer tid);
+
+/*
+ * Does a build of "index" (not a concurrent one) on "heaprel" take the keys
+ * of older row versions that some snapshot may still see, as delete-marked
+ * entries (§21 D32 B)?  A dmbtree index that can take in-place updates of
+ * the columns it reads, on an iheap table.  The table AM's build scan hands
+ * such entries to the build callback with DMBTREE_TID_MARK set in the TID's
+ * offset number; dmbtree inserts them after the sorted load (an entry the
+ * load put there already is marked instead).
+ */
+extern bool dmbtree_build_older_keys(Relation index, Relation heaprel);
+
+#define DMBTREE_TID_MARK	((OffsetNumber) 0x8000)
 
 extern void dmbtree_rmgr_register(void);
 
@@ -70,11 +93,14 @@ extern void iheap_index_fetch_set_entry(IndexFetchTableData *fetch,
 /*
  * Does row "tid" have a version visible to "snapshot" whose key is the one
  * of entry "itup"?  For index-only scans, which take the index tuple's
- * values without visiting the table when the page is all-visible.
+ * values without visiting the table when the page is all-visible.  If
+ * "subst" is not NULL and that version's INCLUDE values differ from the
+ * entry's, *subst is set to an index tuple with the version's values, for
+ * the scan to return instead (palloc'd).
  */
 extern bool iheap_dm_entry_visible(Relation heaprel, ItemPointer tid,
 								   Snapshot snapshot, Relation index,
-								   IndexTuple itup);
+								   IndexTuple itup, IndexTuple *subst);
 
 /*
  * table_index_fetch_tuple_check() for a dmbtree entry: uniqueness checks
@@ -93,6 +119,10 @@ typedef enum DmbtEntryStatus
 	DMBT_ENTRY_DEAD,			/* no snapshot can need it: remove it */
 	DMBT_ENTRY_CURRENT,			/* the newest committed version has its
 								 * key: the mark can be cleared */
+	DMBT_ENTRY_REWRITE,			/* the same, but other INCLUDE values,
+								 * and every snapshot sees that version:
+								 * the entry can take them (newtup) and
+								 * lose its mark */
 } DmbtEntryStatus;
 
 typedef struct DmbtEntryCheck
@@ -101,6 +131,12 @@ typedef struct DmbtEntryCheck
 	IndexTuple	itup;			/* the entry, for its key */
 	int			id;				/* caller's */
 	DmbtEntryStatus status;		/* result */
+	TransactionId wait;			/* KEEP: the writer of the row's newest
+								 * version; until every snapshot sees it,
+								 * the entry stays undecided (or invalid:
+								 * unknown) */
+	IndexTuple	newtup;			/* REWRITE: the entry to put in its place
+								 * (unmarked TID; palloc'd) */
 } DmbtEntryCheck;
 
 /*

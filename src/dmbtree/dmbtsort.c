@@ -69,6 +69,7 @@
 #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000004)
 #define PARALLEL_KEY_WAL_USAGE			UINT64CONST(0xA000000000000005)
 #define PARALLEL_KEY_BUFFER_USAGE		UINT64CONST(0xA000000000000006)
+#define PARALLEL_KEY_TUPLESORT_SPOOL3	UINT64CONST(0xA000000000000007)
 
 /*
  * DISABLE_LEADER_PARTICIPATION disables the leader's participation in
@@ -107,6 +108,8 @@ typedef struct BTShared
 	bool		isunique;
 	bool		nulls_not_distinct;
 	bool		isconcurrent;
+	bool		olderkeys;		/* dmbtree: a third spool, for the marked
+								 * entries of older row versions */
 	int			scantuplesortstates;
 
 	/* Query ID, for report in worker processes */
@@ -147,6 +150,7 @@ typedef struct BTShared
 	int			nparticipantsdone;
 	double		reltuples;
 	bool		havedead;
+	bool		havemarked;		/* dmbtree: spool3 got entries */
 	double		indtuples;
 	bool		brokenhotchain;
 
@@ -195,6 +199,7 @@ typedef struct BTLeader
 	BTShared   *btshared;
 	Sharedsort *sharedsort;
 	Sharedsort *sharedsort2;
+	Sharedsort *sharedsort3;	/* dmbtree: btspool3's */
 	Snapshot	snapshot;
 	WalUsage   *walusage;
 	BufferUsage *bufferusage;
@@ -219,6 +224,14 @@ typedef struct BTBuildState
 	 * put into spool2 instead of spool in order to avoid uniqueness check.
 	 */
 	BTSpool    *spool2;
+
+	/*
+	 * dmbtree: spool3 takes the delete-marked entries of older row versions
+	 * that some snapshot may still see (§21 D32 B), which the table AM hands
+	 * to the callback with marked TIDs.  They are inserted after the load.
+	 */
+	BTSpool    *spool3;
+	bool		havemarked;
 	double		indtuples;
 
 	/*
@@ -288,9 +301,12 @@ static double _dmbt_parallel_heapscan(BTBuildState *buildstate,
 									bool *brokenhotchain);
 static void _dmbt_leader_participate_as_worker(BTBuildState *buildstate);
 static void _dmbt_parallel_scan_and_sort(BTSpool *btspool, BTSpool *btspool2,
+									   BTSpool *btspool3,
 									   BTShared *btshared, Sharedsort *sharedsort,
-									   Sharedsort *sharedsort2, int sortmem,
+									   Sharedsort *sharedsort2,
+									   Sharedsort *sharedsort3, int sortmem,
 									   bool progress);
+static void _dmbt_insert_marked(BTSpool *btspool3);
 
 
 /*
@@ -314,6 +330,8 @@ dmbtbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	buildstate.heap = heap;
 	buildstate.spool = NULL;
 	buildstate.spool2 = NULL;
+	buildstate.spool3 = NULL;
+	buildstate.havemarked = false;
 	buildstate.indtuples = 0;
 	buildstate.btleader = NULL;
 
@@ -339,10 +357,21 @@ dmbtbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	_dmbt_spooldestroy(buildstate.spool);
 	if (buildstate.spool2)
 		_dmbt_spooldestroy(buildstate.spool2);
+	/* dmbtree: then the marked entries of older row versions */
+	if (buildstate.spool3)
+	{
+		_dmbt_insert_marked(buildstate.spool3);
+		_dmbt_spooldestroy(buildstate.spool3);
+	}
 	if (buildstate.btleader)
 		_dmbt_end_parallel(buildstate.btleader);
 
-	/* dmbtree: a rebuild that found rows updated in place */
+	/*
+	 * dmbtree: a rebuild that found rows updated in place whose older
+	 * versions it could not index (§21 D32): older snapshots must not use
+	 * the index.  Without such rows the index has an entry for every
+	 * version some snapshot may see, marked for the older ones.
+	 */
 	if (indexInfo->ii_BrokenHotChain && !indexInfo->ii_Concurrent &&
 		ReindexIsProcessingIndex(RelationGetRelid(index)) &&
 		dmbtree_dm_capable(index))
@@ -486,6 +515,34 @@ _dmbt_spools_heapscan(Relation heap, Relation index, BTBuildState *buildstate,
 										coordinate2, TUPLESORT_NONE);
 	}
 
+	/*
+	 * dmbtree: the marked entries of older row versions go to a third
+	 * spool, to be inserted after the load (§21 D32 B); like spool2, no
+	 * uniqueness check, and work_mem.
+	 */
+	if (!indexInfo->ii_Concurrent && dmbtree_build_older_keys(index, heap))
+	{
+		BTSpool    *btspool3 = palloc0_object(BTSpool);
+		SortCoordinate coordinate3 = NULL;
+
+		btspool3->heap = heap;
+		btspool3->index = index;
+		btspool3->isunique = false;
+		buildstate->spool3 = btspool3;
+
+		if (buildstate->btleader)
+		{
+			coordinate3 = palloc0_object(SortCoordinateData);
+			coordinate3->isWorker = false;
+			coordinate3->nParticipants =
+				buildstate->btleader->nparticipanttuplesorts;
+			coordinate3->sharedsort = buildstate->btleader->sharedsort3;
+		}
+		buildstate->spool3->sortstate =
+			tuplesort_begin_index_btree(heap, index, false, false, work_mem,
+										coordinate3, TUPLESORT_NONE);
+	}
+
 	/* Fill spool using either serial or parallel heap scan */
 	if (!buildstate->btleader)
 		reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
@@ -519,6 +576,11 @@ _dmbt_spools_heapscan(Relation heap, Relation index, BTBuildState *buildstate,
 		/* spool2 turns out to be unnecessary */
 		_dmbt_spooldestroy(buildstate->spool2);
 		buildstate->spool2 = NULL;
+	}
+	if (buildstate->spool3 && !buildstate->havemarked)
+	{
+		_dmbt_spooldestroy(buildstate->spool3);
+		buildstate->spool3 = NULL;
 	}
 
 	return reltuples;
@@ -603,7 +665,14 @@ _dmbt_build_callback(Relation index,
 	 * insert the index tuple into the appropriate spool file for subsequent
 	 * processing
 	 */
-	if (tupleIsAlive || buildstate->spool2 == NULL)
+	if (DmbtTidIsMarked(tid))
+	{
+		/* dmbtree: an older row version's entry (or a marked copy) */
+		Assert(buildstate->spool3 != NULL);
+		buildstate->havemarked = true;
+		_dmbt_spool(buildstate->spool3, tid, values, isnull);
+	}
+	else if (tupleIsAlive || buildstate->spool2 == NULL)
 		_dmbt_spool(buildstate->spool, tid, values, isnull);
 	else
 	{
@@ -1417,6 +1486,8 @@ _dmbt_begin_parallel(BTBuildState *buildstate, bool isconcurrent, int request)
 	BTShared   *btshared;
 	Sharedsort *sharedsort;
 	Sharedsort *sharedsort2;
+	Sharedsort *sharedsort3;
+	bool		olderkeys;
 	BTSpool    *btspool = buildstate->spool;
 	BTLeader   *btleader = palloc0_object(BTLeader);
 	WalUsage   *walusage;
@@ -1472,6 +1543,15 @@ _dmbt_begin_parallel(BTBuildState *buildstate, bool isconcurrent, int request)
 		shm_toc_estimate_keys(&pcxt->estimator, 3);
 	}
 
+	/* dmbtree: and a third, for the marked entries of older row versions */
+	olderkeys = !isconcurrent && dmbtree_build_older_keys(btspool->index,
+														  btspool->heap);
+	if (olderkeys)
+	{
+		shm_toc_estimate_chunk(&pcxt->estimator, estsort);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+	}
+
 	/*
 	 * Estimate space for WalUsage and BufferUsage -- PARALLEL_KEY_WAL_USAGE
 	 * and PARALLEL_KEY_BUFFER_USAGE.
@@ -1518,6 +1598,7 @@ _dmbt_begin_parallel(BTBuildState *buildstate, bool isconcurrent, int request)
 	btshared->isunique = btspool->isunique;
 	btshared->nulls_not_distinct = btspool->nulls_not_distinct;
 	btshared->isconcurrent = isconcurrent;
+	btshared->olderkeys = olderkeys;
 	btshared->scantuplesortstates = scantuplesortstates;
 	btshared->queryid = pgstat_get_my_query_id();
 	ConditionVariableInit(&btshared->workersdonecv);
@@ -1526,6 +1607,7 @@ _dmbt_begin_parallel(BTBuildState *buildstate, bool isconcurrent, int request)
 	btshared->nparticipantsdone = 0;
 	btshared->reltuples = 0.0;
 	btshared->havedead = false;
+	btshared->havemarked = false;
 	btshared->indtuples = 0.0;
 	btshared->brokenhotchain = false;
 	table_parallelscan_initialize(btspool->heap,
@@ -1560,6 +1642,16 @@ _dmbt_begin_parallel(BTBuildState *buildstate, bool isconcurrent, int request)
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_TUPLESORT_SPOOL2, sharedsort2);
 	}
 
+	if (!olderkeys)
+		sharedsort3 = NULL;
+	else
+	{
+		sharedsort3 = (Sharedsort *) shm_toc_allocate(pcxt->toc, estsort);
+		tuplesort_initialize_shared(sharedsort3, scantuplesortstates,
+									pcxt->seg);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_TUPLESORT_SPOOL3, sharedsort3);
+	}
+
 	/* Store query string for workers */
 	if (debug_query_string)
 	{
@@ -1590,6 +1682,7 @@ _dmbt_begin_parallel(BTBuildState *buildstate, bool isconcurrent, int request)
 	btleader->btshared = btshared;
 	btleader->sharedsort = sharedsort;
 	btleader->sharedsort2 = sharedsort2;
+	btleader->sharedsort3 = sharedsort3;
 	btleader->snapshot = snapshot;
 	btleader->walusage = walusage;
 	btleader->bufferusage = bufferusage;
@@ -1678,6 +1771,7 @@ _dmbt_parallel_heapscan(BTBuildState *buildstate, bool *brokenhotchain)
 		if (btshared->nparticipantsdone == nparticipanttuplesorts)
 		{
 			buildstate->havedead = btshared->havedead;
+			buildstate->havemarked = btshared->havemarked;
 			buildstate->indtuples = btshared->indtuples;
 			*brokenhotchain = btshared->brokenhotchain;
 			reltuples = btshared->reltuples;
@@ -1704,6 +1798,7 @@ _dmbt_leader_participate_as_worker(BTBuildState *buildstate)
 	BTLeader   *btleader = buildstate->btleader;
 	BTSpool    *leaderworker;
 	BTSpool    *leaderworker2;
+	BTSpool    *leaderworker3 = NULL;
 	int			sortmem;
 
 	/* Allocate memory and initialize private spool */
@@ -1727,6 +1822,14 @@ _dmbt_leader_participate_as_worker(BTBuildState *buildstate)
 		leaderworker2->isunique = false;
 	}
 
+	if (btleader->btshared->olderkeys)
+	{
+		leaderworker3 = palloc0_object(BTSpool);
+		leaderworker3->heap = leaderworker->heap;
+		leaderworker3->index = leaderworker->index;
+		leaderworker3->isunique = false;
+	}
+
 	/*
 	 * Might as well use reliable figure when doling out maintenance_work_mem
 	 * (when requested number of workers were not launched, this will be
@@ -1735,8 +1838,9 @@ _dmbt_leader_participate_as_worker(BTBuildState *buildstate)
 	sortmem = maintenance_work_mem / btleader->nparticipanttuplesorts;
 
 	/* Perform work common to all participants */
-	_dmbt_parallel_scan_and_sort(leaderworker, leaderworker2, btleader->btshared,
-							   btleader->sharedsort, btleader->sharedsort2,
+	_dmbt_parallel_scan_and_sort(leaderworker, leaderworker2, leaderworker3,
+							   btleader->btshared, btleader->sharedsort,
+							   btleader->sharedsort2, btleader->sharedsort3,
 							   sortmem, true);
 
 #ifdef BTREE_BUILD_STATS
@@ -1757,9 +1861,11 @@ _dmbt_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	char	   *sharedquery;
 	BTSpool    *btspool;
 	BTSpool    *btspool2;
+	BTSpool    *btspool3 = NULL;
 	BTShared   *btshared;
 	Sharedsort *sharedsort;
 	Sharedsort *sharedsort2;
+	Sharedsort *sharedsort3 = NULL;
 	Relation	heapRel;
 	Relation	indexRel;
 	LOCKMODE	heapLockmode;
@@ -1838,13 +1944,24 @@ _dmbt_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 		tuplesort_attach_shared(sharedsort2, seg);
 	}
 
+	if (btshared->olderkeys)
+	{
+		btspool3 = palloc0_object(BTSpool);
+		btspool3->heap = btspool->heap;
+		btspool3->index = btspool->index;
+		btspool3->isunique = false;
+		sharedsort3 = shm_toc_lookup(toc, PARALLEL_KEY_TUPLESORT_SPOOL3, false);
+		tuplesort_attach_shared(sharedsort3, seg);
+	}
+
 	/* Prepare to track buffer usage during parallel execution */
 	InstrStartParallelQuery();
 
 	/* Perform sorting of spool, and possibly a spool2 */
 	sortmem = maintenance_work_mem / btshared->scantuplesortstates;
-	_dmbt_parallel_scan_and_sort(btspool, btspool2, btshared, sharedsort,
-							   sharedsort2, sortmem, false);
+	_dmbt_parallel_scan_and_sort(btspool, btspool2, btspool3, btshared,
+							   sharedsort, sharedsort2, sharedsort3, sortmem,
+							   false);
 
 	/* Report WAL/buffer usage during parallel execution */
 	bufferusage = shm_toc_lookup(toc, PARALLEL_KEY_BUFFER_USAGE, false);
@@ -1878,8 +1995,10 @@ _dmbt_parallel_build_main(dsm_segment *seg, shm_toc *toc)
  */
 static void
 _dmbt_parallel_scan_and_sort(BTSpool *btspool, BTSpool *btspool2,
+						   BTSpool *btspool3,
 						   BTShared *btshared, Sharedsort *sharedsort,
-						   Sharedsort *sharedsort2, int sortmem, bool progress)
+						   Sharedsort *sharedsort2, Sharedsort *sharedsort3,
+						   int sortmem, bool progress)
 {
 	SortCoordinate coordinate;
 	BTBuildState buildstate;
@@ -1925,6 +2044,21 @@ _dmbt_parallel_scan_and_sort(BTSpool *btspool, BTSpool *btspool2,
 										false);
 	}
 
+	/* dmbtree: and a third, for the marked entries of older row versions */
+	if (btspool3)
+	{
+		SortCoordinate coordinate3;
+
+		coordinate3 = palloc0_object(SortCoordinateData);
+		coordinate3->isWorker = true;
+		coordinate3->nParticipants = -1;
+		coordinate3->sharedsort = sharedsort3;
+		btspool3->sortstate =
+			tuplesort_begin_index_btree(btspool->heap, btspool->index, false, false,
+										Min(sortmem, work_mem), coordinate3,
+										false);
+	}
+
 	/* Fill in buildstate for _dmbt_build_callback() */
 	buildstate.isunique = btshared->isunique;
 	buildstate.nulls_not_distinct = btshared->nulls_not_distinct;
@@ -1932,6 +2066,8 @@ _dmbt_parallel_scan_and_sort(BTSpool *btspool, BTSpool *btspool2,
 	buildstate.heap = btspool->heap;
 	buildstate.spool = btspool;
 	buildstate.spool2 = btspool2;
+	buildstate.spool3 = btspool3;
+	buildstate.havemarked = false;
 	buildstate.indtuples = 0;
 	buildstate.btleader = NULL;
 
@@ -1957,6 +2093,8 @@ _dmbt_parallel_scan_and_sort(BTSpool *btspool, BTSpool *btspool2,
 										 PROGRESS_BTREE_PHASE_PERFORMSORT_2);
 		tuplesort_performsort(btspool2->sortstate);
 	}
+	if (btspool3)
+		tuplesort_performsort(btspool3->sortstate);
 
 	/*
 	 * Done.  Record ambuild statistics, and whether we encountered a broken
@@ -1967,6 +2105,8 @@ _dmbt_parallel_scan_and_sort(BTSpool *btspool, BTSpool *btspool2,
 	btshared->reltuples += reltuples;
 	if (buildstate.havedead)
 		btshared->havedead = true;
+	if (buildstate.havemarked)
+		btshared->havemarked = true;
 	btshared->indtuples += buildstate.indtuples;
 	if (indexInfo->ii_BrokenHotChain)
 		btshared->brokenhotchain = true;
@@ -1979,4 +2119,26 @@ _dmbt_parallel_scan_and_sort(BTSpool *btspool, BTSpool *btspool2,
 	tuplesort_end(btspool->sortstate);
 	if (btspool2)
 		tuplesort_end(btspool2->sortstate);
+	if (btspool3)
+		tuplesort_end(btspool3->sortstate);
+}
+
+/*
+ * dmbtree: insert the delete-marked entries of older row versions spooled
+ * by the build scan (§21 D32 B), now that the sorted load is done, through
+ * the insertion path: core's tuplesort orders marked TIDs by their raw
+ * offset numbers, which is no index order.  An entry the load put there
+ * already (a marked copy of a row's newest entry) is marked instead.
+ */
+static void
+_dmbt_insert_marked(BTSpool *btspool3)
+{
+	IndexTuple	itup;
+
+	tuplesort_performsort(btspool3->sortstate);
+	while ((itup = tuplesort_getindextuple(btspool3->sortstate, true)) != NULL)
+	{
+		CHECK_FOR_INTERRUPTS();
+		_dmbt_doinsert_inplace(btspool3->index, itup, false, btspool3->heap);
+	}
 }

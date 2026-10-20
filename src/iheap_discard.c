@@ -180,29 +180,32 @@ iheap_discard(Relation rel, bool force)
 		/* collect the targets of records written by aborted transactions */
 		verify = palloc(sizeof(VerifyItem) * Max(uph->uph_nrecs, 1) * 4);
 		off = IHEAP_UNDO_DATA_START;
-		while (off + IHEAP_UNDOREC_HDRSZ <= ((PageHeader) page)->pd_lower)
+		for (;;)
 		{
 			IHeapUndoRecHeader hdr;
+			const char *payload;
+			uint32		payload_len;
 
-			memcpy(&hdr, (char *) page + off, IHEAP_UNDOREC_HDRSZ);
-			if (hdr.ur_len < IHEAP_UNDOREC_HDRSZ)
+			if (!iheap_undo_page_next(page, &off, &hdr, &payload, &payload_len))
 				break;
 			if (iheap_xid_status(hdr.ur_xid, InvalidBuffer, NULL) == IHX_ABORTED)
 			{
 				if (hdr.ur_type == IHU_MULTI_INSERT)
 				{
-					uint16		n;
+					uint16		n = 0;
 					int			cap = Max(uph->uph_nrecs, 1) * 4;
 
-					memcpy(&n, (char *) page + off + IHEAP_UNDOREC_HDRSZ, sizeof(uint16));
+					if (payload_len >= sizeof(uint16))
+						memcpy(&n, payload, sizeof(uint16));
+					if (sizeof(uint16) + n * sizeof(OffsetNumber) > payload_len)
+						n = 0;
 					if (nverify + n > cap)
 						verify = repalloc(verify, sizeof(VerifyItem) * (nverify + n + cap));
 					for (int i = 0; i < n; i++)
 					{
 						verify[nverify].blkno = hdr.ur_blkno;
 						memcpy(&verify[nverify].offnum,
-							   (char *) page + off + IHEAP_UNDOREC_HDRSZ +
-							   sizeof(uint16) + i * sizeof(OffsetNumber),
+							   payload + sizeof(uint16) + i * sizeof(OffsetNumber),
 							   sizeof(OffsetNumber));
 						nverify++;
 					}
@@ -216,7 +219,6 @@ iheap_discard(Relation rel, bool force)
 					nverify++;
 				}
 			}
-			off += hdr.ur_len;
 		}
 		UnlockReleaseBuffer(buf);
 

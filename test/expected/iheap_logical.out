@@ -1,0 +1,336 @@
+--
+-- Logical decoding of iheap tables (DESIGN.md §9.5, §21 D38).  Every
+-- change is made to a heap table and to its iheap twin, in the same
+-- transaction; the changes decoded for the two must be the same but for
+-- the table's name.
+--
+SELECT 'init' FROM pg_create_logical_replication_slot('ihl', 'test_decoding');
+ ?column? 
+----------
+ init
+(1 row)
+
+-- types of every kind of layout: by value, fixed lengths of all alignments,
+-- varlena, names, arrays, nulls
+CREATE TABLE ld_h (
+	id int PRIMARY KEY, k int, v text, n numeric, d date, u uuid, b bool,
+	c "char", s int2, f float4, i8 int8, nm name, pt point, mac macaddr,
+	iv interval, tz timetz, arr int4[], j jsonb) USING heap;
+CREATE TABLE ld_i (LIKE ld_h INCLUDING ALL) USING iheap;
+CREATE INDEX ld_h_k ON ld_h (k);
+CREATE INDEX ld_i_k ON ld_i (k);
+-- run a statement (with %1$I for the table) on both tables
+CREATE FUNCTION ld_both(sql text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE format(sql, 'ld_h');
+	EXECUTE format(sql, 'ld_i');
+END $$;
+SELECT ld_both($$INSERT INTO %1$I VALUES
+	(1, 10, 'one', 1.5, '2026-01-01', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+	 true, 'x', 7, 2.5, 9000000000, 'nm1', '(1,2)', '08:00:2b:01:02:03',
+	 '1 day 2 hours', '10:00+02', '{1,2,3}', '{"a": 1}'),
+	(2, 20, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	 NULL, NULL, NULL, NULL, NULL),
+	(3, 30, 'three', -3, '2026-03-03', NULL, false, 'z', -1, 0, -1, 'nm3',
+	 '(-1,-2)', NULL, '-1 mon', NULL, '{}', '[1, "x"]')$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+-- in place: a plain column, then a dmbtree key column
+SELECT ld_both($$UPDATE %1$I SET v = 'uno', b = NOT b WHERE id = 1$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$UPDATE %1$I SET k = k + 1, n = n * 2 WHERE id = 1$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+-- a column of the primary key (btree): the row moves, the old key is logged
+SELECT ld_both($$UPDATE %1$I SET id = 4 WHERE id = 2$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+-- a row that grows past its page's room moves too
+SELECT ld_both($$UPDATE %1$I SET v = repeat('w', 1000) WHERE id = 3$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$DELETE FROM %1$I WHERE id = 1$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+-- COPY: multi-insert
+BEGIN;
+COPY ld_h (id, k, v) FROM STDIN;
+COPY ld_i (id, k, v) FROM STDIN;
+COMMIT;
+-- values stored out of line: inserted, carried along unchanged, replaced
+ALTER TABLE ld_h ALTER COLUMN v SET STORAGE EXTERNAL;
+ALTER TABLE ld_i ALTER COLUMN v SET STORAGE EXTERNAL;
+SELECT ld_both($$INSERT INTO %1$I (id, k, v)
+	SELECT g, g, repeat(md5(g::text), 100) FROM generate_series(20, 21) g$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$UPDATE %1$I SET k = -k WHERE id = 20$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$UPDATE %1$I SET v = repeat(md5('new'), 100) WHERE id = 21$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+-- ON CONFLICT: a speculative insertion that is confirmed, and one that
+-- conflicts and updates instead
+SELECT ld_both($$INSERT INTO %1$I (id, k) VALUES (30, 300)
+	ON CONFLICT (id) DO NOTHING$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$INSERT INTO %1$I (id, k) VALUES (30, 301)
+	ON CONFLICT (id) DO UPDATE SET k = excluded.k$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$INSERT INTO %1$I (id, k) VALUES (30, 302), (31, 310)
+	ON CONFLICT (id) DO NOTHING$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+-- subtransactions: what was rolled back is not decoded
+BEGIN;
+SELECT ld_both($$INSERT INTO %1$I (id, k) VALUES (40, 400)$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SAVEPOINT s1;
+SELECT ld_both($$UPDATE %1$I SET k = 401 WHERE id = 40$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$DELETE FROM %1$I WHERE id = 10$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+ROLLBACK TO s1;
+SELECT ld_both($$UPDATE %1$I SET k = 402 WHERE id = 40$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SAVEPOINT s2;
+SELECT ld_both($$UPDATE %1$I SET k = 403 WHERE id = 40$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+RELEASE s2;
+COMMIT;
+-- an aborted transaction leaves nothing
+BEGIN;
+SELECT ld_both($$UPDATE %1$I SET k = 0$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$DELETE FROM %1$I$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+ROLLBACK;
+-- replica identities: the whole old row, then none
+ALTER TABLE ld_h REPLICA IDENTITY FULL;
+ALTER TABLE ld_i REPLICA IDENTITY FULL;
+SELECT ld_both($$UPDATE %1$I SET k = 111 WHERE id = 11$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$UPDATE %1$I SET v = 'twenty' WHERE id = 20$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$DELETE FROM %1$I WHERE id = 12$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+ALTER TABLE ld_h REPLICA IDENTITY NOTHING;
+ALTER TABLE ld_i REPLICA IDENTITY NOTHING;
+SELECT ld_both($$UPDATE %1$I SET id = 41 WHERE id = 40$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$DELETE FROM %1$I WHERE id = 41$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+ALTER TABLE ld_h REPLICA IDENTITY DEFAULT;
+ALTER TABLE ld_i REPLICA IDENTITY DEFAULT;
+-- dropped and added columns: rows older than the new column lack it
+ALTER TABLE ld_h DROP COLUMN j, ADD COLUMN extra int DEFAULT 5;
+ALTER TABLE ld_i DROP COLUMN j, ADD COLUMN extra int DEFAULT 5;
+SELECT ld_both($$UPDATE %1$I SET k = k + 1000 WHERE id = 3$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$INSERT INTO %1$I (id, k, extra) VALUES (50, 500, NULL)$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+-- rewrites decode to nothing; truncation does
+VACUUM FULL ld_h;
+VACUUM FULL ld_i;
+CLUSTER ld_h USING ld_h_pkey;
+CLUSTER ld_i USING ld_i_pkey;
+SELECT ld_both($$UPDATE %1$I SET k = k + 1 WHERE id = 50$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+TRUNCATE ld_h;
+TRUNCATE ld_i;
+-- partitions, and an update that moves a row to another one
+CREATE TABLE ld_hp (id int PRIMARY KEY, v text) PARTITION BY RANGE (id);
+CREATE TABLE ld_hp1 PARTITION OF ld_hp FOR VALUES FROM (0) TO (100) USING heap;
+CREATE TABLE ld_hp2 PARTITION OF ld_hp FOR VALUES FROM (100) TO (200) USING heap;
+CREATE TABLE ld_ip (id int PRIMARY KEY, v text) PARTITION BY RANGE (id);
+CREATE TABLE ld_ip1 PARTITION OF ld_ip FOR VALUES FROM (0) TO (100) USING iheap;
+CREATE TABLE ld_ip2 PARTITION OF ld_ip FOR VALUES FROM (100) TO (200) USING iheap;
+SELECT ld_both($$INSERT INTO %1$Ip VALUES (1, 'a'), (2, 'b')$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$UPDATE %1$Ip SET v = 'aa' WHERE id = 1$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+SELECT ld_both($$UPDATE %1$Ip SET id = 102 WHERE id = 2$$);
+ ld_both 
+---------
+ 
+(1 row)
+
+-- the changes, in order
+CREATE TEMP TABLE dec AS
+SELECT ord, data
+FROM pg_logical_slot_get_changes('ihl', NULL, NULL, 'include-xids', '0',
+								 'skip-empty-xacts', '1')
+	 WITH ORDINALITY AS t(lsn, xid, data, ord);
+-- the same changes for both access methods
+SELECT (SELECT array_agg(regexp_replace(data, '^table public\.ld_h', 'table public.T')
+						 ORDER BY ord)
+		FROM dec WHERE data ~ '^table public\.ld_h') =
+	   (SELECT array_agg(regexp_replace(data, '^table public\.ld_i', 'table public.T')
+						 ORDER BY ord)
+		FROM dec WHERE data ~ '^table public\.ld_i') AS same_changes,
+	   (SELECT count(*) FROM dec WHERE data ~ '^table public\.ld_i') AS iheap_changes;
+ same_changes | iheap_changes 
+--------------+---------------
+ t            |            35
+(1 row)
+
+-- what they are (long values cut short)
+SELECT CASE WHEN length(data) > 200
+			THEN left(data, 160) || ' ... ' || length(data) || ' chars'
+			ELSE data END AS change
+FROM dec WHERE data ~ '^table public\.ld_i' ORDER BY ord;
+                                                                                     change                                                                                      
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ table public.ld_i: INSERT: id[integer]:1 k[integer]:10 v[text]:'one' n[numeric]:1.5 d[date]:'01-01-2026' u[uuid]:'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' b[boolea ... 409 chars
+ table public.ld_i: INSERT: id[integer]:2 k[integer]:20 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null f[ ... 314 chars
+ table public.ld_i: INSERT: id[integer]:3 k[integer]:30 v[text]:'three' n[numeric]:-3 d[date]:'03-03-2026' u[uuid]:null b[boolean]:false c["char"]:'z' s[smallint ... 337 chars
+ table public.ld_i: UPDATE: id[integer]:1 k[integer]:10 v[text]:'uno' n[numeric]:1.5 d[date]:'01-01-2026' u[uuid]:'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' b[boolea ... 410 chars
+ table public.ld_i: UPDATE: id[integer]:1 k[integer]:11 v[text]:'uno' n[numeric]:3.0 d[date]:'01-01-2026' u[uuid]:'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' b[boolea ... 410 chars
+ table public.ld_i: UPDATE: old-key: id[integer]:2 new-tuple: id[integer]:4 k[integer]:20 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null  ... 348 chars
+ table public.ld_i: UPDATE: id[integer]:3 k[integer]:30 v[text]:'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww ... 1332 chars
+ table public.ld_i: DELETE: id[integer]:1
+ table public.ld_i: INSERT: id[integer]:10 k[integer]:100 v[text]:'copy-a' n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:n ... 320 chars
+ table public.ld_i: INSERT: id[integer]:11 k[integer]:110 v[text]:'copy-b' n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:n ... 320 chars
+ table public.ld_i: INSERT: id[integer]:12 k[integer]:null v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null ... 317 chars
+ table public.ld_i: INSERT: id[integer]:20 k[integer]:20 v[text]:'98f13708210194c475687be6106a3b8498f13708210194c475687be6106a3b8498f13708210194c475687be6106a3b8 ... 3513 chars
+ table public.ld_i: INSERT: id[integer]:21 k[integer]:21 v[text]:'3c59dc048e8850243be8079a5c74d0793c59dc048e8850243be8079a5c74d0793c59dc048e8850243be8079a5c74d07 ... 3513 chars
+ table public.ld_i: UPDATE: id[integer]:20 k[integer]:-20 v[text]:unchanged-toast-datum n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null  ... 333 chars
+ table public.ld_i: UPDATE: id[integer]:21 k[integer]:21 v[text]:'22af645d1859cb5ca6da0c484f1f37ea22af645d1859cb5ca6da0c484f1f37ea22af645d1859cb5ca6da0c484f1f37e ... 3513 chars
+ table public.ld_i: INSERT: id[integer]:30 k[integer]:300 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 316 chars
+ table public.ld_i: UPDATE: id[integer]:30 k[integer]:301 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 316 chars
+ table public.ld_i: INSERT: id[integer]:31 k[integer]:310 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 316 chars
+ table public.ld_i: INSERT: id[integer]:40 k[integer]:400 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 316 chars
+ table public.ld_i: UPDATE: id[integer]:40 k[integer]:402 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 316 chars
+ table public.ld_i: UPDATE: id[integer]:40 k[integer]:403 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 316 chars
+ table public.ld_i: UPDATE: old-key: id[integer]:11 k[integer]:110 v[text]:'copy-b' new-tuple: id[integer]:11 k[integer]:111 v[text]:'copy-b' n[numeric]:null d[d ... 387 chars
+ table public.ld_i: UPDATE: old-key: id[integer]:20 k[integer]:-20 v[text]:'98f13708210194c475687be6106a3b8498f13708210194c475687be6106a3b8498f13708210194c475687 ... 3581 chars
+ table public.ld_i: DELETE: id[integer]:12
+ table public.ld_i: UPDATE: id[integer]:41 k[integer]:403 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 316 chars
+ table public.ld_i: DELETE: (no-tuple-data)
+ table public.ld_i: UPDATE: id[integer]:3 k[integer]:1030 v[text]:'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww ... 1331 chars
+ table public.ld_i: INSERT: id[integer]:50 k[integer]:500 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 322 chars
+ table public.ld_i: UPDATE: id[integer]:50 k[integer]:501 v[text]:null n[numeric]:null d[date]:null u[uuid]:null b[boolean]:null c["char"]:null s[smallint]:null  ... 322 chars
+ table public.ld_i: TRUNCATE: (no-flags)
+ table public.ld_ip1: INSERT: id[integer]:1 v[text]:'a'
+ table public.ld_ip1: INSERT: id[integer]:2 v[text]:'b'
+ table public.ld_ip1: UPDATE: id[integer]:1 v[text]:'aa'
+ table public.ld_ip1: DELETE: id[integer]:2
+ table public.ld_ip2: INSERT: id[integer]:102 v[text]:'b'
+(35 rows)
+
+SELECT pg_drop_replication_slot('ihl');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+DROP TABLE ld_h, ld_i, ld_hp, ld_ip;
+DROP FUNCTION ld_both(text);

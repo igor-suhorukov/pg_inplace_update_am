@@ -10,8 +10,14 @@
  * undo for old snapshots may differ in the new index's columns.  A build
  * that sees in-place updates some snapshot may not see yet therefore sets
  * ii_BrokenHotChain, which makes core set indcheckxmin so older snapshots
- * don't use the new index (§11.2).  So is a rebuilt dmbtree index, whose
- * key columns in-place updates change; dmbtbuild() sets indcheckxmin then.
+ * don't use the new index (§11.2).
+ *
+ * A build of a dmbtree index that takes in-place updates, new or rebuilt,
+ * instead gives the index delete-marked entries for the keys of the older
+ * versions some snapshot may still see (§21 D32 B): such an index serves
+ * every snapshot at once.  Only when an older version holds a value stored
+ * out of line does it fall back to indcheckxmin (dmbtbuild() sets it for a
+ * rebuild).
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -30,12 +36,14 @@
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
+#include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/tuplesort.h"
 
 #include "iheap.h"
+#include "dmbtree_api.h"
 
 typedef struct BuildEntry
 {
@@ -44,6 +52,9 @@ typedef struct BuildEntry
 	uint32		len;
 	bool		alive;
 	TransactionId xmin;
+	int			nolder;			/* older versions some snapshot may see */
+	char	  **older;			/* (§21 D32 B), newest first */
+	uint32	   *olderlen;
 } BuildEntry;
 
 /*
@@ -118,6 +129,236 @@ build_version(Relation rel, Buffer buf, Page page, OffsetNumber off,
 	return true;
 }
 
+/*
+ * For a build that indexes the keys of older versions (§21 D32 B): the
+ * versions of the row at off before the one build_version() returns that
+ * some snapshot may still see, newest first, copied into the current memory
+ * context.  The walk stops at a version every snapshot sees (frozen, or
+ * committed and visible to all): nobody sees the ones before it.  Versions
+ * of aborted transactions are seen by nobody, deletions have no key.
+ * Returns false when one of them holds a value stored out of line: its key
+ * cannot be computed safely (the TOAST data of a version on its way out may
+ * be removed meanwhile).
+ */
+static bool
+older_versions(Relation rel, Page page, OffsetNumber off,
+			   GlobalVisState *vistest, BuildEntry *e)
+{
+	ItemId		lp = PageGetItemId(page, off);
+	char	   *cur = (char *) page + ItemIdGetOffset(lp);
+	uint32		curlen = ItemIdGetLength(lp);
+	UndoRecPtr	discard = iheap_discard_ptr(rel);
+	bool		onpage = true;
+	bool		indexed = false;	/* passed the version that is indexed */
+	int			cap = 0;
+	int			steps = 0;
+	IHeapHdr	h;
+
+	e->nolder = 0;
+	ih_hdr_read(cur, &h);
+	for (;;)
+	{
+		bool		deleted = (h.infomask & (IHT_DELETED | IHT_MOVED)) != 0;
+		bool		removable;
+		IHeapXidStatus st;
+		IHeapUndoRec *rec;
+		char	   *mem;
+
+		if (++steps > 100000)
+			return false;
+
+		/* a LOCK record in front of the version is transparent */
+		if (h.urec >= discard && (h.infomask & IHT_LOCKED))
+		{
+			rec = iheap_undo_fetch(rel, h.urec, true);
+			if (rec != NULL && rec->hdr.ur_type == IHU_LOCK)
+			{
+				IHeapHdr	ph;
+
+				ih_hdr_read(rec->hdr.ur_prev_hdr, &ph);
+				h.infomask = ph.infomask | (h.infomask & (IHT_XID_HINTS | IHT_STUB));
+				h.urec = ph.urec;
+				h.xid = ph.xid;
+				pfree(rec);
+				continue;
+			}
+			if (rec != NULL)
+				pfree(rec);
+			else
+				h.urec = InvalidUndoRecPtr; /* discarded under us */
+		}
+
+		if (h.urec < discard)
+		{
+			st = IHX_COMMITTED;
+			removable = true;
+		}
+		else
+		{
+			st = iheap_xid_status(h.xid, InvalidBuffer, NULL);
+			removable = (st == IHX_COMMITTED &&
+						 GlobalVisTestIsRemovableXid(vistest, h.xid, true));
+		}
+
+		if (st != IHX_ABORTED && !deleted)
+		{
+			if (!indexed)
+				indexed = true; /* the version build_version() returns */
+			else
+			{
+				if (ih_hdr_infomask(cur) & IHT_HASEXTERNAL)
+					return false;
+				if (e->nolder == cap)
+				{
+					cap = Max(cap * 2, 4);
+					if (e->nolder == 0)
+					{
+						e->older = palloc(cap * sizeof(char *));
+						e->olderlen = palloc(cap * sizeof(uint32));
+					}
+					else
+					{
+						e->older = repalloc(e->older, cap * sizeof(char *));
+						e->olderlen = repalloc(e->olderlen, cap * sizeof(uint32));
+					}
+				}
+				e->older[e->nolder] = onpage ?
+					ih_copy_tuple_aligned(CurrentMemoryContext, cur, curlen, &mem) :
+					cur;
+				e->olderlen[e->nolder++] = curlen;
+			}
+		}
+		if (removable)
+			break;				/* everybody sees this version or a newer one */
+
+		rec = iheap_undo_fetch(rel, h.urec, true);
+		if (rec == NULL)
+			break;				/* discarded under us: visible to all */
+		if (!iheap_rebuild_prior(rel, &cur, &curlen, &h, rec, &mem))
+		{
+			pfree(rec);
+			break;				/* the insert */
+		}
+		pfree(rec);
+		onpage = false;
+	}
+	return true;
+}
+
+/* are entry values a and b of index columns [from, to) the same, by image? */
+static bool
+build_values_equal(TupleDesc idesc, int from, int to, const Datum *a,
+				   const bool *anull, const Datum *b, const bool *bnull)
+{
+	for (int i = from; i < to; i++)
+	{
+		CompactAttribute *att = TupleDescCompactAttr(idesc, i);
+
+		if (anull[i] != bnull[i])
+			return false;
+		if (!anull[i] && !datum_image_eq(a[i], b[i], att->attbyval, att->attlen))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The entries of a row with older versions some snapshot may still see, in
+ * a build that indexes their keys (§21 D32 B): the newest version's (in
+ * slot) as any other, and a delete-marked one for each other key an older
+ * version has, which cleanup removes once nobody sees that version.  An
+ * older version with the newest one's key but other INCLUDE values makes
+ * the newest entry marked too (a marked copy, which marks the entry after
+ * the load): an unmarked entry's INCLUDE values are returned by index-only
+ * scans for every version with its key.
+ */
+static void
+build_older_keys(Relation indexRel, IndexInfo *indexInfo, EState *estate,
+				 TupleTableSlot *slot, ExprState *predicate, BuildEntry *e,
+				 ItemPointer tid, IndexBuildCallback callback,
+				 void *callback_state)
+{
+	ExprContext *econtext = GetPerTupleExprContext(estate);
+	TupleDesc	idesc = RelationGetDescr(indexRel);
+	int			natts = IndexRelationGetNumberOfAttributes(indexRel);
+	int			nkeyatts = IndexRelationGetNumberOfKeyAttributes(indexRel);
+	Datum		newest[INDEX_MAX_KEYS];
+	bool		newestnull[INDEX_MAX_KEYS];
+	bool		newest_in;
+	bool		mark_newest = false;
+	Datum	  **keys = palloc(e->nolder * sizeof(Datum *));
+	bool	  **keynulls = palloc(e->nolder * sizeof(bool *));
+	int			nkeys = 0;
+	ItemPointerData mtid = *tid;
+
+	mtid.ip_posid |= DMBTREE_TID_MARK;
+
+	/* the newest version's entry values, copied (each version resets) */
+	newest_in = (predicate == NULL || ExecQual(predicate, econtext));
+	if (newest_in)
+	{
+		FormIndexDatum(indexInfo, slot, estate, newest, newestnull);
+		for (int a = 0; a < natts; a++)
+		{
+			CompactAttribute *att = TupleDescCompactAttr(idesc, a);
+
+			if (!newestnull[a])
+				newest[a] = datumCopy(newest[a], att->attbyval, att->attlen);
+		}
+	}
+
+	for (int o = 0; o < e->nolder; o++)
+	{
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+		bool		seen = false;
+
+		MemoryContextReset(econtext->ecxt_per_tuple_memory);
+		iheap_store_tuple(slot, e->older[o], e->olderlen[o], false,
+						  InvalidTransactionId, InvalidTransactionId,
+						  InvalidCommandId);
+		slot->tts_tid = *tid;
+		if (predicate != NULL && !ExecQual(predicate, econtext))
+			continue;
+		FormIndexDatum(indexInfo, slot, estate, values, isnull);
+
+		if (newest_in &&
+			build_values_equal(idesc, 0, nkeyatts, values, isnull, newest,
+							   newestnull))
+		{
+			if (!build_values_equal(idesc, nkeyatts, natts, values, isnull,
+									newest, newestnull))
+				mark_newest = true;
+			continue;
+		}
+		for (int k = 0; k < nkeys && !seen; k++)
+			seen = build_values_equal(idesc, 0, nkeyatts, values, isnull,
+									  keys[k], keynulls[k]);
+		if (seen)
+			continue;
+
+		callback(indexRel, &mtid, values, isnull, true, callback_state);
+		keys[nkeys] = palloc(natts * sizeof(Datum));
+		keynulls[nkeys] = palloc(natts * sizeof(bool));
+		for (int a = 0; a < natts; a++)
+		{
+			CompactAttribute *att = TupleDescCompactAttr(idesc, a);
+
+			keynulls[nkeys][a] = isnull[a];
+			keys[nkeys][a] = isnull[a] ? (Datum) 0 :
+				datumCopy(values[a], att->attbyval, att->attlen);
+		}
+		nkeys++;
+	}
+
+	if (newest_in)
+	{
+		callback(indexRel, tid, newest, newestnull, e->alive, callback_state);
+		if (mark_newest)
+			callback(indexRel, &mtid, newest, newestnull, true, callback_state);
+	}
+}
+
 double
 iheap_index_build_range_scan(Relation heapRel, Relation indexRel,
 							 IndexInfo *indexInfo, bool allow_sync,
@@ -144,6 +385,7 @@ iheap_index_build_range_scan(Relation heapRel, Relation indexRel,
 	MemoryContext pagecxt;
 	double		reltuples = 0;
 	bool		broken = false;
+	bool		olderkeys;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 
@@ -163,6 +405,14 @@ iheap_index_build_range_scan(Relation heapRel, Relation indexRel,
 	else
 		snapshot = SnapshotAny;
 	use_mvcc = IsMVCCSnapshot(snapshot);
+
+	/*
+	 * A dmbtree index that takes in-place updates gets the keys of older
+	 * versions too (§21 D32 B).  Not in a concurrent build, which waits for
+	 * older snapshots before the index is used.
+	 */
+	olderkeys = !use_mvcc && !indexInfo->ii_Concurrent &&
+		dmbtree_build_older_keys(indexRel, heapRel);
 
 	pagecxt = AllocSetContextCreate(CurrentMemoryContext, "iheap index build page",
 									ALLOCSET_DEFAULT_SIZES);
@@ -211,6 +461,7 @@ iheap_index_build_range_scan(Relation heapRel, Relation indexRel,
 					ItemId		lp = PageGetItemId(page, off);
 					IHeapVersion v;
 					bool		alive = true;
+					bool		rowbroken = false;
 					bool		ok;
 
 					if (!ItemIdIsNormal(lp))
@@ -222,9 +473,23 @@ iheap_index_build_range_scan(Relation heapRel, Relation indexRel,
 												   snapshot, &v);
 					else
 						ok = build_version(heapRel, buf, page, off, vistest, &v,
-										   &alive, &broken);
+										   &alive, &rowbroken);
 					if (!ok)
 						continue;
+
+					/*
+					 * Older versions some snapshot may see can have other
+					 * keys: indexed too (marked), or indcheckxmin.
+					 */
+					entries[nentries].nolder = 0;
+					if (rowbroken &&
+						(!olderkeys ||
+						 !older_versions(heapRel, page, off, vistest,
+										 &entries[nentries])))
+					{
+						entries[nentries].nolder = 0;
+						broken = true;
+					}
 
 					entries[nentries].off = off;
 					if (v.from_undo)
@@ -256,6 +521,16 @@ iheap_index_build_range_scan(Relation heapRel, Relation indexRel,
 				ItemPointerSet(&tid, blk, entries[i].off);
 				slot->tts_tid = tid;
 				slot->tts_tableOid = RelationGetRelid(heapRel);
+
+				if (entries[i].nolder > 0)
+				{
+					build_older_keys(indexRel, indexInfo, estate, slot,
+									 predicate, &entries[i], &tid,
+									 callback, callback_state);
+					if (entries[i].alive)
+						reltuples += 1;
+					continue;
+				}
 
 				if (predicate != NULL && !ExecQual(predicate, econtext))
 					continue;

@@ -31,26 +31,19 @@ dmbtree_is_dmbtree(Relation index)
 }
 
 /*
- * An index can take in-place updates of its key columns when a row's
- * entries can be told apart by key alone:
- *
- *	- its key columns are table columns, not expressions, and it has no
- *	  predicate (a row's key is then just some of its column values, and
- *	  every version of the row has an entry; §21 D24);
- *	- all its key columns' opclasses have "equality implies image
- *	  equality", as deduplication requires (otherwise two versions could
- *	  have keys that compare equal but differ in what an index-only scan
- *	  returns).  Unlike deduplication, INCLUDE columns do not prevent it.
- *
- * INCLUDE columns are fine: iheap moves the row when one of them changes.
+ * An index can take in-place updates of the columns it reads when a row's
+ * entries can be told apart by key alone: all its key columns' opclasses
+ * have "equality implies image equality", as deduplication requires
+ * (otherwise two versions could have keys that compare equal but differ in
+ * what an index-only scan returns).  Unlike deduplication, INCLUDE columns
+ * do not prevent it.  Expressions and a predicate are evaluated by iheap
+ * wherever a row version's entry is computed (§21 D24, D39); an INCLUDE
+ * column that changes in place leaves the entry marked, with its values.
  */
 bool
 dmbtree_dm_capable(Relation index)
 {
 	if (!dmbtree_is_dmbtree(index))
-		return false;
-	if (!heap_attisnull(index->rd_indextuple, Anum_pg_index_indexprs, NULL) ||
-		!heap_attisnull(index->rd_indextuple, Anum_pg_index_indpred, NULL))
 		return false;
 	return _dmbt_meta_keys_equalimage(index);
 }
@@ -77,6 +70,38 @@ dmbtree_inplace_mark(Relation index, Relation heaprel, Datum *values,
 	itup = index_form_tuple(RelationGetDescr(index), values, isnull);
 	itup->t_tid = *tid;
 	_dmbt_mark_entry(index, itup, heaprel);
+	pfree(itup);
+}
+
+StaticAssertDecl(DMBT_DM_FLAG == DMBTREE_TID_MARK,
+				 "the build's delete-mark is the delete-mark");
+
+bool
+dmbtree_build_older_keys(Relation index, Relation heaprel)
+{
+	/* the metapage is not there yet: from the operator classes */
+	return dmbtree_is_dmbtree(index) && iheap_relation_is_iheap(heaprel) &&
+		_dmbt_keys_equalimage(index);
+}
+
+/*
+ * An in-place update changed only INCLUDE values of the entry of row "tid",
+ * which keeps its values (marked): raise the error an insertion of the new
+ * entry would raise if it were too large (§21 D39), so that a row whose
+ * entry cannot exist is refused as by an update that moves it.
+ */
+void
+dmbtree_check_entry_size(Relation index, Relation heaprel, Datum *values,
+						 bool *isnull, ItemPointer tid)
+{
+	IndexTuple	itup = index_form_tuple(RelationGetDescr(index), values, isnull);
+	PGAlignedBlock buf;
+
+	itup->t_tid = *tid;
+	/* the check of an insertion on a leaf page */
+	_dmbt_pageinit(buf.data, BLCKSZ);
+	BTPageGetOpaque(buf.data)->btpo_flags = BTP_LEAF;
+	_dmbt_check_third_page(index, heaprel, true, buf.data, itup);
 	pfree(itup);
 }
 

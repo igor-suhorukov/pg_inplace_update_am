@@ -403,8 +403,7 @@ read_undo_record(IHCheckState *cs, UndoRecPtr urp, IHeapUndoRecHeader *hdr,
 	bool		ok = false;
 
 	*problem = NULL;
-	if (off < IHEAP_UNDO_DATA_START ||
-		off + IHEAP_UNDOREC_HDRSZ > BLCKSZ - IHEAP_SPECIAL_SIZE)
+	if (off < IHEAP_UNDO_DATA_START || off >= BLCKSZ - IHEAP_SPECIAL_SIZE)
 	{
 		*problem = "points outside the records of an undo page";
 		return false;
@@ -430,17 +429,16 @@ read_undo_record(IHCheckState *cs, UndoRecPtr urp, IHeapUndoRecHeader *hdr,
 		page = BufferGetPage(buf);
 		if (IHeapPageGetType(page) == IHEAP_PAGE_UNDO &&
 			IHeapUndoPageGetHeader(page)->uph_lpage == lpage &&
-			off + IHEAP_UNDOREC_HDRSZ <= ((PageHeader) page)->pd_lower)
+			((PageHeader) page)->pd_lower <= BLCKSZ - IHEAP_SPECIAL_SIZE)
 		{
-			memcpy(hdr, (char *) page + off, IHEAP_UNDOREC_HDRSZ);
-			if (hdr->ur_len >= IHEAP_UNDOREC_HDRSZ &&
-				off + hdr->ur_len <= ((PageHeader) page)->pd_lower)
+			const char *p;
+
+			if (iheap_undo_read_record(page, off, ((PageHeader) page)->pd_lower,
+									   hdr, &p, payload_len))
 			{
-				*payload_len = hdr->ur_len - IHEAP_UNDOREC_HDRSZ;
 				*payload = MemoryContextAlloc(cs->pagecxt,
 											  Max(*payload_len, 1));
-				memcpy(*payload, (char *) page + off + IHEAP_UNDOREC_HDRSZ,
-					   *payload_len);
+				memcpy(*payload, p, *payload_len);
 				ok = true;
 			}
 		}
@@ -531,8 +529,10 @@ undo_record_problem(IHCheckState *cs, UndoRecPtr urp,
 	{
 		IHeapHdr	ph;
 
+		/* the creator of a version frozen already is never looked up */
 		ih_hdr_read(hdr->ur_prev_hdr, &ph);
-		account_xid(ph.xid, minxid, maxxid);
+		if (UndoRecPtrIsValid(ph.urec))
+			account_xid(ph.xid, minxid, maxxid);
 	}
 	if (!payload_core_len(hdr, payload, payload_len, &core, &nlockers))
 		return "has a malformed lockers list";
@@ -656,10 +656,17 @@ check_undo_page(IHCheckState *cs, BlockNumber blk, Page page, uint64 lpage)
 	TransactionId minxid = InvalidTransactionId;
 	TransactionId maxxid = InvalidTransactionId;
 
-	if (lower < IHEAP_UNDO_DATA_START)
+	if (lower < IHEAP_UNDO_DATA_START || lower > BLCKSZ - IHEAP_SPECIAL_SIZE)
 	{
 		report(cs, blk, InvalidOffsetNumber,
-			   "undo page's pd_lower %u is below its first record", lower);
+			   "undo page's pd_lower %u is outside its record space", lower);
+		return;
+	}
+	if (uph->uph_format != IHEAP_UNDO_FORMAT_V1 &&
+		uph->uph_format != IHEAP_UNDO_FORMAT_COMPACT)
+	{
+		report(cs, blk, InvalidOffsetNumber,
+			   "undo page has record format %u", uph->uph_format);
 		return;
 	}
 
@@ -667,25 +674,19 @@ check_undo_page(IHCheckState *cs, BlockNumber blk, Page page, uint64 lpage)
 	{
 		IHeapUndoRecHeader hdr;
 		UndoRecPtr	urp = MakeUndoRecPtr(lpage, off);
+		const char *payload;
+		uint32		payload_len;
 		const char *problem;
 
-		if (off + IHEAP_UNDOREC_HDRSZ > lower)
+		if (!iheap_undo_read_record(page, off, lower, &hdr, &payload,
+									&payload_len))
 		{
 			report(cs, blk, InvalidOffsetNumber,
-				   "undo page ends inside the header of record " UINT64_FORMAT, urp);
+				   "undo record " UINT64_FORMAT " does not fit the page",
+				   urp);
 			return;
 		}
-		memcpy(&hdr, (char *) page + off, IHEAP_UNDOREC_HDRSZ);
-		if (hdr.ur_len < IHEAP_UNDOREC_HDRSZ || off + hdr.ur_len > lower)
-		{
-			report(cs, blk, InvalidOffsetNumber,
-				   "undo record " UINT64_FORMAT " has length %u, which does not fit the page",
-				   urp, hdr.ur_len);
-			return;
-		}
-		problem = undo_record_problem(cs, urp, &hdr,
-									  (char *) page + off + IHEAP_UNDOREC_HDRSZ,
-									  hdr.ur_len - IHEAP_UNDOREC_HDRSZ,
+		problem = undo_record_problem(cs, urp, &hdr, payload, payload_len,
 									  &minxid, &maxxid);
 		if (problem)
 			report(cs, blk, InvalidOffsetNumber, "undo record " UINT64_FORMAT " %s",

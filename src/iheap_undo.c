@@ -115,15 +115,338 @@ iheap_undo_init_page(Page page, uint64 lpage)
 	uph->uph_min_xid = InvalidTransactionId;
 	uph->uph_max_xid = InvalidTransactionId;
 	uph->uph_nrecs = 0;
+	uph->uph_format = IHEAP_UNDO_FORMAT_COMPACT;
 	((PageHeader) page)->pd_lower = IHEAP_UNDO_DATA_START;
+}
+
+/* ------------------------------------------------------------------------
+ * Compact record headers (§21 D37)
+ *
+ * A record on a page of format IHEAP_UNDO_FORMAT_COMPACT starts with
+ *
+ *		ur_type | ur_flags << 4 (1), format bits IHUC_* (1),
+ *		payload length (1 or 2), ur_xid (4), ur_cid (2 or 4),
+ *		ur_blkno (2 or 4), ur_offnum (1 or 2),
+ *		ur_xact_prev (0, 2: an offset on this page, or 7),
+ *		ur_prev_hdr: nothing for an insert (all zero); else infomask2,
+ *			infomask, hoff (5) and xid (4), then its undo pointer:
+ *			nothing (0: the version was frozen), 2 (an offset on this
+ *			page) or 7
+ *
+ * then the payload.  Every field is little endian and unaligned.  12 to
+ * IHEAP_UNDOREC_MAXHDRSZ bytes, where format IHEAP_UNDO_FORMAT_V1 took 42:
+ * an insert's header takes 12 to 16, an in-place update's 21 (of a frozen
+ * row) to 30.  What a record encodes depends only on the header and the
+ * page's logical number, so redo, which appends what WAL carries in a form
+ * of its own (iheap_undo_register_wal), builds the same bytes.
+ * ------------------------------------------------------------------------
+ */
+#define IHUC_XP_MASK		0x03	/* ur_xact_prev: */
+#define IHUC_XP_NONE		0x00	/* invalid */
+#define IHUC_XP_LOCAL		0x01	/* an offset on this page */
+#define IHUC_XP_FULL		0x02	/* 7 bytes */
+#define IHUC_PH_MASK		0x0C	/* ur_prev_hdr: */
+#define IHUC_PH_NONE		0x00	/* all zero (inserts) */
+#define IHUC_PH_FROZEN		0x04	/* undo pointer 0 */
+#define IHUC_PH_LOCAL		0x08	/* undo pointer on this page */
+#define IHUC_PH_FULL		0x0C	/* undo pointer, 7 bytes */
+#define IHUC_LEN8			0x10	/* payload length in 1 byte */
+#define IHUC_CID16			0x20	/* ur_cid in 2 bytes */
+#define IHUC_BLK16			0x40	/* ur_blkno in 2 bytes */
+#define IHUC_OFF8			0x80	/* ur_offnum in 1 byte */
+
+/* the first byte holds the type and the flags, four bits each */
+StaticAssertDecl(IHU_LOCK <= 0x0F &&
+				 ((IHUF_SPEC | IHUF_LOCKERS | IHUF_KEYS_UPDATED | IHUF_MOVED_IN) & ~0x0F) == 0,
+				 "undo record types and flags must fit in four bits each");
+
+static inline char *
+put_uint(char *p, uint64 v, int nbytes)
+{
+	for (int i = 0; i < nbytes; i++)
+	{
+		p[i] = (char) (v & 0xFF);
+		v >>= 8;
+	}
+	return p + nbytes;
+}
+
+static inline const char *
+get_uint(const char *p, uint64 *v, int nbytes)
+{
+	uint64		r = 0;
+
+	for (int i = nbytes - 1; i >= 0; i--)
+		r = (r << 8) | (uint8) p[i];
+	*v = r;
+	return p + nbytes;
+}
+
+/* the compact header of hdr, for a record on logical undo page lpage */
+static uint32
+undo_encode(char *dst, const IHeapUndoRecHeader *hdr, uint32 payload_len,
+			uint64 lpage)
+{
+	static const char zero[IHEAP_TUPHDR_SIZE] = {0};
+	char	   *p = dst + 2;
+	uint8		fmt = 0;
+
+	if (payload_len <= PG_UINT8_MAX)
+	{
+		fmt |= IHUC_LEN8;
+		p = put_uint(p, payload_len, 1);
+	}
+	else
+		p = put_uint(p, payload_len, 2);
+	p = put_uint(p, hdr->ur_xid, 4);
+	if (hdr->ur_cid <= PG_UINT16_MAX)
+	{
+		fmt |= IHUC_CID16;
+		p = put_uint(p, hdr->ur_cid, 2);
+	}
+	else
+		p = put_uint(p, hdr->ur_cid, 4);
+	if (hdr->ur_blkno <= PG_UINT16_MAX)
+	{
+		fmt |= IHUC_BLK16;
+		p = put_uint(p, hdr->ur_blkno, 2);
+	}
+	else
+		p = put_uint(p, hdr->ur_blkno, 4);
+	if (hdr->ur_offnum <= PG_UINT8_MAX)
+	{
+		fmt |= IHUC_OFF8;
+		p = put_uint(p, hdr->ur_offnum, 1);
+	}
+	else
+		p = put_uint(p, hdr->ur_offnum, 2);
+
+	if (!UndoRecPtrIsValid(hdr->ur_xact_prev))
+		fmt |= IHUC_XP_NONE;
+	else if (UndoRecPtrGetLPage(hdr->ur_xact_prev) == lpage)
+	{
+		fmt |= IHUC_XP_LOCAL;
+		p = put_uint(p, UndoRecPtrGetOffset(hdr->ur_xact_prev), 2);
+	}
+	else
+	{
+		fmt |= IHUC_XP_FULL;
+		p = put_uint(p, hdr->ur_xact_prev, 7);
+	}
+
+	if (memcmp(hdr->ur_prev_hdr, zero, IHEAP_TUPHDR_SIZE) == 0)
+		fmt |= IHUC_PH_NONE;
+	else
+	{
+		IHeapHdr	ph;
+
+		ih_hdr_read(hdr->ur_prev_hdr, &ph);
+		p = put_uint(p, ph.infomask2, 2);
+		p = put_uint(p, ph.infomask, 2);
+		p = put_uint(p, ph.hoff, 1);
+		p = put_uint(p, ph.xid, 4);
+		if (!UndoRecPtrIsValid(ph.urec))
+			fmt |= IHUC_PH_FROZEN;
+		else if (UndoRecPtrGetLPage(ph.urec) == lpage)
+		{
+			fmt |= IHUC_PH_LOCAL;
+			p = put_uint(p, UndoRecPtrGetOffset(ph.urec), 2);
+		}
+		else
+		{
+			fmt |= IHUC_PH_FULL;
+			p = put_uint(p, ph.urec, 7);
+		}
+	}
+
+	dst[0] = (char) ((hdr->ur_type & 0x0F) | (hdr->ur_flags << 4));
+	dst[1] = (char) fmt;
+	return p - dst;
+}
+
+/*
+ * Decode the compact header at src, which has "avail" bytes before the end
+ * of the page's records.  Returns false if they do not hold the header and
+ * its payload.
+ */
+static bool
+undo_decode(const char *src, uint32 avail, uint64 lpage,
+			IHeapUndoRecHeader *hdr, uint32 *hdrlen, uint32 *payload_len)
+{
+	const char *p = src + 2;
+	uint8		fmt;
+	uint64		v;
+	uint32		need;
+
+	if (avail < 2)
+		return false;
+	fmt = (uint8) src[1];
+
+	/* the header's length follows from the format bits */
+	need = 2 + ((fmt & IHUC_LEN8) ? 1 : 2) + 4 + ((fmt & IHUC_CID16) ? 2 : 4) +
+		((fmt & IHUC_BLK16) ? 2 : 4) + ((fmt & IHUC_OFF8) ? 1 : 2);
+	switch (fmt & IHUC_XP_MASK)
+	{
+		case IHUC_XP_NONE:
+			break;
+		case IHUC_XP_LOCAL:
+			need += 2;
+			break;
+		case IHUC_XP_FULL:
+			need += 7;
+			break;
+		default:
+			return false;
+	}
+	switch (fmt & IHUC_PH_MASK)
+	{
+		case IHUC_PH_NONE:
+			break;
+		case IHUC_PH_FROZEN:
+			need += 9;
+			break;
+		case IHUC_PH_LOCAL:
+			need += 11;
+			break;
+		default:
+			need += 16;
+			break;
+	}
+	if (avail < need)
+		return false;
+
+	memset(hdr, 0, sizeof(*hdr));
+	hdr->ur_type = (uint8) src[0] & 0x0F;
+	hdr->ur_flags = (uint8) src[0] >> 4;
+	p = get_uint(p, &v, (fmt & IHUC_LEN8) ? 1 : 2);
+	*payload_len = (uint32) v;
+	p = get_uint(p, &v, 4);
+	hdr->ur_xid = (TransactionId) v;
+	p = get_uint(p, &v, (fmt & IHUC_CID16) ? 2 : 4);
+	hdr->ur_cid = (CommandId) v;
+	p = get_uint(p, &v, (fmt & IHUC_BLK16) ? 2 : 4);
+	hdr->ur_blkno = (BlockNumber) v;
+	p = get_uint(p, &v, (fmt & IHUC_OFF8) ? 1 : 2);
+	hdr->ur_offnum = (OffsetNumber) v;
+
+	switch (fmt & IHUC_XP_MASK)
+	{
+		case IHUC_XP_LOCAL:
+			p = get_uint(p, &v, 2);
+			hdr->ur_xact_prev = MakeUndoRecPtr(lpage, v);
+			break;
+		case IHUC_XP_FULL:
+			p = get_uint(p, &v, 7);
+			hdr->ur_xact_prev = v;
+			break;
+		default:
+			hdr->ur_xact_prev = InvalidUndoRecPtr;
+			break;
+	}
+
+	if ((fmt & IHUC_PH_MASK) != IHUC_PH_NONE)
+	{
+		IHeapHdr	ph;
+
+		p = get_uint(p, &v, 2);
+		ph.infomask2 = (uint16) v;
+		p = get_uint(p, &v, 2);
+		ph.infomask = (uint16) v;
+		p = get_uint(p, &v, 1);
+		ph.hoff = (uint8) v;
+		p = get_uint(p, &v, 4);
+		ph.xid = (TransactionId) v;
+		switch (fmt & IHUC_PH_MASK)
+		{
+			case IHUC_PH_LOCAL:
+				p = get_uint(p, &v, 2);
+				ph.urec = MakeUndoRecPtr(lpage, v);
+				break;
+			case IHUC_PH_FULL:
+				p = get_uint(p, &v, 7);
+				ph.urec = v;
+				break;
+			default:
+				ph.urec = InvalidUndoRecPtr;
+				break;
+		}
+		ih_hdr_write(hdr->ur_prev_hdr, &ph);
+	}
+
+	Assert(p - src == need);
+	if (avail - need < *payload_len)
+		return false;
+	*hdrlen = need;
+	hdr->ur_len = (uint16) (need + *payload_len);
+	return true;
+}
+
+/*
+ * Read the record at offset "off" of an undo page whose records end at
+ * "limit" (pd_lower, or less).  Returns false if it is malformed: its
+ * header or payload does not fit before limit.
+ */
+bool
+iheap_undo_read_record(Page page, uint32 off, uint32 limit,
+					   IHeapUndoRecHeader *hdr, const char **payload,
+					   uint32 *payload_len)
+{
+	IHeapUndoPageHeaderData *uph = IHeapUndoPageGetHeader(page);
+	uint32		hdrlen;
+
+	if (off < IHEAP_UNDO_DATA_START || off >= limit ||
+		limit > BLCKSZ - IHEAP_SPECIAL_SIZE)
+		return false;
+
+	if (uph->uph_format == IHEAP_UNDO_FORMAT_V1)
+	{
+		if (off + IHEAP_UNDOREC_V1_HDRSZ > limit)
+			return false;
+		memcpy(hdr, (char *) page + off, IHEAP_UNDOREC_V1_HDRSZ);
+		if (hdr->ur_len < IHEAP_UNDOREC_V1_HDRSZ || off + hdr->ur_len > limit)
+			return false;
+		hdrlen = IHEAP_UNDOREC_V1_HDRSZ;
+		*payload_len = hdr->ur_len - IHEAP_UNDOREC_V1_HDRSZ;
+	}
+	else if (uph->uph_format == IHEAP_UNDO_FORMAT_COMPACT)
+	{
+		if (!undo_decode((char *) page + off, limit - off, uph->uph_lpage, hdr,
+						 &hdrlen, payload_len))
+			return false;
+	}
+	else
+		return false;
+
+	*payload = (char *) page + off + hdrlen;
+	return true;
+}
+
+/*
+ * Iterate over the records of an undo page: decodes the record at *off and
+ * advances *off past it.  Returns false at the end of the records, or at a
+ * malformed record (then *off is short of pd_lower).
+ */
+bool
+iheap_undo_page_next(Page page, uint32 *off, IHeapUndoRecHeader *hdr,
+					 const char **payload, uint32 *payload_len)
+{
+	uint32		lower = ((PageHeader) page)->pd_lower;
+
+	if (*off >= lower ||
+		!iheap_undo_read_record(page, *off, lower, hdr, payload, payload_len))
+		return false;
+	*off += hdr->ur_len;
+	return true;
 }
 
 /*
  * Account a record for the page's xid range.  For LOCK records the tuple's
  * creator (prev header xid) is accounted too: readers may consult CLOG for
- * it while the LOCK record is live (relfrozenxid must not pass it).  So is
- * every xid of a lockers list: discard must keep the record while any of
- * those lockers may still be running, whoever wrote the record.
+ * it while the LOCK record is live (relfrozenxid must not pass it), unless
+ * the version was frozen when the record was written (its undo pointer is
+ * then 0, and nobody looks its creator up).  So is every xid of a lockers
+ * list: discard must keep the record while any of those lockers may still
+ * be running, whoever wrote the record.
  */
 static void
 undo_page_account(Page page, const IHeapUndoRecHeader *hdr,
@@ -139,7 +462,7 @@ undo_page_account(Page page, const IHeapUndoRecHeader *hdr,
 		IHeapHdr	ph;
 
 		ih_hdr_read(hdr->ur_prev_hdr, &ph);
-		if (TransactionIdIsNormal(ph.xid))
+		if (TransactionIdIsNormal(ph.xid) && UndoRecPtrIsValid(ph.urec))
 			xids[nxids++] = ph.xid;
 	}
 	if ((hdr->ur_flags & IHUF_LOCKERS) && payload_len >= sizeof(uint16))
@@ -175,21 +498,42 @@ undo_page_account(Page page, const IHeapUndoRecHeader *hdr,
 	uph->uph_nrecs++;
 }
 
-/* place a record on an undo page (also used by redo) */
-void
-iheap_undo_put_record(Page page, uint32 offset, const char *rec, uint32 len)
+/*
+ * Append a record to an undo page, in the page's format (also used by
+ * redo).  Sets hdr->ur_len and returns it.
+ */
+uint32
+iheap_undo_put_record(Page page, uint32 offset, IHeapUndoRecHeader *hdr,
+					  const char *payload, uint32 payload_len)
 {
-	IHeapUndoRecHeader hdr;
+	IHeapUndoPageHeaderData *uph = IHeapUndoPageGetHeader(page);
 	PageHeader	ph = (PageHeader) page;
+	char		hbuf[IHEAP_UNDOREC_HDRSZ];
+	uint32		hdrlen;
+	uint32		len;
 
-	if (offset != ph->pd_lower || offset + len > ph->pd_upper)
+	if (uph->uph_format == IHEAP_UNDO_FORMAT_COMPACT)
+		hdrlen = undo_encode(hbuf, hdr, payload_len, uph->uph_lpage);
+	else
+	{
+		Assert(uph->uph_format == IHEAP_UNDO_FORMAT_V1);
+		hdrlen = IHEAP_UNDOREC_V1_HDRSZ;
+	}
+	len = hdrlen + payload_len;
+	if (offset != ph->pd_lower || offset + len > ph->pd_upper ||
+		len > PG_UINT16_MAX)
 		elog(PANIC, "iheap: bad undo record placement at %u (lower %u, upper %u, len %u)",
 			 offset, ph->pd_lower, ph->pd_upper, len);
-	memcpy((char *) page + offset, rec, len);
-	memcpy(&hdr, rec, IHEAP_UNDOREC_HDRSZ);
-	undo_page_account(page, &hdr, rec + IHEAP_UNDOREC_HDRSZ,
-					  len - IHEAP_UNDOREC_HDRSZ);
+	hdr->ur_len = (uint16) len;
+	if (uph->uph_format == IHEAP_UNDO_FORMAT_V1)
+		memcpy(hbuf, hdr, IHEAP_UNDOREC_V1_HDRSZ);
+
+	memcpy((char *) page + offset, hbuf, hdrlen);
+	if (payload_len > 0)
+		memcpy((char *) page + offset + hdrlen, payload, payload_len);
+	undo_page_account(page, hdr, payload, payload_len);
 	ph->pd_lower = offset + len;
+	return len;
 }
 
 /*
@@ -342,6 +686,9 @@ iheap_undo_reserve(Relation rel, Size len, IHeapUndoReservation *res)
 	res->init = false;
 	res->nwal = 0;
 
+	/* outside the critical section of the writes (it may read the metapage) */
+	res->discard = iheap_discard_ptr(rel);
+
 	if (ent->lpage != 0 &&
 		ent->blkno < RelationGetNumberOfBlocks(rel))
 	{
@@ -354,6 +701,7 @@ iheap_undo_reserve(Relation rel, Size len, IHeapUndoReservation *res)
 		page = BufferGetPage(buf);
 		if (IHeapPageGetType(page) == IHEAP_PAGE_UNDO &&
 			IHeapUndoPageGetHeader(page)->uph_lpage == ent->lpage &&
+			IHeapUndoPageGetHeader(page)->uph_format == IHEAP_UNDO_FORMAT_COMPACT &&
 			(IHeapPageGetOpaque(page)->ihp_flags & IHU_DISCARDED) == 0 &&
 			((PageHeader) page)->pd_upper - ((PageHeader) page)->pd_lower >= len)
 		{
@@ -376,7 +724,9 @@ iheap_undo_reserve(Relation rel, Size len, IHeapUndoReservation *res)
 /*
  * Write a record into the reserved page.  Must be called inside the
  * caller's critical section; registers nothing in WAL by itself (see
- * iheap_undo_register_wal).
+ * iheap_undo_register_wal).  A previous version that was frozen when the
+ * undo was reserved is recorded with undo pointer 0 (hdr is changed): it
+ * needs no undo, and the compact header leaves the pointer out.
  */
 UndoRecPtr
 iheap_undo_write(Relation rel, IHeapUndoReservation *res,
@@ -384,21 +734,21 @@ iheap_undo_write(Relation rel, IHeapUndoReservation *res,
 				 uint32 payload_len)
 {
 	Page		page = BufferGetPage(res->buffer);
-	uint32		len = IHEAP_UNDOREC_HDRSZ + payload_len;
 	uint32		off = res->offset;
-	PageHeader	ph = (PageHeader) page;
+	uint32		len;
 	UndoRecPtr	urp;
+	IHeapHdr	prev;
 
 	Assert(CritSectionCount > 0 || !RelationNeedsWAL(rel));
-	if (len > PG_UINT16_MAX || off + len > ph->pd_upper)
-		elog(PANIC, "iheap: undo record does not fit (offset %u, len %u)", off, len);
 
-	hdr->ur_len = (uint16) len;
-	memcpy((char *) page + off, hdr, IHEAP_UNDOREC_HDRSZ);
-	if (payload_len > 0)
-		memcpy((char *) page + off + IHEAP_UNDOREC_HDRSZ, payload, payload_len);
-	undo_page_account(page, hdr, payload, payload_len);
-	ph->pd_lower = off + len;
+	ih_hdr_read(hdr->ur_prev_hdr, &prev);
+	if (UndoRecPtrIsValid(prev.urec) && prev.urec < res->discard)
+	{
+		prev.urec = InvalidUndoRecPtr;
+		ih_hdr_write(hdr->ur_prev_hdr, &prev);
+	}
+
+	len = iheap_undo_put_record(page, off, hdr, payload, payload_len);
 	res->offset = off + len;
 	MarkBufferDirty(res->buffer);
 
@@ -431,13 +781,18 @@ iheap_undo_register_wal(IHeapUndoReservation *res, uint8 block_id,
 	XLogRegisterBuffer(block_id, res->buffer, REGBUF_STANDARD);
 	for (int i = 0; i < res->nwal; i++)
 	{
-		const char *rec = (char *) page + res->wal[i].offset;
-		uint16		payload_len = res->wal[i].len - IHEAP_UNDOREC_HDRSZ;
+		const char *payload;
+		uint32		plen;
+		uint16		payload_len;
 		IHeapUndoRecHeader hdr;
 		char	   *p = res->walhdr[i];
 		uint8	   *wflags = (uint8 *) p;
 
-		memcpy(&hdr, rec, IHEAP_UNDOREC_HDRSZ);
+		if (!iheap_undo_read_record(page, res->wal[i].offset,
+									res->wal[i].offset + res->wal[i].len,
+									&hdr, &payload, &plen))
+			elog(PANIC, "iheap: undo record just written cannot be read");
+		payload_len = (uint16) plen;
 		*wflags = 0;
 		p[1] = (char) hdr.ur_type;
 		p[2] = (char) hdr.ur_flags;
@@ -480,7 +835,7 @@ iheap_undo_register_wal(IHeapUndoReservation *res, uint8 block_id,
 
 		XLogRegisterBufData(block_id, res->walhdr[i], p - res->walhdr[i]);
 		if (payload_len > 0)
-			XLogRegisterBufData(block_id, rec + IHEAP_UNDOREC_HDRSZ, payload_len);
+			XLogRegisterBufData(block_id, payload, payload_len);
 	}
 }
 
@@ -494,7 +849,6 @@ iheap_undo_redo_records(XLogReaderState *record, Page page, const char *data,
 {
 	const char *end = data + len;
 	uint64		lpage = IHeapUndoPageGetHeader(page)->uph_lpage;
-	char		buf[BLCKSZ];
 
 	while (data < end)
 	{
@@ -544,15 +898,12 @@ iheap_undo_redo_records(XLogReaderState *record, Page page, const char *data,
 		}
 		memcpy(hdr.ur_prev_hdr, data, IHEAP_TUPHDR_SIZE);
 		data += IHEAP_TUPHDR_SIZE;
-		hdr.ur_len = IHEAP_UNDOREC_HDRSZ + payload_len;
 
-		if (data + payload_len > end || hdr.ur_len > sizeof(buf))
+		if (data + payload_len > end)
 			elog(PANIC, "iheap: corrupt undo data in WAL record");
-		memcpy(buf, &hdr, IHEAP_UNDOREC_HDRSZ);
-		memcpy(buf + IHEAP_UNDOREC_HDRSZ, data, payload_len);
+		(void) iheap_undo_put_record(page, ((PageHeader) page)->pd_lower, &hdr,
+									 data, payload_len);
 		data += payload_len;
-		iheap_undo_put_record(page, ((PageHeader) page)->pd_lower, buf,
-							  hdr.ur_len);
 	}
 }
 
@@ -598,9 +949,16 @@ iheap_undo_fetch(Relation rel, UndoRecPtr urp, bool missing_ok)
 	IHeapUndoRecHeader hdr;
 	IHeapUndoRec *rec;
 	PageHeader	ph;
+	const char *payload;
+	uint32		payload_len;
 
+	/* 0: the version was frozen when its successor's record was written */
 	if (!UndoRecPtrIsValid(urp))
+	{
+		if (missing_ok)
+			return NULL;
 		elog(ERROR, "iheap: invalid undo pointer");
+	}
 
 	blk = iheap_lpage_to_block(rel, lpage, &found);
 	if (!found || blk >= RelationGetNumberOfBlocks(rel))
@@ -621,7 +979,7 @@ iheap_undo_fetch(Relation rel, UndoRecPtr urp, bool missing_ok)
 	if (IHeapPageGetType(page) != IHEAP_PAGE_UNDO ||
 		IHeapUndoPageGetHeader(page)->uph_lpage != lpage ||
 		off < IHEAP_UNDO_DATA_START ||
-		off + IHEAP_UNDOREC_HDRSZ > ph->pd_lower)
+		off >= ph->pd_lower)
 	{
 		UnlockReleaseBuffer(buf);
 		if (missing_ok)
@@ -632,8 +990,8 @@ iheap_undo_fetch(Relation rel, UndoRecPtr urp, bool missing_ok)
 						urp, RelationGetRelationName(rel))));
 	}
 
-	memcpy(&hdr, (char *) page + off, IHEAP_UNDOREC_HDRSZ);
-	if (hdr.ur_len < IHEAP_UNDOREC_HDRSZ || off + hdr.ur_len > ph->pd_lower)
+	if (!iheap_undo_read_record(page, off, ph->pd_lower, &hdr, &payload,
+								&payload_len))
 	{
 		UnlockReleaseBuffer(buf);
 		ereport(ERROR,
@@ -642,12 +1000,13 @@ iheap_undo_fetch(Relation rel, UndoRecPtr urp, bool missing_ok)
 						urp, RelationGetRelationName(rel))));
 	}
 
-	rec = palloc(offsetof(IHeapUndoRec, data) + hdr.ur_len);
+	/* the copy keeps the payload only; the header is decoded */
+	rec = palloc(offsetof(IHeapUndoRec, data) + Max(payload_len, 1));
 	rec->urp = urp;
 	rec->hdr = hdr;
-	memcpy(rec->data, (char *) page + off, hdr.ur_len);
-	rec->payload = rec->data + IHEAP_UNDOREC_HDRSZ;
-	rec->payload_len = hdr.ur_len - IHEAP_UNDOREC_HDRSZ;
+	memcpy(rec->data, payload, payload_len);
+	rec->payload = rec->data;
+	rec->payload_len = payload_len;
 
 	UnlockReleaseBuffer(buf);
 	return rec;

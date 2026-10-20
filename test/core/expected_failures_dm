@@ -50,3 +50,6 @@ regress/create_index       usingidx; name
 regress/foreign_key        fk; opclass
 regress/insert_conflict    arbiter; a plan (an EXISTS subquery on the small table takes a seq scan)
 regress/rules              arbiter
+
+# --- isolation: only in core-dm
+isolation/insert-conflict-specconflict  the index is on an expression, which dmbtree takes in-place updates through (§21 D39): a conflict probe (SnapshotDirty) checks the row's key against the unmarked entry it found (§11.5.4), so the expression's function runs once more per probe and repeats its NOTICEs

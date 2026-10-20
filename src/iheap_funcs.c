@@ -287,14 +287,16 @@ iheap_undo_page_records(PG_FUNCTION_ARGS)
 	uph = IHeapUndoPageGetHeader(page.data);
 	lower = ((PageHeader) page.data)->pd_lower;
 	off = IHEAP_UNDO_DATA_START;
-	while (off + IHEAP_UNDOREC_HDRSZ <= lower)
+	while (off < lower)
 	{
 		IHeapUndoRecHeader hdr;
+		const char *payload;
+		uint32		payload_len;
 		Datum		values[9];
 		bool		nulls[9] = {0};
 
-		memcpy(&hdr, page.data + off, IHEAP_UNDOREC_HDRSZ);
-		if (hdr.ur_len < IHEAP_UNDOREC_HDRSZ || off + hdr.ur_len > lower)
+		if (!iheap_undo_read_record(page.data, off, lower, &hdr, &payload,
+									&payload_len))
 			break;
 
 		values[0] = Int64GetDatum((int64) MakeUndoRecPtr(uph->uph_lpage, off));

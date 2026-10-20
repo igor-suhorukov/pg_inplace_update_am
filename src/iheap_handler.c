@@ -45,9 +45,14 @@ PG_MODULE_MAGIC_EXT(.name = "pg_inplace_update_am",.version = "0.1");
 bool		iheap_enable_inplace = true;
 int			iheap_foreground_undo_limit = 1024; /* kB */
 
+/*
+ * "error" was the default before decoding was implemented (it stopped
+ * decoding at the first change of an iheap table): accepted, as "on".
+ */
 static const struct config_enum_entry logical_decoding_options[] = {
-	{"error", 0, false},
-	{"ignore", 1, false},
+	{"on", IHEAP_LOGICAL_ON, false},
+	{"ignore", IHEAP_LOGICAL_IGNORE, false},
+	{"error", IHEAP_LOGICAL_ON, true},
 	{NULL, 0, false}
 };
 
@@ -450,9 +455,9 @@ _PG_init(void)
 
 	DefineCustomEnumVariable("iheap.logical_decoding",
 							 "What logical decoding does with changes to iheap tables.",
-							 "\"error\" stops decoding; \"ignore\" skips the changes.",
+							 "\"on\" decodes them; \"ignore\" skips them.",
 							 &iheap_logical_decoding,
-							 0,
+							 IHEAP_LOGICAL_ON,
 							 logical_decoding_options,
 							 PGC_SIGHUP,
 							 0,

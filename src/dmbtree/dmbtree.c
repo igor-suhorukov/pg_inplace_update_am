@@ -226,21 +226,38 @@ dmbtinsert(Relation rel, Datum *values, bool *isnull,
  * dmbtree: may an index-only scan return the current entry?  An unmarked
  * entry matches the newest committed version of its row (the executor
  * visits the table unless the page is all-visible); a marked one is
- * checked against the version the scan's snapshot sees.
+ * checked against the version the scan's snapshot sees.  That version's
+ * INCLUDE values may be other than the marked entry's (an in-place update
+ * changed them, §21 D39): the scan then returns an entry with the
+ * version's values.
  */
 static bool
 _dmbt_ios_entry_ok(IndexScanDesc scan, BTScanOpaque so)
 {
 	BTScanPosItem *item = &so->currPos.items[so->currPos.itemIndex];
 	ItemPointerData tid;
+	IndexTuple	subst = NULL;
+	bool		ok;
 
 	if (!DmbtTidIsMarked(&item->heapTid))
 		return true;
 	tid = DmbtTidUnmarked(&item->heapTid);
-	return iheap_dm_entry_visible(scan->heapRelation, &tid, scan->xs_snapshot,
-								  scan->indexRelation,
-								  (IndexTuple) (so->currTuples +
-												item->tupleOffset));
+	ok = iheap_dm_entry_visible(scan->heapRelation, &tid, scan->xs_snapshot,
+								scan->indexRelation,
+								(IndexTuple) (so->currTuples + item->tupleOffset),
+								&subst);
+	if (subst != NULL)
+	{
+		if (so->dmSubstCxt == NULL)
+			so->dmSubstCxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+												   "dmbtree index-only scan entry",
+												   ALLOCSET_SMALL_SIZES);
+		MemoryContextReset(so->dmSubstCxt);
+		scan->xs_itup = MemoryContextAlloc(so->dmSubstCxt, IndexTupleSize(subst));
+		memcpy(scan->xs_itup, subst, IndexTupleSize(subst));
+		pfree(subst);
+	}
+	return ok;
 }
 
 /*
@@ -409,6 +426,7 @@ dmbtbeginscan(Relation rel, int nkeys, int norderbys)
 	so->killedItems = NULL;		/* until needed */
 	so->numKilled = 0;
 	so->dmVerify = false;		/* dmbtree: decided by dmbtrescan */
+	so->dmSubstCxt = NULL;
 
 	/*
 	 * We don't know yet whether the scan will be index-only, so we do not
@@ -534,6 +552,8 @@ dmbtendscan(IndexScanDesc scan)
 	if (so->currTuples != NULL)
 		pfree(so->currTuples);
 	/* so->markTuples should not be pfree'd, see dmbtrescan */
+	if (so->dmSubstCxt != NULL)
+		MemoryContextDelete(so->dmSubstCxt);
 	pfree(so);
 }
 

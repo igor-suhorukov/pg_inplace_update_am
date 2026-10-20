@@ -785,10 +785,11 @@ iheap_tid_found_dirty(Relation rel, ItemPointer tid)
 /*
  * Does version *v of the row at off have the key of entry dm?  For
  * fetch_in_buffer(), which holds buf share-locked and saw the row's header
- * "seen" on the page.  A key value stored out of line is fetched with the
- * page unlocked (TOAST access takes locks and may read), from a copy of
- * the version that *v then holds; *changed tells that the row changed
- * meanwhile, and the caller must start over.
+ * "seen" on the page.  A key value stored out of line is fetched, and an
+ * index expression or predicate evaluated, with the page unlocked (TOAST
+ * access takes locks and may read; expressions run the user's functions),
+ * from a copy of the version that *v then holds; *changed tells that the
+ * row changed meanwhile, and the caller must start over.
  */
 static int
 dm_matches_on_page(Relation rel, Buffer buf, OffsetNumber off,
@@ -798,7 +799,7 @@ dm_matches_on_page(Relation rel, Buffer buf, OffsetNumber off,
 	Page		page;
 	ItemId		lp;
 	IHeapHdr	h;
-	int			match = iheap_dm_matches(rel, dm, v->tuple, false);
+	int			match = iheap_dm_matches(rel, dm, v->tuple, 0);
 
 	*changed = false;
 	if (match >= 0)
@@ -808,7 +809,7 @@ dm_matches_on_page(Relation rel, Buffer buf, OffsetNumber off,
 		v->tuple = ih_copy_tuple_aligned(CurrentMemoryContext, v->tuple,
 										 v->len, &v->mem);
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	match = iheap_dm_matches(rel, dm, v->tuple, true);
+	match = iheap_dm_matches(rel, dm, v->tuple, IHEAP_DM_UNLOCKED);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 
 	page = BufferGetPage(buf);

@@ -374,6 +374,9 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 	IHeapUndoRecHeader uh;
 	IHeapHdr	h;
 	uint32		payload_len = speculative ? sizeof(uint32) : 0;
+	bool		logical = iheap_logically_logged(rel,
+												 (options & TABLE_INSERT_NO_LOGICAL) != 0);
+	IHeapLogicalPart logpart = {0};
 
 	/* as heap: the leader of a parallel CREATE TABLE AS may insert */
 	if (IsParallelWorker())
@@ -423,6 +426,8 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 	res.buffer = InvalidBuffer;
 	if (!frozen)
 		iheap_undo_reserve(rel, IHEAP_UNDOREC_HDRSZ + payload_len, &res);
+	if (logical)
+		iheap_logical_prepare(&logpart, rel, true, NULL, NULL, false);
 
 	offnum = iheap_page_choose_offnum(page);
 	ih_vm_prepare(rel, buffer, &vm);
@@ -473,12 +478,17 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 
 		xlrec.offnum = offnum;
 		xlrec.flags = (page_init ? XLIH_INIT_PAGE : 0) |
-			(vm.cleared ? XLIH_VM_CLEARED : 0);
+			(vm.cleared ? XLIH_VM_CLEARED : 0) |
+			(logical ? XLIH_LOGICAL : 0);
 
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfIHeapInsert);
+		if (logical)
+			XLogRegisterData(logpart.data, logpart.len);
+		/* logical decoding reads the tuple even with a full-page image */
 		XLogRegisterBuffer(IH_BLK_DATA, buffer,
-						   REGBUF_STANDARD | (page_init ? REGBUF_WILL_INIT : 0));
+						   REGBUF_STANDARD | (page_init ? REGBUF_WILL_INIT : 0) |
+						   (logical ? REGBUF_KEEP_DATA : 0));
 		XLogRegisterBufData(IH_BLK_DATA, tup, len);
 		if (!frozen)
 			iheap_undo_register_wal(&res, IH_BLK_UNDO,
@@ -504,6 +514,7 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 	if (!frozen)
 		iheap_undo_release(&res);
 	UnlockReleaseBuffer(buffer);
+	iheap_logical_free(&logpart);
 
 	if (ts)
 		iheap_toast_end(ts);
@@ -592,7 +603,8 @@ iheap_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 		XLogRecPtr	recptr;
 
 		xlrec.offnum = ItemPointerGetOffsetNumber(tid);
-		xlrec.succeeded = succeeded ? 1 : 0;
+		xlrec.flags = (succeeded ? XLIH_SPEC_SUCCEEDED : 0) |
+			(iheap_logically_logged(rel, false) ? XLIH_SPEC_LOGICAL : 0);
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfIHeapSpecFinish);
 		XLogRegisterBuffer(IH_BLK_DATA, buffer, REGBUF_STANDARD);
@@ -629,6 +641,9 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 	IHeapToastState **toasts = palloc0(nslots * sizeof(IHeapToastState *));
 	char	   *walbuf = palloc(BLCKSZ * 2);
 	int			done = 0;
+	bool		logical = iheap_logically_logged(rel,
+												 (options & TABLE_INSERT_NO_LOGICAL) != 0);
+	IHeapLogicalPart logpart = {0};
 
 	/* as heap: the leader of a parallel CREATE TABLE AS may insert */
 	if (IsParallelWorker())
@@ -662,6 +677,8 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 
 	xid = GetCurrentTransactionId();
 	CheckForSerializableConflictIn(rel, NULL, InvalidBlockNumber);
+	if (logical)
+		iheap_logical_prepare(&logpart, rel, true, NULL, NULL, false);
 
 	while (done < nslots)
 	{
@@ -775,11 +792,16 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 
 			xlrec.ntuples = n;
 			xlrec.flags = (page_init ? XLIH_INIT_PAGE : 0) |
-				(vm.cleared ? XLIH_VM_CLEARED : 0);
+				(vm.cleared ? XLIH_VM_CLEARED : 0) |
+				(logical ? XLIH_LOGICAL : 0) |
+				(done + n == nslots ? XLIH_LAST_IN_MULTI : 0);
 			XLogBeginInsert();
 			XLogRegisterData(&xlrec, SizeOfIHeapMultiInsert);
+			if (logical)
+				XLogRegisterData(logpart.data, logpart.len);
 			XLogRegisterBuffer(IH_BLK_DATA, buffer,
-							   REGBUF_STANDARD | (page_init ? REGBUF_WILL_INIT : 0));
+							   REGBUF_STANDARD | (page_init ? REGBUF_WILL_INIT : 0) |
+							   (logical ? REGBUF_KEEP_DATA : 0));
 			XLogRegisterBufData(IH_BLK_DATA, walbuf, wp - walbuf);
 			if (!frozen)
 				iheap_undo_register_wal(&res, IH_BLK_UNDO,
@@ -820,6 +842,7 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 	}
 
 	pgstat_count_heap_insert(rel, nslots);
+	iheap_logical_free(&logpart);
 
 	for (int i = 0; i < nslots; i++)
 		pfree(mems[i]);
@@ -1560,6 +1583,9 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 	IHeapHdr	nh;
 	char	   *oldcopy = NULL;
 	char	   *oldmem = NULL;
+	bool		logical = iheap_logically_logged(rel,
+												 (options & TABLE_DELETE_NO_LOGICAL) != 0);
+	IHeapLogicalPart logpart = {0};
 
 	if (IsInParallelMode())
 		ereport(ERROR,
@@ -1617,6 +1643,22 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 	if (c.h.infomask & IHT_HASEXTERNAL)
 		oldcopy = ih_copy_tuple_aligned(CurrentMemoryContext, tup, len, &oldmem);
 
+	/*
+	 * The old row's replica identity for logical decoding, as heap logs it
+	 * (fetching values stored out of line under the buffer lock, as heap).
+	 */
+	if (logical)
+	{
+		TupleDesc	desc = RelationGetDescr(rel);
+		Datum	   *values = palloc(Max(desc->natts, 1) * sizeof(Datum));
+		bool	   *isnull = palloc(Max(desc->natts, 1) * sizeof(bool));
+
+		ih_deform_tuple(desc, tup, values, isnull);
+		iheap_logical_prepare(&logpart, rel, false, values, isnull, true);
+		pfree(values);
+		pfree(isnull);
+	}
+
 	CheckForSerializableConflictIn(rel, tid, blk);
 
 	memset(&uh, 0, sizeof(uh));
@@ -1656,9 +1698,12 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 		XLogRecPtr	recptr;
 
 		xlrec.offnum = off;
-		xlrec.flags = vm.cleared ? XLIH_VM_CLEARED : 0;
+		xlrec.flags = (vm.cleared ? XLIH_VM_CLEARED : 0) |
+			(logical ? XLIH_LOGICAL : 0);
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfIHeapHdrChange);
+		if (logical)
+			XLogRegisterData(logpart.data, logpart.len);
 		XLogRegisterBuffer(IH_BLK_DATA, buf, REGBUF_STANDARD);
 		XLogRegisterBufData(IH_BLK_DATA, tup, IHEAP_TUPHDR_SIZE);
 		iheap_undo_register_wal(&res, IH_BLK_UNDO,
@@ -1679,6 +1724,7 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 	UnlockReleaseBuffer(buf);
 	if (held_tuple_lock != NoLock)
 		UnlockTuple(rel, tid, held_tuple_lock);
+	iheap_logical_free(&logpart);
 
 	if (oldcopy)
 	{
@@ -1916,7 +1962,8 @@ typedef struct IHUpdatePlan
 	bool		inplace;
 	IHeapMoveReason move_reason;	/* why not in place, if not */
 	bool		summarized;
-	bool		dm_changed;		/* a dmbtree index's key changes (§11.6) */
+	bool		dm_changed;		/* a column a dmbtree index reads changes
+								 * (§11.6) */
 	bool		valid;
 } IHUpdatePlan;
 
@@ -2026,6 +2073,10 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 	ItemId		lp;
 	char	   *tup;
 	uint32		curlen;
+	bool		logical = iheap_logically_logged(rel,
+												 (options & TABLE_UPDATE_NO_LOGICAL) != 0);
+	IHeapLogicalPart logpart = {0};
+	bool		dm_entries = false;
 
 	*update_indexes = TU_None;
 	*lockmode = LockTupleExclusive;
@@ -2138,6 +2189,18 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("row is too big: size %u, maximum size %zu",
 						newlen, (Size) IHEAP_MAX_TUPLE_SIZE)));
+
+	/*
+	 * For logical decoding, the old row's replica identity, as heap logs it
+	 * (plan describes the version being replaced); the new tuple goes into
+	 * the record whole, with the layout to read it by.
+	 */
+	if (logical)
+		iheap_logical_prepare(&logpart, rel, true, plan.oldvalues,
+							  plan.oldisnull,
+							  iheap_logical_key_required(rel, plan.modified,
+														 plan.oldvalues,
+														 plan.oldisnull));
 
 	lp = PageGetItemId(page, off);
 	curlen = ItemIdGetLength(lp);
@@ -2277,12 +2340,24 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			xlrec.suffix = d.suffix;
 			xlrec.flags = (relocated ? XLIH_RELOCATED : 0) |
 				(vm.cleared ? XLIH_VM_CLEARED : 0);
+			if (logical)
+			{
+				/* decoding reads the new tuple from the record alone */
+				xlrec.prefix = 0;
+				xlrec.suffix = 0;
+				newmid = newbody;
+				xlrec.flags |= XLIH_LOGICAL;
+			}
 			XLogBeginInsert();
 			XLogRegisterData(&xlrec, SizeOfIHeapUpdate);
-			XLogRegisterBuffer(IH_BLK_DATA, buf, REGBUF_STANDARD);
+			if (logical)
+				XLogRegisterData(logpart.data, logpart.len);
+			XLogRegisterBuffer(IH_BLK_DATA, buf,
+							   REGBUF_STANDARD | (logical ? REGBUF_KEEP_DATA : 0));
 			XLogRegisterBufData(IH_BLK_DATA, newtup, IHEAP_TUPHDR_SIZE);
 			if (newmid > 0)
-				XLogRegisterBufData(IH_BLK_DATA, newtup + IHEAP_TUPHDR_SIZE + d.prefix,
+				XLogRegisterBufData(IH_BLK_DATA,
+									newtup + IHEAP_TUPHDR_SIZE + xlrec.prefix,
 									newmid);
 			iheap_undo_register_wal(&res, IH_BLK_UNDO,
 									BufferGetBlockNumber(buf));
@@ -2449,17 +2524,24 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			xlrec.flags = (same_page ? XLIH_SAME_PAGE : 0) |
 				(new_init ? XLIH_NEW_INIT_PAGE : 0) |
 				(vm.cleared ? XLIH_VM_CLEARED : 0) |
-				(newvm.cleared ? XLIH_NEW_VM_CLEARED : 0);
+				(newvm.cleared ? XLIH_NEW_VM_CLEARED : 0) |
+				(logical ? XLIH_LOGICAL : 0);
 			XLogBeginInsert();
 			XLogRegisterData(&xlrec, SizeOfIHeapMove);
-			XLogRegisterBuffer(IH_BLK_DATA, buf, REGBUF_STANDARD);
+			if (logical)
+				XLogRegisterData(logpart.data, logpart.len);
+			/* decoding reads the new tuple even with a full-page image */
+			XLogRegisterBuffer(IH_BLK_DATA, buf,
+							   REGBUF_STANDARD |
+							   (logical && same_page ? REGBUF_KEEP_DATA : 0));
 			XLogRegisterBufData(IH_BLK_DATA, tup, IHEAP_TUPHDR_SIZE);
 			if (same_page)
 				XLogRegisterBufData(IH_BLK_DATA, newtup, newlen);
 			else
 			{
 				XLogRegisterBuffer(IH_BLK_NEWDATA, newbuf,
-								   REGBUF_STANDARD | (new_init ? REGBUF_WILL_INIT : 0));
+								   REGBUF_STANDARD | (new_init ? REGBUF_WILL_INIT : 0) |
+								   (logical ? REGBUF_KEEP_DATA : 0));
 				XLogRegisterBufData(IH_BLK_NEWDATA, newtup, newlen);
 			}
 			iheap_undo_register_wal(&res, IH_BLK_UNDO,
@@ -2507,24 +2589,26 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		UnlockTuple(rel, otid, held_tuple_lock);
 
 	/*
-	 * dmbtree indexes whose key changed get their new and marked entries now
-	 * that no table page is locked (§11.6).  The row stays ours meanwhile.
+	 * dmbtree indexes whose entry changed get their new and marked entries
+	 * now that no table page is locked (§11.6).  The row stays ours
+	 * meanwhile.
 	 */
 	if (inplace && plan.dm_changed)
-		iheap_dm_update_indexes(rel, otid, plan.modified,
-								plan.oldvalues, plan.oldisnull,
-								newvalues, newisnull);
+		dm_entries = iheap_dm_update_indexes(rel, otid, plan.modified,
+											 plan.oldvalues, plan.oldisnull,
+											 newvalues, newisnull);
 
 	iheap_stat_count_update(rel,
 							inplace ? IHEAP_MOVE_NONE :
 							plan.inplace ? IHEAP_MOVE_SIZE : plan.move_reason,
-							inplace && plan.dm_changed);
+							dm_entries);
 
 	if (ts)
 	{
 		iheap_toast_end(ts);
 		pfree(ts);
 	}
+	iheap_logical_free(&logpart);
 	pfree(newmem);
 	ih_plan_free(&plan);
 	pfree(newvalues);

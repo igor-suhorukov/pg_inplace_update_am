@@ -72,20 +72,29 @@ typedef struct xl_btree_metadata
 } xl_btree_metadata;
 
 /*
- * dmbtree: set (marked = true) or clear the delete-mark bit of heap TIDs on
- * a leaf page.  Marking never moves an entry, so the items are named by
- * position: each one an offset number and a posting list index (or
- * DMBT_PLAIN_TUPLE for the t_tid of a plain tuple).
+ * dmbtree: set (DMBT_MARK_SET) or clear (DMBT_MARK_CLEAR) the delete-mark
+ * bit of heap TIDs on a leaf page.  Marking never moves an entry, so the
+ * items are named by position: each one an offset number and a posting
+ * list index (or DMBT_PLAIN_TUPLE for the t_tid of a plain tuple).
  *
- * Backup Blk 0: leaf page; its data is the array of DmbtMarkItem
+ * DMBT_MARK_REPLACE puts new tuples in the place of plain tuples, unmarked:
+ * entries of an index with INCLUDE columns that take their row's values
+ * (§21 D39).  Key and heap TID stay, and so does the order.
+ *
+ * Backup Blk 0: leaf page; its data is the array of DmbtMarkItem, then for
+ * DMBT_MARK_REPLACE the new tuples, one after the other (unaligned)
  */
 typedef struct xl_dmbt_mark
 {
 	uint16		nitems;
-	bool		marked;
+	uint8		op;				/* DMBT_MARK_* */
 } xl_dmbt_mark;
 
-#define SizeOfDmbtMark	(offsetof(xl_dmbt_mark, marked) + sizeof(bool))
+#define DMBT_MARK_CLEAR		0
+#define DMBT_MARK_SET		1
+#define DMBT_MARK_REPLACE	2
+
+#define SizeOfDmbtMark	(offsetof(xl_dmbt_mark, op) + sizeof(uint8))
 
 /*
  * This is what we need to know about simple (without split) insert.
