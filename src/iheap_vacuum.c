@@ -331,7 +331,7 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	oldcxt = MemoryContextSwitchTo(cxt);
 
 	/* 1. discard undo; applies leftovers of aborted transactions */
-	(void) iheap_discard(rel, true);
+	(void) iheap_discard_all(rel, true);
 	discard = iheap_relcache(rel, true)->rc_discard;
 
 	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &indrels);

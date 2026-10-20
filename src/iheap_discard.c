@@ -25,6 +25,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
@@ -299,6 +300,35 @@ iheap_discard(Relation rel, bool force)
 	iheap_stat_count_discard(rel, npages, nbytes);
 
 	return npages;
+}
+
+/*
+ * Discard everything the horizon allows (VACUUM, iheap_discard()), one
+ * iheap_discard() call after another.  A writer that allocates undo passes
+ * at most DISCARD_MAX_PAGES_PER_CALL pages, which bounds the work done in
+ * its transaction; maintenance goes on until a call stops short of that,
+ * at the horizon or the stream's end.  Each call passes the pages it counts,
+ * so the loop ends.  VACUUM honours its cost delay between calls.  Returns
+ * the logical pages passed in all.
+ */
+int64
+iheap_discard_all(Relation rel, bool vacuum)
+{
+	int64		total = 0;
+
+	for (;;)
+	{
+		int64		n = iheap_discard(rel, true);
+
+		total += n;
+		if (n < DISCARD_MAX_PAGES_PER_CALL)
+			break;
+		if (vacuum)
+			vacuum_delay_point(false);
+		else
+			CHECK_FOR_INTERRUPTS();
+	}
+	return total;
 }
 
 /*

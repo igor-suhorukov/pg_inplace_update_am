@@ -1,0 +1,137 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1rr s2move s2del s2vac s2stat s1sel s1idx s1c s2vac s2stat s2sel s2check
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2move: UPDATE mb SET k = k + 1000 WHERE id <= 2;
+step s2del: DELETE FROM mb WHERE id = 3;
+step s2vac: VACUUM mb;
+step s2stat: SELECT deleted_items, stub_items, dead_items FROM iheap_relation_stats('mb');
+deleted_items|stub_items|dead_items
+-------------+----------+----------
+            3|         0|         0
+(1 row)
+
+step s1sel: SELECT id, k, v FROM mb ORDER BY id;
+id|k| v
+--+-+--
+ 1|1|10
+ 2|2|20
+ 3|3|30
+ 4|4|40
+ 5|5|50
+ 6|6|60
+(6 rows)
+
+step s1idx: SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT id, k, v FROM mb WHERE k < 1000 ORDER BY k; RESET enable_seqscan; RESET enable_bitmapscan;
+id|k| v
+--+-+--
+ 1|1|10
+ 2|2|20
+ 3|3|30
+ 4|4|40
+ 5|5|50
+ 6|6|60
+(6 rows)
+
+step s1c: COMMIT;
+step s2vac: VACUUM mb;
+step s2stat: SELECT deleted_items, stub_items, dead_items FROM iheap_relation_stats('mb');
+deleted_items|stub_items|dead_items
+-------------+----------+----------
+            0|         0|         0
+(1 row)
+
+step s2sel: SELECT id, k, v FROM mb ORDER BY id;
+id|   k| v
+--+----+--
+ 1|1001|10
+ 2|1002|20
+ 4|   4|40
+ 5|   5|50
+ 6|   6|60
+(5 rows)
+
+step s2check: SELECT * FROM iheap_check('mb');
+blkno|offnum|msg
+-----+------+---
+(0 rows)
+
+
+starting permutation: s2always s2full s2flags s1rr s2cmove s2vac s2stat s1sel s1idx s2sel s2check s1c s2vac s2stat s2check
+step s2always: SET iheap.compact_headers = always;
+step s2full: VACUUM FULL mb;
+step s2flags: SELECT count(*) FILTER (WHERE 'COMPACT' = ANY (flags)) AS compact FROM iheap_page_items('mb', 1);
+compact
+-------
+      6
+(1 row)
+
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2cmove: UPDATE mb SET k = k + 2000 WHERE id = 4; DELETE FROM mb WHERE id = 5;
+step s2vac: VACUUM mb;
+step s2stat: SELECT deleted_items, stub_items, dead_items FROM iheap_relation_stats('mb');
+deleted_items|stub_items|dead_items
+-------------+----------+----------
+            0|         2|         0
+(1 row)
+
+step s1sel: SELECT id, k, v FROM mb ORDER BY id;
+id|k| v
+--+-+--
+ 1|1|10
+ 2|2|20
+ 3|3|30
+ 4|4|40
+ 5|5|50
+ 6|6|60
+(6 rows)
+
+step s1idx: SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT id, k, v FROM mb WHERE k < 1000 ORDER BY k; RESET enable_seqscan; RESET enable_bitmapscan;
+id|k| v
+--+-+--
+ 1|1|10
+ 2|2|20
+ 3|3|30
+ 4|4|40
+ 5|5|50
+ 6|6|60
+(6 rows)
+
+step s2sel: SELECT id, k, v FROM mb ORDER BY id;
+id|   k| v
+--+----+--
+ 1|   1|10
+ 2|   2|20
+ 3|   3|30
+ 4|2004|40
+ 6|   6|60
+(5 rows)
+
+step s2check: SELECT * FROM iheap_check('mb');
+blkno|offnum|msg
+-----+------+---
+(0 rows)
+
+step s1c: COMMIT;
+step s2vac: VACUUM mb;
+step s2stat: SELECT deleted_items, stub_items, dead_items FROM iheap_relation_stats('mb');
+deleted_items|stub_items|dead_items
+-------------+----------+----------
+            0|         0|         0
+(1 row)
+
+step s2check: SELECT * FROM iheap_check('mb');
+blkno|offnum|msg
+-----+------+---
+(0 rows)
+

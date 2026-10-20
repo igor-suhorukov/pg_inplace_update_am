@@ -62,7 +62,12 @@ PG_FUNCTION_INFO_V1(iheap_check);
 	(IHT_HASNULL | IHT_HASVARWIDTH | IHT_HASEXTERNAL | IHT_ALIGNDATA | \
 	 IHT_XID_COMMITTED | IHT_XID_ABORTED | IHT_DELETED | IHT_MOVED | \
 	 IHT_LOCKED | IHT_INPLACE | IHT_SPECULATIVE | IHT_STUB | \
-	 IHT_KEYS_UPDATED | IHT_MOVED_PART)
+	 IHT_KEYS_UPDATED | IHT_MOVED_PART | IHT_COMPACT)
+
+/* flags of versions made by a transaction some snapshot may not see yet */
+#define IHT_XID_FLAGS \
+	(IHT_XID_HINTS | IHT_DELETED | IHT_MOVED | IHT_INPLACE | IHT_SPECULATIVE | \
+	 IHT_STUB | IHT_KEYS_UPDATED | IHT_MOVED_PART)
 
 #define IHUF_KNOWN_FLAGS \
 	(IHUF_SPEC | IHUF_LOCKERS | IHUF_KEYS_UPDATED | IHUF_MOVED_IN)
@@ -604,12 +609,14 @@ undo_record_problem(IHCheckState *cs, UndoRecPtr urp,
 		case IHU_UPDATE:
 			{
 				IHeapUpdateDelta d;
+				IHeapHdr	ph;
 
 				if (core < sizeof(d))
 					return "is an update without a delta";
 				memcpy(&d, payload, sizeof(d));
+				ih_hdr_read(hdr->ur_prev_hdr, &ph);
 				if (sizeof(d) + d.mid_len != core ||
-					(uint32) d.prefix + d.suffix + d.mid_len + IHEAP_TUPHDR_SIZE != d.old_len)
+					(uint32) d.prefix + d.suffix + d.mid_len + ih_hdr_size_of(&ph) != d.old_len)
 					return psprintf("is an update with a malformed delta (old length %u, prefix %u, suffix %u, middle %u, payload %u)",
 									d.old_len, d.prefix, d.suffix, d.mid_len, core);
 				break;
@@ -722,7 +729,7 @@ attributes_problem(IHCheckState *cs, const char *tup, uint32 len,
 {
 	int			natts = h->infomask2 & IHT_NATTS_MASK;
 	bool		hasnull = (h->infomask & IHT_HASNULL) != 0;
-	const uint8 *bits = (const uint8 *) (tup + IHEAP_TUPHDR_SIZE);
+	const uint8 *bits = (const uint8 *) (tup + ih_hdr_size_of(h));
 	const char *tp = tup + h->hoff;
 	uint32		datalen = len - h->hoff;
 	uint32		off = 0;
@@ -842,6 +849,7 @@ check_undo_chain(IHCheckState *cs, BlockNumber blk, OffsetNumber off,
 {
 	uint32		curlen = len;	/* length of the version h describes */
 	bool		lenknown = !stub;
+	bool		onpage = true;	/* h describes the item's version on the page */
 	int			steps = 0;
 
 	while (h.urec >= cs->discard)
@@ -949,7 +957,7 @@ check_undo_chain(IHCheckState *cs, BlockNumber blk, OffsetNumber off,
 					}
 					memcpy(&d, payload, sizeof(d));
 					if (lenknown &&
-						(uint32) d.prefix + d.suffix > curlen - IHEAP_TUPHDR_SIZE)
+						(uint32) d.prefix + d.suffix > curlen - ih_hdr_size_of(&h))
 					{
 						report(cs, blk, off, "update record " UINT64_FORMAT " keeps %u bytes of a version of %u bytes",
 							   h.urec, d.prefix + d.suffix, curlen);
@@ -960,17 +968,34 @@ check_undo_chain(IHCheckState *cs, BlockNumber blk, OffsetNumber off,
 					break;
 				}
 			case IHU_DELETE:
-				curlen = IHEAP_TUPHDR_SIZE + core;
-				lenknown = true;
-				break;
 			case IHU_MOVE:
-				curlen = IHEAP_TUPHDR_SIZE + core - sizeof(ItemPointerData);
-				lenknown = true;
-				break;
+				{
+					/*
+					 * The body of the version before: in the record (a
+					 * compact header's, or one written before §21 D40), or
+					 * on the page after the deletion's header, until the
+					 * item is a stub.
+					 */
+					uint32		skip = (rh.ur_type == IHU_MOVE) ?
+						sizeof(ItemPointerData) : 0;
+
+					if (core > skip)
+					{
+						curlen = ih_hdr_size_of(&ph) + core - skip;
+						lenknown = true;
+					}
+					else if (lenknown && onpage)
+						curlen = curlen - ih_hdr_size_of(&h) + ih_hdr_size_of(&ph);
+					else
+						lenknown = false;
+					break;
+				}
 			default:
 				/* a lock: the same version */
 				break;
 		}
+		if (rh.ur_type != IHU_LOCK)
+			onpage = false;
 
 		if (ph.urec == h.urec)
 		{
@@ -1053,6 +1078,14 @@ check_tuple(IHCheckState *cs, BlockNumber blk, OffsetNumber off, Page page,
 		report(cs, blk, off, "tuple is a stub, but neither DELETED nor MOVED");
 	if (stub && len != IHEAP_TUPHDR_SIZE)
 		report(cs, blk, off, "stub of %u bytes", len);
+	if ((h.infomask & IHT_COMPACT) && (h.infomask & IHT_XID_FLAGS))
+		report(cs, blk, off, "tuple has a compact header and flags %04X, which need an xid",
+			   h.infomask & IHT_XID_FLAGS);
+	if (len < ih_hdr_size_of(&h))
+	{
+		report(cs, blk, off, "tuple of %u bytes is shorter than its header", len);
+		return;
+	}
 
 	if (natts > cs->desc->natts)
 	{
@@ -1060,7 +1093,7 @@ check_tuple(IHCheckState *cs, BlockNumber blk, OffsetNumber off, Page page,
 			   natts, cs->desc->natts);
 		walk = false;
 	}
-	hoff = IHEAP_TUPHDR_SIZE + ((h.infomask & IHT_HASNULL) ? BITMAPLEN(natts) : 0);
+	hoff = ih_hdr_size_of(&h) + ((h.infomask & IHT_HASNULL) ? BITMAPLEN(natts) : 0);
 	if (h.hoff != hoff)
 	{
 		report(cs, blk, off, "tuple's header length is %u, expected %u",
@@ -1177,7 +1210,7 @@ check_data_page(IHCheckState *cs, BlockNumber blk, Page page, uint8 vmstatus)
 
 		if (ItemIdGetOffset(lp) < ph->pd_upper ||
 			ItemIdGetOffset(lp) + ItemIdGetLength(lp) > ph->pd_special ||
-			ItemIdGetLength(lp) < IHEAP_TUPHDR_SIZE)
+			ItemIdGetLength(lp) < IHEAP_COMPACT_HDRSZ)
 		{
 			report(cs, blk, off, "line pointer to %u of %u bytes is outside the tuple space %u to %u",
 				   ItemIdGetOffset(lp), ItemIdGetLength(lp), ph->pd_upper,

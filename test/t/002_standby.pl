@@ -59,10 +59,43 @@ UPDATE tu SET code = code + 20000 WHERE id % 5 = 0;
 });
 $primary->safe_psql('postgres', 'VACUUM');
 
+# moves (a btree index's column changes) and deletions while a prepared
+# transaction holds the horizon: the old rows' bodies stay on their pages,
+# and the pruning that frees them later carries a conflict horizon (§21
+# D40).  Rows with compact headers (§21 D43), from a rewrite: locked,
+# updated in place, moved, deleted, and rolled back.
+$primary->safe_psql('postgres', q{
+CREATE TABLE tc (id int PRIMARY KEY, k int, v int, s text) USING iheap;
+CREATE INDEX tc_k ON tc USING btree (k);
+INSERT INTO tc SELECT g, g, g, 'c' || g FROM generate_series(1, 3000) g;
+SET iheap.compact_headers = always;
+VACUUM FULL tc;
+BEGIN;
+INSERT INTO tc VALUES (0, 0, 0, 'held');
+PREPARE TRANSACTION 'held';
+SELECT count(*) FROM (SELECT id FROM tc WHERE id % 7 = 0 FOR KEY SHARE) l;
+UPDATE tc SET v = v + 1 WHERE id % 5 = 0;
+UPDATE tc SET k = k + 10000 WHERE id % 11 = 0;
+DELETE FROM tc WHERE id % 13 = 0;
+BEGIN;
+UPDATE tc SET v = -v WHERE id % 3 = 0;
+DELETE FROM tc WHERE id % 4 = 0;
+UPDATE tc SET k = -k WHERE id % 6 = 0;
+SELECT count(*) FROM (SELECT id FROM tc WHERE id % 9 = 0 FOR UPDATE) l;
+ROLLBACK;
+VACUUM tc;
+COMMIT PREPARED 'held';
+UPDATE tc SET k = k + 1 WHERE id % 17 = 0;
+VACUUM tc;
+VACUUM FULL tc;
+UPDATE tc SET v = v + 1 WHERE id % 19 = 0;
+DELETE FROM tc WHERE id % 23 = 0;
+});
+
 $primary->wait_for_catchup($standby);
 
 # the structure checks, on both sides (the standby replays every page)
-for my $t (qw(ti tf tt tu))
+for my $t (qw(ti tf tt tu tc))
 {
 	is(iheap_verify($primary, $t), '', "structure checks of $t on the primary");
 	is(iheap_verify($standby, $t), '', "structure checks of $t on the standby");
@@ -75,6 +108,9 @@ is(iheap_snapshot($standby, 'ti'), iheap_snapshot($primary, 'th'),
 is($standby->safe_psql('postgres', 'SELECT count(*), sum(v) FROM tf'),
 	$primary->safe_psql('postgres', 'SELECT count(*), sum(v) FROM tf'),
 	'rewritten table replicated');
+is($standby->safe_psql('postgres', 'SELECT count(*), sum(k), sum(v) FROM tc'),
+	$primary->safe_psql('postgres', 'SELECT count(*), sum(k), sum(v) FROM tc'),
+	'table with compact headers replicated');
 is($standby->safe_psql('postgres', q{
 SET enable_seqscan = off; SET enable_bitmapscan = off;
 SELECT count(*) FROM ti WHERE k > -1000000}),

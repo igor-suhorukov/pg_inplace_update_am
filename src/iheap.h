@@ -130,9 +130,24 @@ typedef uint64 UndoRecPtr;
  * Pass-by-reference attributes are aligned relative to the data area; when
  * a tuple contains such a value, IHT_ALIGNDATA is set and the tuple is
  * placed so that its data area is MAXALIGNed in memory.
+ *
+ * A compact header (IHT_COMPACT, §21 D43) ends before the xid: 12 bytes.
+ * Its version was created by a transaction every snapshot sees, so the
+ * xid would never be looked up; it reads as FrozenTransactionId.  Locks
+ * set its undo pointer as for any other header.  Only versions written
+ * frozen get one (table rewrites, frozen loads), and only those without
+ * aligned values (IHT_ALIGNDATA) whose body takes at least
+ * IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ bytes, so that the 16-byte
+ * header of a deletion fits in their storage.
+ *
+ * Undo records carry the header of the previous version as an "image": the
+ * 16-byte layout above whatever the version's own form, with xid
+ * FrozenTransactionId for a compact one (ih_hdr_write_image()).
+ * ih_hdr_read() reads both forms.
  * ------------------------------------------------------------------------
  */
 #define IHEAP_TUPHDR_SIZE	16
+#define IHEAP_COMPACT_HDRSZ	12
 
 #define IHT_NATTS_MASK		0x07FF	/* in infomask2 */
 
@@ -150,6 +165,7 @@ typedef uint64 UndoRecPtr;
 #define IHT_STUB			0x0800	/* body reclaimed, header only */
 #define IHT_KEYS_UPDATED	0x1000	/* modification by xid changed keys */
 #define IHT_MOVED_PART		0x2000	/* deleted by a move to another partition */
+#define IHT_COMPACT			0x4000	/* compact header: no xid (frozen) */
 
 #define IHT_XID_HINTS		(IHT_XID_COMMITTED | IHT_XID_ABORTED)
 #define IHT_DATA_FLAGS		(IHT_HASNULL | IHT_HASVARWIDTH | IHT_HASEXTERNAL | \
@@ -165,6 +181,31 @@ typedef struct IHeapHdr
 	TransactionId xid;
 } IHeapHdr;
 
+static inline uint16
+ih_hdr_infomask(const char *tup)
+{
+	uint16		v;
+
+	memcpy(&v, tup + 2, sizeof(uint16));
+	return v;
+}
+
+/* bytes the header of tup takes (the null bitmap starts there) */
+static inline uint32
+ih_hdr_size(const char *tup)
+{
+	return (ih_hdr_infomask(tup) & IHT_COMPACT) ?
+		IHEAP_COMPACT_HDRSZ : IHEAP_TUPHDR_SIZE;
+}
+
+/* bytes the header h takes in a tuple */
+static inline uint32
+ih_hdr_size_of(const IHeapHdr *h)
+{
+	return (h->infomask & IHT_COMPACT) ? IHEAP_COMPACT_HDRSZ : IHEAP_TUPHDR_SIZE;
+}
+
+/* read a header, in a tuple (either form) or as an image */
 static inline void
 ih_hdr_read(const char *tup, IHeapHdr *h)
 {
@@ -177,9 +218,13 @@ ih_hdr_read(const char *tup, IHeapHdr *h)
 	for (int i = 6; i >= 0; i--)
 		u = (u << 8) | b[5 + i];
 	h->urec = u;
-	memcpy(&h->xid, tup + 12, sizeof(TransactionId));
+	if (h->infomask & IHT_COMPACT)
+		h->xid = FrozenTransactionId;
+	else
+		memcpy(&h->xid, tup + 12, sizeof(TransactionId));
 }
 
+/* write the header of a tuple, in the form its flags give */
 static inline void
 ih_hdr_write(char *tup, const IHeapHdr *h)
 {
@@ -194,16 +239,28 @@ ih_hdr_write(char *tup, const IHeapHdr *h)
 		b[5 + i] = (uint8) (u & 0xFF);
 		u >>= 8;
 	}
-	memcpy(tup + 12, &h->xid, sizeof(TransactionId));
+	if ((h->infomask & IHT_COMPACT) == 0)
+		memcpy(tup + 12, &h->xid, sizeof(TransactionId));
+	else
+		Assert(h->xid == FrozenTransactionId);
 }
 
-static inline uint16
-ih_hdr_infomask(const char *tup)
+/* write h as a 16-byte image (undo records' previous headers) */
+static inline void
+ih_hdr_write_image(char *img, const IHeapHdr *h)
 {
-	uint16		v;
+	ih_hdr_write(img, h);
+	memcpy(img + 12, &h->xid, sizeof(TransactionId));
+}
 
-	memcpy(&v, tup + 2, sizeof(uint16));
-	return v;
+/* the image of the header of tuple tup */
+static inline void
+ih_hdr_image(char *img, const char *tup)
+{
+	IHeapHdr	h;
+
+	ih_hdr_read(tup, &h);
+	ih_hdr_write_image(img, &h);
 }
 
 static inline void
@@ -576,6 +633,12 @@ extern void iheap_fake_relation_close(Relation rel);
 extern bool iheap_enable_inplace;
 extern int	iheap_foreground_undo_limit;
 extern int	iheap_logical_decoding;
+extern int	iheap_compact_headers;
+
+/* iheap.compact_headers (§21 D43) */
+#define IHEAP_COMPACT_OFF		0
+#define IHEAP_COMPACT_AUTO		1	/* where fillfactor leaves room to grow back */
+#define IHEAP_COMPACT_ALWAYS	2
 
 /* iheap_tuple.c */
 extern Size ih_compute_data_size(TupleDesc desc, const Datum *values,
@@ -589,6 +652,8 @@ extern void ih_deform_into_slot(TupleTableSlot *slot, const char *tuple,
 extern char *ih_copy_tuple_aligned(MemoryContext cxt, const char *tuple,
 								   uint32 len, char **mem);
 extern uint32 ih_tuple_len_on_page(Page page, OffsetNumber off);
+extern bool ih_tuple_can_compact(const char *tuple, uint32 len);
+extern uint32 ih_tuple_compact(char *tuple, uint32 len);
 
 /* iheap_slot.c */
 extern void iheap_store_tuple(TupleTableSlot *slot, char *tuple, uint32 len,
@@ -630,21 +695,25 @@ typedef struct IHeapUndoWalEnt
 
 /*
  * Undo records travel in WAL as buffer data of their undo page, each as a
- * compact header followed by the payload.  The header leaves out what redo
- * can derive (DESIGN.md §21 D15): the placement (records are appended at
- * pd_lower), the length, the writer when it is the WAL record's xid, the
- * target block when it is the record's data block (IH_BLK_DATA), and the
- * logical page of the chain pointer when it is the undo page's own.
- *
- *		wflags (1), ur_type (1), ur_flags (1), payload length (2),
- *		ur_cid (4), ur_offnum (2), [ur_xid (4)], [ur_blkno (4)],
- *		ur_xact_prev (0, 2 or 8), ur_prev_hdr (16)
+ * flags byte and the record as its page encodes it (§21 D37), less what
+ * redo can derive (§21 D15, D42): the writer's xid when it is the WAL
+ * record's, the target block when it is the record's data block
+ * (IH_BLK_DATA), and the delta header of an in-place update (old length,
+ * prefix, suffix, middle length), which the update record's prefix and
+ * suffix and the record's own lengths give.  The placement is derived too:
+ * records are appended at pd_lower.
  */
-#define IHUW_XID			0x01	/* ur_xid present */
-#define IHUW_BLKNO			0x02	/* ur_blkno present */
-#define IHUW_PREV_LOCAL		0x04	/* ur_xact_prev: offset on this page */
-#define IHUW_PREV_NONE		0x08	/* ur_xact_prev invalid */
-#define IHEAP_UNDOWAL_MAXHDR	(1 + 1 + 1 + 2 + 4 + 2 + 4 + 4 + 8 + IHEAP_TUPHDR_SIZE)
+#define IHUW_XID			0x01	/* the writer's xid is there */
+#define IHUW_BLKNO			0x02	/* the target block is there */
+#define IHUW_DELTA			0x04	/* the update delta's header is left out */
+#define IHEAP_UNDOWAL_MAXHDR	(1 + IHEAP_UNDOREC_MAXHDRSZ)
+
+/* what redo needs to derive an update's delta header (IHUW_DELTA) */
+typedef struct IHeapUndoDeltaSrc
+{
+	uint16		prefix;
+	uint16		suffix;
+} IHeapUndoDeltaSrc;
 
 typedef struct IHeapUndoReservation
 {
@@ -657,7 +726,7 @@ typedef struct IHeapUndoReservation
 								 * headers below it are written frozen */
 	int			nwal;			/* records written, for WAL registration */
 	IHeapUndoWalEnt wal[4];
-	char		walhdr[4][IHEAP_UNDOWAL_MAXHDR];	/* their compact headers */
+	char		walhdr[4][IHEAP_UNDOWAL_MAXHDR];	/* their WAL headers */
 } IHeapUndoReservation;
 
 extern void iheap_undo_reserve(Relation rel, Size len,
@@ -666,9 +735,10 @@ extern UndoRecPtr iheap_undo_write(Relation rel, IHeapUndoReservation *res,
 								   IHeapUndoRecHeader *hdr,
 								   const char *payload, uint32 payload_len);
 extern void iheap_undo_register_wal(IHeapUndoReservation *res, uint8 block_id,
-									BlockNumber datablk);
-extern void iheap_undo_redo_records(XLogReaderState *record, Page page,
-									const char *data, Size len);
+									BlockNumber datablk, bool delta_derived);
+extern uint64 iheap_undo_redo_block(XLogReaderState *record, uint8 block_id,
+									int known_entry, uint16 known_off,
+									const IHeapUndoDeltaSrc *delta);
 extern void iheap_undo_set_lsn(IHeapUndoReservation *res, XLogRecPtr lsn);
 extern void iheap_undo_release(IHeapUndoReservation *res);
 extern IHeapUndoRec *iheap_undo_fetch(Relation rel, UndoRecPtr urp,
@@ -770,6 +840,8 @@ extern Buffer iheap_get_buffer_for_tuple(Relation rel, Size len,
 										 BulkInsertStateData *bistate,
 										 Buffer otherbuf, bool *page_init);
 extern Size iheap_page_free_space(Page page);
+extern int	iheap_compact_quota(Relation rel);
+extern int	iheap_page_compact_count(Page page);
 extern OffsetNumber iheap_page_add_item(Page page, const char *tuple,
 										uint32 len, OffsetNumber want);
 extern bool iheap_page_place_item(Page page, OffsetNumber off,
@@ -785,11 +857,15 @@ extern void iheap_register_xact_callbacks(void);
 
 /* iheap_discard.c */
 extern int64 iheap_discard(Relation rel, bool force);
+extern int64 iheap_discard_all(Relation rel, bool vacuum);
 extern TransactionId iheap_oldest_live_xid(Relation rel, TransactionId horizon);
 
 /* iheap_prune.c */
 extern bool iheap_page_prune(Relation rel, Buffer buffer, bool force,
 							 OffsetNumber *deadoffs, int *ndead);
+extern bool iheap_page_prune_opt(Relation rel, Buffer buffer);
+extern bool iheap_page_prune_grow(Relation rel, Buffer buffer,
+								  OffsetNumber off, uint32 len);
 extern void iheap_page_compact(Relation rel, Page page,
 							   const uint32 *reserve);
 extern void iheap_compute_reservations(Relation rel, Page page,

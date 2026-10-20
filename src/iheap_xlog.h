@@ -5,9 +5,13 @@
  *
  * Every data-changing operation writes one record that registers the data
  * page(s), the undo page and, when visibility-map bits are cleared, the VM
- * page(s).  Undo page block data is a sequence of
- *		{ uint16 offset; uint16 length; char bytes[length] }
- * entries, one per undo record written by the operation.
+ * page(s).  The undo page's block data holds the undo records the operation
+ * wrote, each in the form iheap_undo.c describes (their page encoding, with
+ * what redo can derive left out).
+ *
+ * Tuple headers travel without their xid and with their undo pointer as an
+ * offset on the record's undo page (§21 D42): redo replays the undo page
+ * first and takes its logical page number from it.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -33,7 +37,6 @@
 #define XLOG_IHEAP_META			0xB0
 #define XLOG_IHEAP_SPEC_FINISH	0xC0
 #define XLOG_IHEAP_UNUSED		0xD0	/* vacuum: LP_DEAD -> LP_UNUSED */
-#define XLOG_IHEAP_UNDO			0xE0	/* undo records only (table rewrite) */
 
 #define XLOG_IHEAP_OPMASK		0xF0
 
@@ -49,6 +52,9 @@
 										 * logical decoding needs (below) */
 #define XLIH_LAST_IN_MULTI		0x80	/* MULTI_INSERT: the last record of a
 										 * multi_insert call */
+#define XLIH_MOVE_DELTA			0x20	/* MOVE on the same page: the new body
+										 * logged as the middle that differs
+										 * from the old one (below) */
 
 /*
  * With XLIH_LOGICAL, the record's struct is followed in main data by a flags
@@ -70,7 +76,34 @@
 #define IH_BLK_META			0	/* UNDO_ALLOC, DISCARD, META */
 #define IH_BLK_NEWUNDO		1	/* UNDO_ALLOC */
 
-/* XLOG_IHEAP_INSERT: block DATA data = full tuple */
+/*
+ * The header of a tuple a record writes, as it travels in WAL:
+ *
+ *		uint16 infomask2, uint16 infomask, uint8 hoff, uint16 urec_off
+ *
+ * unaligned.  The tuple's header on the page takes the form its infomask
+ * gives (IHT_COMPACT, §21 D43).  Its undo pointer is urec_off on the
+ * record's undo page, or 0 when urec_off is 0 (a frozen insert).  Its xid
+ * is not logged: a compact header has none; otherwise it is the record's
+ * xid, or FrozenTransactionId for a frozen insert.
+ */
+#define SizeOfIHeapWalHdr	7
+
+/*
+ * The header an existing item gets (DELETE, LOCK, the old item of a MOVE),
+ * as it travels in WAL:
+ *
+ *		uint16 infomask, uint16 urec_off
+ *
+ * infomask2 and hoff are those of the item's header on the page, and so is
+ * the xid of a LOCK (a lock does not change the version's creator); a
+ * DELETE or MOVE sets the record's xid.  A compact header that has to
+ * carry an xid becomes a full one: the item turns into a stub (IHT_STUB in
+ * the new infomask, its body in the undo record) and hoff grows with it.
+ */
+#define SizeOfIHeapWalHdrChange	4
+
+/* XLOG_IHEAP_INSERT: block DATA data = header (SizeOfIHeapWalHdr), body */
 typedef struct xl_iheap_insert
 {
 	OffsetNumber offnum;
@@ -81,17 +114,22 @@ typedef struct xl_iheap_insert
 
 /*
  * XLOG_IHEAP_MULTI_INSERT: block DATA data = ntuples entries of
- * { OffsetNumber offnum; uint16 len; char tuple[len] }
+ *		{ OffsetNumber offnum; uint16 bodylen; uint16 infomask2;
+ *		  uint16 infomask; uint8 hoff; char body[bodylen] }
+ * All tuples share the record's xid and its undo record at urec_off (0 for a
+ * frozen load: no undo, xid FrozenTransactionId).
  */
 typedef struct xl_iheap_multi_insert
 {
 	uint16		ntuples;
+	uint16		urec_off;
 	uint8		flags;
 } xl_iheap_multi_insert;
 
 #define SizeOfIHeapMultiInsert	(offsetof(xl_iheap_multi_insert, flags) + sizeof(uint8))
+#define SizeOfIHeapMultiTuple	(2 + 2 + 2 + 2 + 1)
 
-/* XLOG_IHEAP_DELETE, XLOG_IHEAP_LOCK: block DATA data = new 16-byte header */
+/* XLOG_IHEAP_DELETE, XLOG_IHEAP_LOCK: block DATA data = header change */
 typedef struct xl_iheap_hdrchange
 {
 	OffsetNumber offnum;
@@ -102,9 +140,11 @@ typedef struct xl_iheap_hdrchange
 
 /*
  * XLOG_IHEAP_UPDATE: block DATA data =
- *		header (16) + new body bytes between prefix and suffix
- * The new tuple is old_body[0:prefix] + mid + old_body[old_len-suffix:].
- * With XLIH_LOGICAL, prefix and suffix are 0: the whole new tuple.
+ *		header (SizeOfIHeapWalHdr) + new body bytes between prefix and suffix
+ * The new body is old_body[0:prefix] + mid + old_body[old_bodylen-suffix:].
+ * With XLIH_LOGICAL, prefix and suffix are 0: the whole new body.  Without
+ * it, the update's undo record leaves its delta header out of WAL: redo
+ * takes prefix and suffix from here.
  */
 typedef struct xl_iheap_update
 {
@@ -120,8 +160,12 @@ typedef struct xl_iheap_update
 #define SizeOfIHeapUpdate	(offsetof(xl_iheap_update, flags) + sizeof(uint8))
 
 /*
- * XLOG_IHEAP_MOVE: block DATA data = new header of the old item;
- * block NEWDATA (or DATA when XLIH_SAME_PAGE, appended) data = new tuple.
+ * XLOG_IHEAP_MOVE: block DATA data = header change of the old item;
+ * block NEWDATA (or DATA when XLIH_SAME_PAGE, appended) data = the new
+ * tuple: header (SizeOfIHeapWalHdr), body.  With XLIH_MOVE_DELTA (a move on
+ * the same page, the old body still there: §21 D40), main data goes on with
+ * xl_iheap_move_delta, and only the new body's bytes between prefix and
+ * suffix are logged, as heap does for an update on the same page.
  */
 typedef struct xl_iheap_move
 {
@@ -133,9 +177,15 @@ typedef struct xl_iheap_move
 
 #define SizeOfIHeapMove		(offsetof(xl_iheap_move, flags) + sizeof(uint8))
 
+typedef struct xl_iheap_move_delta
+{
+	uint16		prefix;
+	uint16		suffix;
+} xl_iheap_move_delta;
+
 /* XLOG_IHEAP_ROLLBACK */
 #define XLIH_RB_KILL		1	/* item becomes LP_DEAD */
-#define XLIH_RB_HEADER		2	/* restore header only */
+#define XLIH_RB_HEADER		2	/* restore header only (data: its image) */
 #define XLIH_RB_TUPLE		3	/* restore whole tuple at lp_off */
 
 typedef struct xl_iheap_rollback
@@ -153,7 +203,9 @@ typedef struct xl_iheap_rollback
  *		OffsetNumber dead[ndead]		items that become LP_DEAD
  *		OffsetNumber stub[nstub]		items shrunk to a header-only stub
  *		{ OffsetNumber off; uint16 len } reserve[nreserve]
- * followed by compaction of the page.
+ * followed by compaction of the page.  With XLIH_PRUNE_CONFLICT, main data
+ * goes on with the newest xid whose deleted or moved rows lost their body
+ * (standby queries that may still see them are cancelled first).
  */
 typedef struct xl_iheap_prune
 {
@@ -162,6 +214,9 @@ typedef struct xl_iheap_prune
 	uint16		nreserve;
 	uint8		flags;
 } xl_iheap_prune;
+
+#define XLIH_PRUNE_DONE			0x01	/* the page has nothing left to prune */
+#define XLIH_PRUNE_CONFLICT		0x02	/* a conflict horizon follows */
 
 #define SizeOfIHeapPrune	(offsetof(xl_iheap_prune, flags) + sizeof(uint8))
 
@@ -193,7 +248,10 @@ typedef struct xl_iheap_discard
 
 #define SizeOfIHeapDiscard	(offsetof(xl_iheap_discard, flags) + sizeof(uint8))
 
-/* XLOG_IHEAP_SPEC_FINISH: block DATA data = new header (when succeeded) */
+/*
+ * XLOG_IHEAP_SPEC_FINISH: no block data; a confirmation clears the item's
+ * IHT_SPECULATIVE flag, a super-deletion makes it LP_DEAD.
+ */
 typedef struct xl_iheap_spec_finish
 {
 	OffsetNumber offnum;
@@ -213,5 +271,21 @@ typedef struct xl_iheap_unused
 } xl_iheap_unused;
 
 #define SizeOfIHeapUnused	(sizeof(uint16))
+
+/* ------------------------------------------------------------------------
+ * Tuple headers in WAL (iheap_xlog.c)
+ * ------------------------------------------------------------------------
+ */
+struct IHeapHdr;
+
+extern void iheap_walhdr_put(char *dst, const struct IHeapHdr *h);
+extern uint16 iheap_walhdr_urec_off(const char *src);
+extern void iheap_walhdr_get(const char *src, struct IHeapHdr *h,
+							 uint64 lpage, TransactionId xid);
+extern void iheap_walchange_put(char *dst, const struct IHeapHdr *h);
+extern uint16 iheap_walchange_urec_off(const char *src);
+extern void iheap_walchange_get(const char *src, const struct IHeapHdr *old,
+								struct IHeapHdr *h, uint64 lpage,
+								TransactionId xid);
 
 #endif							/* IHEAP_XLOG_H */

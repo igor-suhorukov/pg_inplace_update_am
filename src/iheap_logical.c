@@ -433,25 +433,32 @@ reorder_tuple(ReorderBuffer *rb, HeapTuple src)
 }
 
 /*
- * The iheap tuple tdata (tlen bytes, unaligned, as in the record) as a heap
- * tuple of the reorder buffer, by the layout desc.
+ * The iheap tuple with header h and body (null bitmap and data, bodylen
+ * bytes, unaligned, as in the record) as a heap tuple of the reorder buffer,
+ * by the layout desc.  Records carry tuple headers in their WAL form
+ * (§21 D42): their xid and undo pointer do not matter here.
  */
 static HeapTuple
-decode_iheap_tuple(ReorderBuffer *rb, TupleDesc desc, const char *tdata,
-				   uint32 tlen)
+decode_iheap_tuple(ReorderBuffer *rb, TupleDesc desc, const IHeapHdr *h,
+				   const char *body, uint32 bodylen)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(decode_cxt);
-	char	   *mem;
-	char	   *tup;
+	uint32		hs = ih_hdr_size_of(h);
+	uint32		tlen = hs + bodylen;
+	char	   *mem = palloc(tlen + MAXIMUM_ALIGNOF);
+	char	   *tup = mem;
 	Datum	   *values;
 	bool	   *isnull;
 	HeapTuple	htup;
 	HeapTuple	result;
 
-	if (tlen < IHEAP_TUPHDR_SIZE || ih_hdr_hoff(tdata) > tlen ||
-		ih_hdr_natts(tdata) > desc->natts)
+	if (h->hoff < hs || h->hoff > tlen ||
+		(h->infomask2 & IHT_NATTS_MASK) > desc->natts)
 		elog(ERROR, "iheap: logical decoding: tuple does not match its layout");
-	tup = ih_copy_tuple_aligned(decode_cxt, tdata, tlen, &mem);
+	if (h->infomask & IHT_ALIGNDATA)
+		tup = (char *) (TYPEALIGN(MAXIMUM_ALIGNOF, (uintptr_t) mem + h->hoff) - h->hoff);
+	ih_hdr_write(tup, h);
+	memcpy(tup + hs, body, bodylen);
 	values = palloc(Max(desc->natts, 1) * sizeof(Datum));
 	isnull = palloc(Max(desc->natts, 1) * sizeof(bool));
 	ih_deform_tuple(desc, tup, values, isnull);
@@ -461,6 +468,20 @@ decode_iheap_tuple(ReorderBuffer *rb, TupleDesc desc, const char *tdata,
 	result = reorder_tuple(rb, htup);
 	MemoryContextReset(decode_cxt);
 	return result;
+}
+
+/* the same for a tuple as a WAL header form followed by its body */
+static HeapTuple
+decode_wal_tuple(ReorderBuffer *rb, TupleDesc desc, const char *data,
+				 uint32 len)
+{
+	IHeapHdr	h;
+
+	if (len < SizeOfIHeapWalHdr)
+		elog(ERROR, "iheap: logical decoding: truncated tuple");
+	iheap_walhdr_get(data, &h, 0, FrozenTransactionId);
+	return decode_iheap_tuple(rb, desc, &h, data + SizeOfIHeapWalHdr,
+							  len - SizeOfIHeapWalHdr);
 }
 
 /* the old row's identity at "p" (heap's layout, as written) */
@@ -581,14 +602,16 @@ decode_insert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	if (lp.desc == NULL || tdata == NULL)
 		elog(ERROR, "iheap: logical decoding: insert without its tuple");
 
+	if (tlen < SizeOfIHeapWalHdr)
+		elog(ERROR, "iheap: logical decoding: insert without its tuple");
 	change = new_change(ctx, r, IH_BLK_DATA,
 						(ih_hdr_infomask(tdata) & IHT_SPECULATIVE) ?
 						REORDER_BUFFER_CHANGE_INTERNAL_SPEC_INSERT :
 						REORDER_BUFFER_CHANGE_INSERT);
 	if (change == NULL)
 		return;
-	change->data.tp.newtuple = decode_iheap_tuple(ctx->reorder, lp.desc,
-												  tdata, tlen);
+	change->data.tp.newtuple = decode_wal_tuple(ctx->reorder, lp.desc,
+												tdata, tlen);
 	queue_change(ctx, buf, change);
 }
 
@@ -613,21 +636,27 @@ decode_multi_insert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	for (int i = 0; i < xlrec->ntuples; i++)
 	{
 		ReorderBufferChange *change;
-		uint16		tlen;
+		uint16		bodylen;
+		IHeapHdr	h;
 
-		if (data + sizeof(OffsetNumber) + sizeof(uint16) > end)
+		/* offnum, body length, infomask2, infomask, hoff, body */
+		if (data + SizeOfIHeapMultiTuple > end)
 			elog(ERROR, "iheap: logical decoding: truncated multi-insert");
-		data += sizeof(OffsetNumber);
-		memcpy(&tlen, data, sizeof(uint16));
-		data += sizeof(uint16);
-		if (data + tlen > end)
+		memcpy(&bodylen, data + 2, sizeof(uint16));
+		memcpy(&h.infomask2, data + 4, sizeof(uint16));
+		memcpy(&h.infomask, data + 6, sizeof(uint16));
+		h.hoff = (uint8) data[8];
+		h.urec = InvalidUndoRecPtr;
+		h.xid = FrozenTransactionId;
+		data += SizeOfIHeapMultiTuple;
+		if (data + bodylen > end)
 			elog(ERROR, "iheap: logical decoding: truncated multi-insert");
 
 		change = new_change(ctx, r, IH_BLK_DATA, REORDER_BUFFER_CHANGE_INSERT);
 		if (change == NULL)
 			return;
 		change->data.tp.newtuple = decode_iheap_tuple(ctx->reorder, lp.desc,
-													  data, tlen);
+													  &h, data, bodylen);
 
 		/*
 		 * As heap: TOAST reassembly state is reset only after the last row
@@ -636,7 +665,7 @@ decode_multi_insert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		change->data.tp.clear_toast_afterwards =
 			(xlrec->flags & XLIH_LAST_IN_MULTI) && i + 1 == xlrec->ntuples;
 		queue_change(ctx, buf, change);
-		data += tlen;
+		data += bodylen;
 	}
 }
 
@@ -660,12 +689,12 @@ decode_update(LogicalDecodingContext *ctx, XLogRecordBuffer *buf, bool move)
 		read_logical_part(r, SizeOfIHeapMove, &lp);
 		if (xlrec->flags & XLIH_SAME_PAGE)
 		{
-			/* the old item's new header, then the new tuple */
+			/* the old item's header change, then the new tuple */
 			tdata = XLogRecGetBlockData(r, IH_BLK_DATA, &tlen);
-			if (tdata == NULL || tlen < IHEAP_TUPHDR_SIZE)
+			if (tdata == NULL || tlen < SizeOfIHeapWalHdrChange)
 				elog(ERROR, "iheap: logical decoding: update without its tuple");
-			tdata += IHEAP_TUPHDR_SIZE;
-			tlen -= IHEAP_TUPHDR_SIZE;
+			tdata += SizeOfIHeapWalHdrChange;
+			tlen -= SizeOfIHeapWalHdrChange;
 		}
 		else
 			tdata = XLogRecGetBlockData(r, IH_BLK_NEWDATA, &tlen);
@@ -678,7 +707,7 @@ decode_update(LogicalDecodingContext *ctx, XLogRecordBuffer *buf, bool move)
 		if (!(xlrec->flags & XLIH_LOGICAL))
 			return;
 		read_logical_part(r, SizeOfIHeapUpdate, &lp);
-		/* logged whole: the header, then the body (no prefix, no suffix) */
+		/* logged whole: the header's WAL form, then the body (no prefix, no suffix) */
 		tdata = XLogRecGetBlockData(r, IH_BLK_DATA, &tlen);
 		if (xlrec->prefix != 0 || xlrec->suffix != 0)
 			elog(ERROR, "iheap: logical decoding: update logged as a delta");
@@ -690,8 +719,8 @@ decode_update(LogicalDecodingContext *ctx, XLogRecordBuffer *buf, bool move)
 	change = new_change(ctx, r, block_id, REORDER_BUFFER_CHANGE_UPDATE);
 	if (change == NULL)
 		return;
-	change->data.tp.newtuple = decode_iheap_tuple(ctx->reorder, lp.desc,
-												  tdata, tlen);
+	change->data.tp.newtuple = decode_wal_tuple(ctx->reorder, lp.desc,
+												tdata, tlen);
 	if (lp.old != NULL)
 		change->data.tp.oldtuple = decode_old_tuple(ctx->reorder, lp.old,
 													lp.end);

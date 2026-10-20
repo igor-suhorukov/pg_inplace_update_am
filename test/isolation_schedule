@@ -12,3 +12,4 @@ iheap_dm_snapshot
 iheap_dm_rebuild
 iheap_dm_unique
 iheap_dm_serializable
+iheap_moved_body

@@ -60,7 +60,7 @@ regress/opr_sanity         lists the operators of every index AM: dmbtree's copi
 regress/reloptions         layout: VACUUM truncation leaves the metapage, the size never returns to 0
 regress/returning          layout (in-place updates keep ctid), plan, order
 regress/rowsecurity        layout: TABLESAMPLE picks other rows; order
-regress/stats              relpages counts metapage and undo pages but scans read data pages only; VACUUM FULL writes through shared buffers, so the next VACUUM reads nothing through its ring
+regress/stats              relpages counts metapage and undo pages but scans read data pages only; the buffer ring test's table fills 16 data pages (291 rows each), which VACUUM's 16-buffer ring reads without reusing a buffer
 regress/tablesample        layout: sampling depends on the block layout
 regress/temp               scans copy pages and keep no buffer pins between rows, so local-buffer exhaustion does not happen; layout
 regress/tid                layout: there is no row at (0,1)

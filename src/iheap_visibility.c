@@ -280,29 +280,38 @@ ih_ssi_conflict_out(Relation rel, TransactionId xid, Snapshot snapshot)
  * ------------------------------------------------------------------------
  */
 
-/* allocate an aligned buffer and assemble header + body pieces */
+/*
+ * Allocate an aligned buffer and assemble a tuple from the header image
+ * "hdr" (written in its own form) and up to three body pieces.
+ */
 static char *
 ih_assemble(const char *hdr, const char *p1, uint32 l1, const char *p2,
 			uint32 l2, const char *p3, uint32 l3, uint32 *len, char **memp)
 {
-	uint32		total = IHEAP_TUPHDR_SIZE + l1 + l2 + l3;
-	char	   *mem = palloc(total + MAXIMUM_ALIGNOF);
-	char	   *t = mem;
-	uint8		hoff = ((const uint8 *) hdr)[4];
+	IHeapHdr	h;
+	uint32		hs;
+	uint32		total;
+	char	   *mem;
+	char	   *t;
 
-	if (ih_tuple_needs_align(hdr))
+	ih_hdr_read(hdr, &h);
+	hs = ih_hdr_size_of(&h);
+	total = hs + l1 + l2 + l3;
+	mem = palloc(total + MAXIMUM_ALIGNOF);
+	t = mem;
+	if (h.infomask & IHT_ALIGNDATA)
 	{
-		uintptr_t	p = TYPEALIGN(MAXIMUM_ALIGNOF, (uintptr_t) mem + hoff);
+		uintptr_t	p = TYPEALIGN(MAXIMUM_ALIGNOF, (uintptr_t) mem + h.hoff);
 
-		t = (char *) (p - hoff);
+		t = (char *) (p - h.hoff);
 	}
-	memcpy(t, hdr, IHEAP_TUPHDR_SIZE);
+	ih_hdr_write(t, &h);
 	if (l1)
-		memcpy(t + IHEAP_TUPHDR_SIZE, p1, l1);
+		memcpy(t + hs, p1, l1);
 	if (l2)
-		memcpy(t + IHEAP_TUPHDR_SIZE + l1, p2, l2);
+		memcpy(t + hs + l1, p2, l2);
 	if (l3)
-		memcpy(t + IHEAP_TUPHDR_SIZE + l1 + l2, p3, l3);
+		memcpy(t + hs + l1 + l2, p3, l3);
 	*len = total;
 	*memp = mem;
 	return t;
@@ -312,7 +321,10 @@ ih_assemble(const char *hdr, const char *p1, uint32 l1, const char *p2,
  * Given the current version (*tuple, *len) and the undo record that
  * produced it, rebuild the previous version.  On success *tuple and *len point
  * to a new palloc'd tuple and *h holds its header.  Returns false for
- * records without a previous version (inserts).
+ * records without a previous version (inserts), and for a deletion or move
+ * whose previous version is gone: its record does not carry the body, which
+ * stayed on the page until no snapshot could see it (§21 D40), and the item
+ * is a stub now.
  */
 bool
 iheap_rebuild_prior(Relation rel, char **tuple, uint32 *len, IHeapHdr *h,
@@ -321,7 +333,9 @@ iheap_rebuild_prior(Relation rel, char **tuple, uint32 *len, IHeapHdr *h,
 	const char *prevhdr = rec->hdr.ur_prev_hdr;
 	uint32		core = iheap_undo_payload_core_len(rec);
 	char	   *cur = *tuple;
-	uint32		curbody = *len - IHEAP_TUPHDR_SIZE;
+	uint32		curhs = ih_hdr_size(cur);
+	uint32		curbody = *len > curhs ? *len - curhs : 0;
+	bool		curstub = (ih_hdr_infomask(cur) & IHT_STUB) != 0;
 
 	switch (rec->hdr.ur_type)
 	{
@@ -330,46 +344,59 @@ iheap_rebuild_prior(Relation rel, char **tuple, uint32 *len, IHeapHdr *h,
 			return false;
 
 		case IHU_DELETE:
-			*tuple = ih_assemble(prevhdr, rec->payload, core, NULL, 0, NULL, 0,
-								 len, mem);
-			break;
-
 		case IHU_MOVE:
-			if (core < sizeof(ItemPointerData))
-				elog(ERROR, "iheap: corrupt MOVE undo record " UINT64_FORMAT,
-					 rec->urp);
-			*tuple = ih_assemble(prevhdr,
-								 rec->payload + sizeof(ItemPointerData),
-								 core - sizeof(ItemPointerData),
-								 NULL, 0, NULL, 0, len, mem);
-			break;
+			{
+				uint32		skip = (rec->hdr.ur_type == IHU_MOVE) ?
+					sizeof(ItemPointerData) : 0;
+
+				if (core < skip)
+					elog(ERROR, "iheap: corrupt MOVE undo record " UINT64_FORMAT,
+						 rec->urp);
+				if (core > skip)
+				{
+					/* the body went to undo (a compact header, or before D40) */
+					*tuple = ih_assemble(prevhdr, rec->payload + skip, core - skip,
+										 NULL, 0, NULL, 0, len, mem);
+				}
+				else if (curstub)
+					return false;
+				else
+				{
+					/* the body is on the page, after the deletion's header */
+					*tuple = ih_assemble(prevhdr, cur + curhs, curbody,
+										 NULL, 0, NULL, 0, len, mem);
+				}
+				break;
+			}
 
 		case IHU_UPDATE:
 			{
 				IHeapUpdateDelta d;
 				const char *mid;
+				IHeapHdr	ph;
 
 				if (core < sizeof(IHeapUpdateDelta))
 					elog(ERROR, "iheap: corrupt UPDATE undo record " UINT64_FORMAT,
 						 rec->urp);
 				memcpy(&d, rec->payload, sizeof(d));
 				mid = rec->payload + sizeof(d);
+				ih_hdr_read(prevhdr, &ph);
 				if ((uint32) d.prefix + d.suffix > curbody ||
 					sizeof(d) + d.mid_len > core ||
-					(uint32) d.prefix + d.suffix + d.mid_len + IHEAP_TUPHDR_SIZE != d.old_len)
+					(uint32) d.prefix + d.suffix + d.mid_len + ih_hdr_size_of(&ph) != d.old_len)
 					elog(ERROR, "iheap: UPDATE undo record " UINT64_FORMAT " does not match the tuple",
 						 rec->urp);
 				*tuple = ih_assemble(prevhdr,
-									 cur + IHEAP_TUPHDR_SIZE, d.prefix,
+									 cur + curhs, d.prefix,
 									 mid, d.mid_len,
-									 cur + IHEAP_TUPHDR_SIZE + curbody - d.suffix,
+									 cur + curhs + curbody - d.suffix,
 									 d.suffix, len, mem);
 				break;
 			}
 
 		case IHU_LOCK:
 			/* content unchanged; only the header goes back */
-			*tuple = ih_assemble(prevhdr, cur + IHEAP_TUPHDR_SIZE, curbody,
+			*tuple = ih_assemble(prevhdr, cur + curhs, curbody,
 								 NULL, 0, NULL, 0, len, mem);
 			break;
 
@@ -549,17 +576,8 @@ iheap_resolve_version_ext(Relation rel, Buffer buffer, char *pagetup,
 					if (st == IHX_ABORTED ||
 						(settled_only && st == IHX_IN_PROGRESS))
 						stepback = true;
-					else if (deleted && (h.infomask & IHT_STUB))
-					{
-						/* body reclaimed: take the content from undo */
-						if (rec == NULL)
-							rec = iheap_undo_fetch(rel, h.urec, true);
-						if (rec == NULL)
-							goto invisible;
-						stepback = true;
-					}
 					else
-						visible = true;
+						visible = true; /* a stub's content: see "found" */
 					break;
 				}
 
@@ -668,6 +686,48 @@ iheap_resolve_version_ext(Relation rel, Buffer buffer, char *pagetup,
 	}
 
 found:
+	if (h.infomask & (IHT_DELETED | IHT_MOVED))
+	{
+		/*
+		 * A deleted version (SnapshotAny, SnapshotDirty, SnapshotNonVacuumable):
+		 * h.xid deleted it, as heap's xmax says; the content was made by the
+		 * one before.  A stub's content is in the deletion's undo record, if
+		 * anywhere: a deletion of a compact tuple put it there; otherwise it
+		 * was on the page until every snapshot saw the deletion.
+		 */
+		IHeapUndoRec *rec = iheap_undo_fetch(rel, h.urec, true);
+		TransactionId xmin = FrozenTransactionId;
+
+		if (rec != NULL)
+		{
+			IHeapHdr	ph;
+
+			ih_hdr_read(rec->hdr.ur_prev_hdr, &ph);
+			if (ph.urec >= discard)
+				xmin = ph.xid;
+		}
+		if (h.infomask & IHT_STUB)
+		{
+			char	   *newmem;
+			IHeapHdr	ph;
+
+			if (rec == NULL ||
+				!iheap_rebuild_prior(rel, &cur, &curlen, &ph, rec, &newmem))
+			{
+				if (rec)
+					pfree(rec);
+				goto invisible;
+			}
+			if (curmem)
+				pfree(curmem);
+			curmem = newmem;
+			from_undo = true;
+		}
+		if (rec)
+			pfree(rec);
+		v->xmax = h.xid;
+		h.xid = xmin;
+	}
 	if (rebuilt > 0)
 		iheap_stat_count_walk(rel, rebuilt);
 	v->tuple = cur;
@@ -676,26 +736,6 @@ found:
 	v->from_undo = from_undo;
 	v->xmin = h.xid;
 	v->cmin = cmin;
-	if (h.infomask & (IHT_DELETED | IHT_MOVED))
-	{
-		/*
-		 * A deleted version (SnapshotAny, SnapshotDirty): h.xid deleted it,
-		 * as heap's xmax says; the content was made by the one before.
-		 */
-		IHeapUndoRec *rec = iheap_undo_fetch(rel, h.urec, true);
-
-		v->xmax = h.xid;
-		v->xmin = FrozenTransactionId;
-		if (rec != NULL)
-		{
-			IHeapHdr	ph;
-
-			ih_hdr_read(rec->hdr.ur_prev_hdr, &ph);
-			if (ph.urec >= discard)
-				v->xmin = ph.xid;
-			pfree(rec);
-		}
-	}
 	return true;
 
 invisible:

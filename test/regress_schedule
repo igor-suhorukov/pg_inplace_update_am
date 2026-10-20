@@ -9,3 +9,5 @@ iheap_bloat
 iheap_stats
 iheap_check
 iheap_logical
+iheap_wal
+iheap_compact

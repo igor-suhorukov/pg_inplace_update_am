@@ -147,6 +147,7 @@ tuple_flags_array(uint16 infomask)
 		{IHT_STUB, "STUB"},
 		{IHT_KEYS_UPDATED, "KEYS_UPDATED"},
 		{IHT_MOVED_PART, "MOVED_PART"},
+		{IHT_COMPACT, "COMPACT"},
 	};
 	Datum		elems[lengthof(names)];
 	int			n = 0;
@@ -204,7 +205,7 @@ iheap_page_items(PG_FUNCTION_ARGS)
 		values[2] = Int32GetDatum(ItemIdGetOffset(lp));
 		values[3] = Int32GetDatum(ItemIdGetLength(lp));
 
-		if (ItemIdIsNormal(lp) && ItemIdGetLength(lp) >= IHEAP_TUPHDR_SIZE &&
+		if (ItemIdIsNormal(lp) && ItemIdGetLength(lp) >= IHEAP_COMPACT_HDRSZ &&
 			ItemIdGetOffset(lp) + ItemIdGetLength(lp) <= BLCKSZ)
 		{
 			IHeapHdr	h;
@@ -444,7 +445,7 @@ iheap_discard_undo(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not an iheap relation",
 						RelationGetRelationName(rel))));
-	n = iheap_discard(rel, true);
+	n = iheap_discard_all(rel, false);
 	relation_close(rel, RowExclusiveLock);
 
 	PG_RETURN_INT64(n);

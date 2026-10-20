@@ -3,8 +3,9 @@
  * iheap_tuple.c
  *	  Forming and deforming iheap tuples.
  *
- * Layout (DESIGN.md §21 D2, D11): a 16-byte header, an optional null
- * bitmap, then the data area.  Compared to heap tuples:
+ * Layout (DESIGN.md §21 D2, D11): a 16-byte header (12 bytes for a compact
+ * one, §21 D43), an optional null bitmap, then the data area.  Compared to
+ * heap tuples:
  *
  *	- pass-by-value attributes are stored without alignment padding and are
  *	  read with memcpy;
@@ -353,7 +354,7 @@ ih_deform_into_slot(TupleTableSlot *slot, const char *tuple, uint32 *offp,
 	int			tupnatts = ih_hdr_natts(tuple);
 	uint16		infomask = ih_hdr_infomask(tuple);
 	bool		hasnull = (infomask & IHT_HASNULL) != 0;
-	const uint8 *bits = (const uint8 *) (tuple + IHEAP_TUPHDR_SIZE);
+	const uint8 *bits = (const uint8 *) (tuple + ih_hdr_size(tuple));
 	const char *tp = tuple + ih_hdr_hoff(tuple);
 	int			attnum = slot->tts_nvalid;
 	uint32		off = *offp;
@@ -417,7 +418,7 @@ ih_deform_tuple(TupleDesc desc, const char *tuple, Datum *values, bool *isnull)
 	int			tupnatts = ih_hdr_natts(tuple);
 	uint16		infomask = ih_hdr_infomask(tuple);
 	bool		hasnull = (infomask & IHT_HASNULL) != 0;
-	const uint8 *bits = (const uint8 *) (tuple + IHEAP_TUPHDR_SIZE);
+	const uint8 *bits = (const uint8 *) (tuple + ih_hdr_size(tuple));
 	const char *tp = tuple + ih_hdr_hoff(tuple);
 	uint32		off = 0;
 	int			natts = desc->natts;
@@ -489,4 +490,42 @@ ih_tuple_len_on_page(Page page, OffsetNumber off)
 	ItemId		lp = PageGetItemId(page, off);
 
 	return ItemIdGetLength(lp);
+}
+
+/*
+ * Can the version "tuple" (len bytes, frozen) take a compact header
+ * (§21 D43)?  Not with a value that needs alignment: the data area would
+ * start at another place relative to the tuple, and a later version with a
+ * full header could not go where this one is.  And only when the body
+ * leaves room for the 16-byte header of a deletion, which then takes the
+ * tuple's storage.
+ */
+bool
+ih_tuple_can_compact(const char *tuple, uint32 len)
+{
+	return (ih_hdr_infomask(tuple) & (IHT_ALIGNDATA | IHT_COMPACT)) == 0 &&
+		len >= 2 * IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
+}
+
+/*
+ * Give the frozen version "tuple" (len bytes, full header) a compact
+ * header, in place: the null bitmap and the data move down.  Returns the
+ * new length.
+ */
+uint32
+ih_tuple_compact(char *tuple, uint32 len)
+{
+	IHeapHdr	h;
+	uint32		shrink = IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
+
+	Assert(ih_tuple_can_compact(tuple, len));
+	ih_hdr_read(tuple, &h);
+	memmove(tuple + IHEAP_COMPACT_HDRSZ, tuple + IHEAP_TUPHDR_SIZE,
+			len - IHEAP_TUPHDR_SIZE);
+	h.infomask = (h.infomask & ~IHT_XID_HINTS) | IHT_COMPACT;
+	h.hoff -= shrink;
+	h.xid = FrozenTransactionId;
+	h.urec = InvalidUndoRecPtr;
+	ih_hdr_write(tuple, &h);
+	return len - shrink;
 }

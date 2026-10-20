@@ -3,13 +3,18 @@
  * iheap_prune.c
  *	  Data page space management: item placement, compaction, pruning.
  *
- * Space rules (DESIGN.md §21 D6):
- *	- Storage freed by a DELETE, a non-in-place UPDATE or a shrinking
- *	  in-place UPDATE stays reserved until the writer commits, because
- *	  rollback restores it in place.
- *	- After the deleter commits, a deleted row shrinks to a 16-byte stub;
- *	  old snapshots read its image from undo.  Once the stub is frozen it
+ * Space rules (DESIGN.md §21 D6, D40):
+ *	- Storage freed by a shrinking in-place UPDATE stays reserved until the
+ *	  writer commits, because rollback restores the old version in place.
+ *	- A deleted or moved row keeps its body on the page until every
+ *	  snapshot sees the deletion, as heap's does: old snapshots read it there.
+ *	  Then it shrinks to a 16-byte stub, and the prune record carries the
+ *	  deleter as conflict horizon for standbys.  (A deletion of a row with a
+ *	  compact header stubs it at once, its body in undo; its storage stays
+ *	  reserved until the deletion commits.)  Once the stub is frozen it
  *	  becomes LP_DEAD (no storage) until index vacuum frees the line pointer.
+ *	  Until the horizon passes, pd_prune_xid holds what a prune waits for,
+ *	  and writers looking for room do not prune before (as heap).
  *	- Compaction needs only an exclusive content lock: readers never touch
  *	  page memory without holding the content lock (§21 D11).
  *
@@ -19,11 +24,13 @@
  */
 #include "postgres.h"
 
+#include "access/transam.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #include "iheap.h"
 #include "iheap_xlog.h"
@@ -217,8 +224,10 @@ iheap_page_place_item_ext(Page page, OffsetNumber off, const char *tuple,
 
 /*
  * Reservation needed by one item: the largest old length among the
- * uncommitted in-place updates in its chain (0 if none).  Rollback of those
- * updates restores the old, longer tuple at the item's location.
+ * uncommitted in-place updates in its chain, and the length of a version
+ * an uncommitted deletion or move put in undo (one with a compact header,
+ * whose item became a stub at once), 0 if none.  Rollback of those changes
+ * restores the old, longer tuple at the item's location.
  */
 uint32
 iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
@@ -267,6 +276,15 @@ iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
 
 			memcpy(&d, rec->payload, sizeof(d));
 			reserve = Max(reserve, d.old_len);
+		}
+		else if (rec->hdr.ur_type == IHU_DELETE || rec->hdr.ur_type == IHU_MOVE)
+		{
+			uint32		skip = (rec->hdr.ur_type == IHU_MOVE) ?
+				sizeof(ItemPointerData) : 0;
+			uint32		core = iheap_undo_payload_core_len(rec);
+
+			if (core > skip)
+				reserve = Max(reserve, ih_hdr_size_of(&ph) + core - skip);
 		}
 		if (rec->hdr.ur_type == IHU_INSERT ||
 			rec->hdr.ur_type == IHU_MULTI_INSERT)
@@ -376,28 +394,80 @@ iheap_page_compact(Relation rel, Page page, const uint32 *reserve)
 }
 
 /*
- * Prune a data page held with an exclusive lock: roll back aborted changes,
- * shrink committed deletions to stubs, turn frozen deletions into LP_DEAD,
- * and compact.  Returns true if anything changed.  Offsets of items that
- * became LP_DEAD are appended to deadoffs (if not NULL).
+ * Do the tuples of a page fit after compaction?  Items that become LP_DEAD
+ * (gone) lose their storage, stubs keep a header, every item takes the
+ * larger of its length and its reservation: the placement of
+ * iheap_page_compact(), done on paper.
  */
-bool
-iheap_page_prune(Relation rel, Buffer buffer, bool force,
-				 OffsetNumber *deadoffs, int *ndead_out)
+static bool
+compaction_fits(Page page, const bool *gone, const bool *stubbed,
+				const uint32 *reserve)
+{
+	PageHeader	ph = (PageHeader) page;
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	CompactItem items[MaxOffsetNumber];
+	int			nitems = 0;
+	int			upper = ph->pd_special;
+
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId		lp = PageGetItemId(page, off);
+
+		if (!ItemIdHasStorage(lp) || gone[off])
+			continue;
+		items[nitems].off = off;
+		items[nitems].lp_off = ItemIdGetOffset(lp);
+		items[nitems].len = stubbed[off] ? IHEAP_TUPHDR_SIZE : ItemIdGetLength(lp);
+		items[nitems].need = Max(items[nitems].len, reserve[off]);
+		nitems++;
+	}
+	qsort(items, nitems, sizeof(CompactItem), compact_item_cmp);
+	for (int i = 0; i < nitems; i++)
+	{
+		int			start = ih_place_start(upper - (items[i].need - items[i].len),
+										   (char *) page + items[i].lp_off,
+										   items[i].len);
+
+		if (start < ph->pd_lower)
+			return false;
+		upper = start;
+	}
+	return true;
+}
+
+/*
+ * Prune a data page held with an exclusive lock: roll back aborted changes,
+ * shrink deletions every snapshot sees to stubs, turn frozen deletions into
+ * LP_DEAD, and compact.  With grow_off, the item there gets storage for
+ * grow_len bytes where it is, if the page has the room (*grown).  Returns
+ * true if anything changed.  Offsets of items that became LP_DEAD are
+ * appended to deadoffs (if not NULL).
+ */
+static bool
+prune_page(Relation rel, Buffer buffer, bool force, OffsetNumber *deadoffs,
+		   int *ndead_out, OffsetNumber grow_off, uint32 grow_len, bool *grown)
 {
 	Page		page = BufferGetPage(buffer);
 	OffsetNumber maxoff;
 	OffsetNumber dead[MaxOffsetNumber];
 	OffsetNumber stub[MaxOffsetNumber];
 	uint32		reserve[MaxOffsetNumber + 1];
+	bool		gone[MaxOffsetNumber + 1];
+	bool		stubbed[MaxOffsetNumber + 1];
 	int			ndead = 0;
 	int			nstub = 0;
 	int			nreserve = 0;
 	bool		pending = false;
+	bool		stubs_wait = false;
 	UndoRecPtr	discard;
+	GlobalVisState *vistest;
+	TransactionId conflict = InvalidTransactionId;
+	TransactionId wait_xid = InvalidTransactionId;
 
 	if (ndead_out)
 		*ndead_out = 0;
+	if (grown)
+		*grown = false;
 
 	if (!IHeapPageIsData(page))
 		return false;
@@ -407,31 +477,63 @@ iheap_page_prune(Relation rel, Buffer buffer, bool force,
 	iheap_stat_rollback_report(RelationGetRelid(rel), IHEAP_ROLLBACK_LAZY);
 
 	discard = iheap_discard_ptr(rel);
+	vistest = GlobalVisTestFor(rel);
 	maxoff = PageGetMaxOffsetNumber(page);
 	memset(reserve, 0, sizeof(uint32) * (maxoff + 1));
+	memset(gone, 0, sizeof(bool) * (maxoff + 1));
+	memset(stubbed, 0, sizeof(bool) * (maxoff + 1));
 
 	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
 	{
 		ItemId		lp = PageGetItemId(page, off);
+		char	   *tup;
 		IHeapHdr	h;
 
 		if (!ItemIdIsNormal(lp))
 			continue;
-		ih_hdr_read((char *) page + ItemIdGetOffset(lp), &h);
+		tup = (char *) page + ItemIdGetOffset(lp);
+		ih_hdr_read(tup, &h);
 
 		if (h.infomask & (IHT_DELETED | IHT_MOVED))
 		{
+			IHeapXidStatus st;
+
 			if (h.urec < discard)
-				dead[ndead++] = off;
-			else if (iheap_xid_status(h.xid, buffer,
-									  (char *) page + ItemIdGetOffset(lp)) == IHX_COMMITTED)
 			{
-				if ((h.infomask & IHT_STUB) == 0)
-					stub[nstub++] = off;
-				pending = true;
+				dead[ndead++] = off;
+				gone[off] = true;
+				continue;
 			}
-			else
-				pending = true;
+			st = iheap_xid_status(h.xid, buffer, tup);
+			if (st == IHX_COMMITTED &&
+				GlobalVisTestIsRemovableXid(vistest, h.xid, true))
+			{
+				/* no snapshot sees the row before its deletion: a stub */
+				if ((h.infomask & IHT_STUB) == 0)
+				{
+					stub[nstub++] = off;
+					stubbed[off] = true;
+					if (!TransactionIdIsValid(conflict) ||
+						TransactionIdFollows(h.xid, conflict))
+						conflict = h.xid;
+				}
+				stubs_wait = true;
+			}
+			else if (h.infomask & IHT_STUB)
+			{
+				/* a compact row's deletion, its body in undo: keep its room */
+				reserve[off] = iheap_item_reservation(rel, page, off);
+				if (reserve[off] > 0)
+					nreserve++;
+				stubs_wait = true;
+			}
+			else if (!TransactionIdIsValid(wait_xid) ||
+					 TransactionIdPrecedes(h.xid, wait_xid))
+			{
+				/* the body stays until the horizon passes its deleter */
+				wait_xid = h.xid;
+			}
+			pending = true;
 		}
 		else if (h.urec >= discard)
 		{
@@ -444,10 +546,40 @@ iheap_page_prune(Relation rel, Buffer buffer, bool force,
 		}
 	}
 
+	if (OffsetNumberIsValid(grow_off) && grow_off <= maxoff &&
+		!gone[grow_off] && !stubbed[grow_off] &&
+		ItemIdIsNormal(PageGetItemId(page, grow_off)))
+	{
+		uint32		was = reserve[grow_off];
+
+		reserve[grow_off] = Max(was, grow_len);
+		if (compaction_fits(page, gone, stubbed, reserve))
+		{
+			if (was == 0)
+				nreserve++;
+			force = true;
+			if (grown)
+				*grown = true;
+		}
+		else
+			reserve[grow_off] = was;
+	}
+
+	/*
+	 * What the next prune waits for (iheap_page_prune_opt()): the oldest
+	 * deleter whose row's body has to stay; failing that, if stubs wait for
+	 * discard to pass their records, the next xid (once every transaction
+	 * there is now has gone, discard can have passed them).  A hint, as
+	 * heap's pd_prune_xid: set without WAL, masked by consistency checks.
+	 */
+	if (!TransactionIdIsValid(wait_xid) && stubs_wait)
+		wait_xid = ReadNextTransactionId();
+
 	if (ndead == 0 && nstub == 0 && !force)
 	{
 		if (!pending)
 			IHeapPageGetOpaque(page)->ihp_flags &= ~IHP_PRUNABLE;
+		((PageHeader) page)->pd_prune_xid = wait_xid;
 		return false;
 	}
 
@@ -466,6 +598,7 @@ iheap_page_prune(Relation rel, Buffer buffer, bool force,
 	iheap_page_compact(rel, page, reserve);
 	if (!pending)
 		IHeapPageGetOpaque(page)->ihp_flags &= ~IHP_PRUNABLE;
+	((PageHeader) page)->pd_prune_xid = wait_xid;
 	MarkBufferDirty(buffer);
 
 	if (RelationNeedsWAL(rel))
@@ -493,10 +626,13 @@ iheap_page_prune(Relation rel, Buffer buffer, bool force,
 		xlrec.ndead = ndead;
 		xlrec.nstub = nstub;
 		xlrec.nreserve = nres;
-		xlrec.flags = pending ? 0 : 1;
+		xlrec.flags = (pending ? 0 : XLIH_PRUNE_DONE) |
+			(TransactionIdIsValid(conflict) ? XLIH_PRUNE_CONFLICT : 0);
 
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfIHeapPrune);
+		if (TransactionIdIsValid(conflict))
+			XLogRegisterData(&conflict, sizeof(TransactionId));
 		XLogRegisterBuffer(IH_BLK_DATA, buffer, REGBUF_STANDARD);
 		if (ndead > 0)
 			XLogRegisterBufData(IH_BLK_DATA, dead, ndead * sizeof(OffsetNumber));
@@ -516,4 +652,52 @@ iheap_page_prune(Relation rel, Buffer buffer, bool force,
 		*ndead_out = ndead;
 
 	return true;
+}
+
+bool
+iheap_page_prune(Relation rel, Buffer buffer, bool force,
+				 OffsetNumber *deadoffs, int *ndead_out)
+{
+	return prune_page(rel, buffer, force, deadoffs, ndead_out,
+					  InvalidOffsetNumber, 0, NULL);
+}
+
+/*
+ * Prune for a writer that wants room on the page, unless the horizon has
+ * not passed what the last prune waited for (pd_prune_xid): pruning would
+ * free nothing, and while a long snapshot holds the horizon every write to
+ * a full page would walk its items again (§21 D40).  As with heap's hint,
+ * the changes of a writer that aborted wait too (writers roll back what
+ * they touch, readers pass over it, VACUUM prunes regardless), and a value
+ * that is not a recent xid, left long ago, is not trusted.
+ */
+bool
+iheap_page_prune_opt(Relation rel, Buffer buffer)
+{
+	Page		page = BufferGetPage(buffer);
+	TransactionId hint = ((PageHeader) page)->pd_prune_xid;
+
+	if (!(IHeapPageGetOpaque(page)->ihp_flags & IHP_PRUNABLE))
+		return false;
+	if (TransactionIdIsNormal(hint) &&
+		TransactionIdPrecedes(hint, ReadNextTransactionId()) &&
+		!GlobalVisTestIsRemovableXid(GlobalVisTestFor(rel), hint, true))
+		return false;
+	return prune_page(rel, buffer, false, NULL, NULL,
+					  InvalidOffsetNumber, 0, NULL);
+}
+
+/*
+ * Prune the page and give the item at "off" storage for "len" bytes where
+ * it is, if the page has the room: a version that grows in an in-place
+ * update and finds no free space for its new length elsewhere on the page
+ * (§21 D43).  Returns whether it did.
+ */
+bool
+iheap_page_prune_grow(Relation rel, Buffer buffer, OffsetNumber off, uint32 len)
+{
+	bool		grown;
+
+	(void) prune_page(rel, buffer, true, NULL, NULL, off, len, &grown);
+	return grown;
 }

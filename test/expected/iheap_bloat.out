@@ -125,6 +125,40 @@ SELECT sum(counter) FROM ib;
  8000
 (1 row)
 
+-- one VACUUM discards all the undo the horizon allows, however much: a
+-- writer passes at most 1024 undo pages at a time, VACUUM and
+-- iheap_discard() go on (§21 D9)
+CREATE TABLE iu (id int, pad text) USING iheap WITH (autovacuum_enabled = off);
+INSERT INTO iu SELECT g, repeat('u', 200) FROM generate_series(1, 50000) g;
+VACUUM iu;
+UPDATE iu SET pad = repeat('v', 200);
+SELECT live_undo_pages > 1024 AS iu_much_undo FROM iheap_metapage_info('iu');
+ iu_much_undo 
+--------------
+ t
+(1 row)
+
+VACUUM iu;
+SELECT live_undo_pages AS iu_undo_left FROM iheap_metapage_info('iu');
+ iu_undo_left 
+--------------
+            0
+(1 row)
+
+UPDATE iu SET pad = repeat('w', 200);
+SELECT iheap_discard('iu') > 1024 AS iu_discarded_all;
+ iu_discarded_all 
+------------------
+ t
+(1 row)
+
+SELECT live_undo_pages AS iu_undo_left FROM iheap_metapage_info('iu');
+ iu_undo_left 
+--------------
+            0
+(1 row)
+
+DROP TABLE iu;
 -- ------------------------------------------------------------------------
 -- C. Rows that grow and shrink keep their TIDs while the page has room.
 -- ------------------------------------------------------------------------

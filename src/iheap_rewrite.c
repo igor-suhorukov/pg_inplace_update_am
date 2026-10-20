@@ -14,6 +14,13 @@
  * deleted rows (with their content in undo); rows whose deletion every
  * snapshot sees are dropped.
  *
+ * The new relation is built in memory a page at a time and written with
+ * the bulk writer (bulk_write.h), as heap's rewrite is (§21 D41): no shared
+ * buffers, no per-row WAL records, the pages WAL-logged whole.  Its undo
+ * pages, in extents placed among the data pages, and its metapage, last,
+ * go the same way.  A row whose only version every snapshot sees may get a
+ * compact header (§21 D43).
+ *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
  *-------------------------------------------------------------------------
@@ -25,18 +32,17 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
-#include "access/xloginsert.h"
 #include "commands/progress.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/bulk_write.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 #include "iheap.h"
-#include "iheap_xlog.h"
 
 typedef struct ChainVersion
 {
@@ -214,45 +220,210 @@ retoast_version(Relation OldHeap, Relation NewHeap, const char *tuple,
 	return res;
 }
 
-/* write one undo record of the new relation by itself (older versions) */
-static UndoRecPtr
-write_undo_only(Relation rel, IHeapUndoRecHeader *uh, const char *payload,
-				uint32 payload_len)
+/*
+ * The new relation as it is written: the data page and the undo page being
+ * filled, in memory, and where the next pages go.
+ */
+typedef struct RewriteWriter
 {
-	IHeapUndoReservation res;
-	UndoRecPtr	urp;
+	Relation	rel;
+	BulkWriteState *bulk;
+	BlockNumber nextblk;		/* the next block to hand out */
+	Size		save_free;		/* fillfactor's free space per data page */
+	int			quota;			/* compact headers a page may have, -1: any */
 
-	memset(&res, 0, sizeof(res));
-	iheap_undo_reserve(rel, IHEAP_UNDOREC_HDRSZ + payload_len, &res);
+	BulkWriteBuffer dpage;		/* data page being filled, or NULL */
+	BlockNumber dblk;
+	int			dcompact;		/* compact headers on it */
 
-	START_CRIT_SECTION();
-	urp = iheap_undo_write(rel, &res, uh, payload, payload_len);
-	if (RelationNeedsWAL(rel))
+	BulkWriteBuffer upage;		/* undo page being filled, or NULL */
+	BlockNumber ublk;
+	uint64		next_lpage;		/* next logical undo page */
+	IHeapExtent *extents;		/* undo extents so far */
+	int			nextents;
+} RewriteWriter;
+
+static void
+rw_begin(RewriteWriter *w, Relation rel)
+{
+	memset(w, 0, sizeof(*w));
+	w->rel = rel;
+	w->bulk = smgr_bulk_start_rel(rel, MAIN_FORKNUM);
+	w->nextblk = IHEAP_METAPAGE_BLKNO + 1;
+	w->save_free = RelationGetTargetPageFreeSpace(rel, HEAP_DEFAULT_FILLFACTOR);
+	w->quota = iheap_compact_quota(rel);
+	w->next_lpage = 1;
+	w->extents = palloc(IHEAP_MAX_EXTENTS * sizeof(IHeapExtent));
+}
+
+static void
+rw_flush_data(RewriteWriter *w)
+{
+	if (w->dpage == NULL)
+		return;
+	smgr_bulk_write(w->bulk, w->dblk, w->dpage, true);
+	w->dpage = NULL;
+}
+
+static void
+rw_flush_undo(RewriteWriter *w)
+{
+	if (w->upage == NULL)
+		return;
+	smgr_bulk_write(w->bulk, w->ublk, w->upage, true);
+	w->upage = NULL;
+}
+
+/*
+ * The data page for a row of len bytes, flushing the current one when the
+ * row does not fit it with the free space fillfactor keeps; a new page takes
+ * any row.  With compactable (a row whose only version is frozen), the row
+ * gets a compact header if the page's quota allows: *compact.
+ */
+static Page
+rw_data_page(RewriteWriter *w, uint32 len, bool compactable, bool *compact)
+{
+	uint32		shrink = IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
+
+	for (;;)
 	{
-		XLogRecPtr	recptr;
+		Page		page;
+		bool		empty;
+		Size		need;
 
-		XLogBeginInsert();
-		iheap_undo_register_wal(&res, IH_BLK_UNDO, InvalidBlockNumber);
-		recptr = XLogInsert(RM_IHEAP_ID, XLOG_IHEAP_UNDO);
-		iheap_undo_set_lsn(&res, recptr);
+		if (w->dpage == NULL)
+		{
+			w->dpage = smgr_bulk_get_buf(w->bulk);
+			iheap_init_data_page((Page) w->dpage);
+			w->dblk = w->nextblk++;
+			w->dcompact = 0;
+		}
+		page = (Page) w->dpage;
+		*compact = compactable && (w->quota < 0 || w->dcompact < w->quota);
+		need = (*compact ? len - shrink : len) + sizeof(ItemIdData) + MAXIMUM_ALIGNOF;
+		empty = PageGetMaxOffsetNumber(page) == 0;
+		if (iheap_page_free_space(page) >= need + (empty ? 0 : w->save_free))
+		{
+			if (*compact)
+				w->dcompact++;
+			return page;
+		}
+		if (empty)
+			elog(ERROR, "iheap: row of %u bytes does not fit an empty page", len);
+		rw_flush_data(w);
 	}
-	END_CRIT_SECTION();
+}
 
-	iheap_undo_release(&res);
-	return urp;
+/* a new undo page, in the current extent or a new one after the last block */
+static void
+rw_new_undo_page(RewriteWriter *w)
+{
+	IHeapExtent *e = w->nextents > 0 ? &w->extents[w->nextents - 1] : NULL;
+	uint64		lpage = w->next_lpage++;
+
+	rw_flush_undo(w);
+	if (e == NULL || lpage >= e->ie_lstart + e->ie_npages)
+	{
+		/* sized as the undo so far, like iheap_meta_next_extent_size() */
+		uint32		npages = IHEAP_EXTENT_MIN_PAGES;
+
+		while (npages < lpage - 1 && npages < IHEAP_EXTENT_MAX_PAGES)
+			npages *= 2;
+		if (w->nextents >= IHEAP_MAX_EXTENTS)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("too many undo extents in relation \"%s\"",
+							RelationGetRelationName(w->rel))));
+		e = &w->extents[w->nextents++];
+		e->ie_lstart = lpage;
+		e->ie_pstart = w->nextblk;
+		e->ie_npages = npages;
+		w->nextblk += npages;
+	}
+	w->upage = smgr_bulk_get_buf(w->bulk);
+	iheap_undo_init_page((Page) w->upage, lpage);
+	w->ublk = e->ie_pstart + (BlockNumber) (lpage - e->ie_lstart);
+}
+
+/* write an undo record of the new relation; returns where it went */
+static UndoRecPtr
+rw_undo_write(RewriteWriter *w, IHeapUndoRecHeader *uh, const char *payload,
+			  uint32 payload_len)
+{
+	Page		page = (Page) w->upage;
+	uint32		off;
+
+	if (page == NULL ||
+		((PageHeader) page)->pd_upper - ((PageHeader) page)->pd_lower <
+		IHEAP_UNDOREC_HDRSZ + payload_len)
+	{
+		rw_new_undo_page(w);
+		page = (Page) w->upage;
+	}
+	off = ((PageHeader) page)->pd_lower;
+	(void) iheap_undo_put_record(page, off, uh, payload, payload_len);
+	return MakeUndoRecPtr(IHeapUndoPageGetHeader(page)->uph_lpage, off);
+}
+
+/*
+ * The last pages: the open data and undo pages, empty undo pages for the
+ * rest of the last extent where it lies beyond everything else (its blocks
+ * must exist), and the metapage describing the undo extents.
+ */
+static void
+rw_finish(RewriteWriter *w)
+{
+	BulkWriteBuffer metabuf;
+	IHeapMetaPageData *meta;
+	uint64		live = 0;
+
+	rw_flush_data(w);
+	rw_flush_undo(w);
+	if (w->nextents > 0)
+	{
+		IHeapExtent *e = &w->extents[w->nextents - 1];
+
+		if (e->ie_pstart + e->ie_npages == w->nextblk)
+		{
+			for (uint64 lp = w->next_lpage; lp < e->ie_lstart + e->ie_npages; lp++)
+			{
+				BulkWriteBuffer b = smgr_bulk_get_buf(w->bulk);
+
+				iheap_undo_init_page((Page) b, lp);
+				smgr_bulk_write(w->bulk,
+								e->ie_pstart + (BlockNumber) (lp - e->ie_lstart),
+								b, true);
+			}
+		}
+	}
+
+	metabuf = smgr_bulk_get_buf(w->bulk);
+	iheap_init_metapage((Page) metabuf);
+	meta = IHeapPageGetMeta((Page) metabuf);
+	meta->im_next_lpage = w->next_lpage;
+	meta->im_nextents = w->nextents;
+	memcpy(meta->im_extents, w->extents, w->nextents * sizeof(IHeapExtent));
+	for (int i = 0; i < w->nextents; i++)
+		live += w->extents[i].ie_npages;
+	meta->im_undo_peak = (uint32) Min(live, PG_UINT32_MAX);
+	iheap_meta_set_lower((Page) metabuf);
+	smgr_bulk_write(w->bulk, IHEAP_METAPAGE_BLKNO, metabuf, true);
+
+	smgr_bulk_finish(w->bulk);
+	pfree(w->extents);
+	iheap_relcache_invalidate(w->rel);
 }
 
 /*
  * Write one row into the new relation.  chain[0] is the newest version,
  * chain[n-1] the oldest one kept.  A deletion entry takes its content from
  * the next older entry.  Undo records are written oldest first, so that
- * each can name the next older one in its prev header; the older ones go
- * in WAL records of their own, the newest one with the tuple.
+ * each can name the next older one in its prev header.
  */
 static void
-write_row(Relation OldHeap, Relation NewHeap, Chain *chain,
-		  BulkInsertStateData *bistate)
+write_row(RewriteWriter *w, Relation OldHeap, Chain *chain)
 {
+	Relation	NewHeap = w->rel;
 	ChainVersion *v = chain->v;
 	int			n = chain->n;
 	char	  **content = palloc(n * sizeof(char *));
@@ -260,14 +431,10 @@ write_row(Relation OldHeap, Relation NewHeap, Chain *chain,
 	IHeapHdr   *hdrs = palloc(n * sizeof(IHeapHdr));
 	char	  **payload = palloc(n * sizeof(char *));
 	uint32	   *payload_len = palloc(n * sizeof(uint32));
-	Buffer		buffer;
 	Page		page;
-	bool		page_init;
-	IHeapUndoReservation res;
-	bool		top_undo;
+	bool		compact;
 	OffsetNumber offnum;
 	BlockNumber blkno;
-	char	   *top;
 
 	Assert(n > 0 && !v[n - 1].deleted);
 
@@ -312,22 +479,23 @@ write_row(Relation OldHeap, Relation NewHeap, Chain *chain,
 		}
 	}
 
-	buffer = iheap_get_buffer_for_tuple(NewHeap, clen[0], bistate, InvalidBuffer,
-										&page_init);
-	page = BufferGetPage(buffer);
-	blkno = BufferGetBlockNumber(buffer);
+	/* a row whose only version everybody sees may be compact (§21 D43) */
+	page = rw_data_page(w, clen[0],
+						n == 1 && !TransactionIdIsNormal(v[0].creator) &&
+						w->quota != 0 && ih_tuple_can_compact(content[0], clen[0]),
+						&compact);
+	if (compact)
+		clen[0] = ih_tuple_compact(content[0], clen[0]);
+	blkno = w->dblk;
 	offnum = iheap_page_choose_offnum(page);
 
-	/*
-	 * Headers of all versions, oldest first.  Records of the older versions
-	 * are written now; the newest version's record goes with the tuple.
-	 */
+	/* headers of all versions and their undo records, oldest first */
 	for (int i = n - 1; i >= 0; i--)
 	{
 		IHeapHdr	hk;
 
 		ih_hdr_read(content[i], &hk);
-		hk.infomask &= IHT_DATA_FLAGS;
+		hk.infomask &= IHT_DATA_FLAGS | IHT_COMPACT;
 
 		if (!TransactionIdIsNormal(v[i].creator))
 		{
@@ -338,98 +506,35 @@ write_row(Relation OldHeap, Relation NewHeap, Chain *chain,
 		}
 		else
 		{
+			IHeapUndoRecHeader uh;
+
 			hk.xid = v[i].creator;
-			hk.urec = InvalidUndoRecPtr;	/* set below */
 			if (v[i].deleted)
 				hk.infomask |= IHT_DELETED | IHT_KEYS_UPDATED;
 			else if (i < n - 1)
 				hk.infomask |= IHT_INPLACE;
 
-			if (i > 0)
+			memset(&uh, 0, sizeof(uh));
+			uh.ur_xid = v[i].creator;
+			uh.ur_cid = FirstCommandId;
+			uh.ur_blkno = blkno;
+			uh.ur_offnum = offnum;
+			uh.ur_xact_prev = InvalidUndoRecPtr;
+			if (i == n - 1)
+				uh.ur_type = IHU_INSERT;
+			else
 			{
-				IHeapUndoRecHeader uh;
-
-				memset(&uh, 0, sizeof(uh));
-				uh.ur_xid = v[i].creator;
-				uh.ur_cid = FirstCommandId;
-				uh.ur_blkno = blkno;
-				uh.ur_offnum = offnum;
-				uh.ur_xact_prev = InvalidUndoRecPtr;
-				if (i == n - 1)
-					uh.ur_type = IHU_INSERT;
-				else
-				{
-					uh.ur_type = v[i].deleted ? IHU_DELETE : IHU_UPDATE;
-					ih_hdr_write(uh.ur_prev_hdr, &hdrs[i + 1]);
-				}
-				hk.urec = write_undo_only(NewHeap, &uh, payload[i],
-										  payload_len[i]);
+				uh.ur_type = v[i].deleted ? IHU_DELETE : IHU_UPDATE;
+				ih_hdr_write_image(uh.ur_prev_hdr, &hdrs[i + 1]);
 			}
+			hk.urec = rw_undo_write(w, &uh, payload[i], payload_len[i]);
 		}
 		hdrs[i] = hk;
 	}
 
-	top_undo = TransactionIdIsNormal(v[0].creator);
-	memset(&res, 0, sizeof(res));
-	res.buffer = InvalidBuffer;
-	if (top_undo)
-		iheap_undo_reserve(NewHeap, IHEAP_UNDOREC_HDRSZ + payload_len[0], &res);
-
-	START_CRIT_SECTION();
-
-	if (top_undo)
-	{
-		IHeapUndoRecHeader uh;
-
-		memset(&uh, 0, sizeof(uh));
-		uh.ur_xid = v[0].creator;
-		uh.ur_cid = FirstCommandId;
-		uh.ur_blkno = blkno;
-		uh.ur_offnum = offnum;
-		uh.ur_xact_prev = InvalidUndoRecPtr;
-		if (n == 1)
-			uh.ur_type = IHU_INSERT;
-		else
-		{
-			uh.ur_type = v[0].deleted ? IHU_DELETE : IHU_UPDATE;
-			ih_hdr_write(uh.ur_prev_hdr, &hdrs[1]);
-		}
-		hdrs[0].urec = iheap_undo_write(NewHeap, &res, &uh, payload[0],
-										payload_len[0]);
-	}
-
-	top = content[0];
-	ih_hdr_write(top, &hdrs[0]);
-	if (iheap_page_add_item(page, top, clen[0], offnum) != offnum)
-		elog(PANIC, "iheap: rewrite failed to add tuple");
-	MarkBufferDirty(buffer);
-
-	if (RelationNeedsWAL(NewHeap))
-	{
-		xl_iheap_insert xlrec;
-		XLogRecPtr	recptr;
-
-		xlrec.offnum = offnum;
-		xlrec.flags = page_init ? XLIH_INIT_PAGE : 0;
-		XLogBeginInsert();
-		XLogRegisterData(&xlrec, SizeOfIHeapInsert);
-		XLogRegisterBuffer(IH_BLK_DATA, buffer,
-						   REGBUF_STANDARD | (page_init ? REGBUF_WILL_INIT : 0));
-		XLogRegisterBufData(IH_BLK_DATA, top, clen[0]);
-		if (top_undo)
-			iheap_undo_register_wal(&res, IH_BLK_UNDO,
-									BufferGetBlockNumber(buffer));
-		recptr = XLogInsert(RM_IHEAP_ID, XLOG_IHEAP_INSERT);
-		PageSetLSN(page, recptr);
-		if (top_undo)
-			iheap_undo_set_lsn(&res, recptr);
-	}
-
-	END_CRIT_SECTION();
-
-	if (top_undo)
-		iheap_undo_release(&res);
-	UnlockReleaseBuffer(buffer);
+	ih_hdr_write(content[0], &hdrs[0]);
+	if (iheap_page_add_item(page, content[0], clen[0], offnum) != offnum)
+		elog(ERROR, "iheap: rewrite failed to add tuple");
 }
 
 /* state of one table rewrite */
@@ -437,6 +542,7 @@ typedef struct RewriteState
 {
 	Relation	OldTable;
 	Relation	NewTable;
+	RewriteWriter writer;
 	TransactionId OldestXmin;
 	MemoryContext rowcxt;
 	TransactionId minxid;
@@ -502,7 +608,7 @@ rewrite_item(RewriteState *rs, Buffer buf, OffsetNumber off)
 
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 	oldcxt = MemoryContextSwitchTo(rs->rowcxt);
-	write_row(rs->OldTable, rs->NewTable, &chain, NULL);
+	write_row(&rs->writer, rs->OldTable, &chain);
 	MemoryContextSwitchTo(oldcxt);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 
@@ -549,6 +655,7 @@ iheap_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 	rs.visited = MemoryContextAllocExtended(CurrentMemoryContext,
 											Max((Size) nblocks * VISITED_BYTES, 1),
 											MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+	rw_begin(&rs.writer, NewTable);
 
 	pgstat_progress_update_param(PROGRESS_REPACK_TOTAL_HEAP_BLKS, nblocks);
 
@@ -614,6 +721,8 @@ iheap_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 		UnlockReleaseBuffer(buf);
 		pgstat_progress_update_param(PROGRESS_REPACK_HEAP_BLKS_SCANNED, blk + 1);
 	}
+
+	rw_finish(&rs.writer);
 
 	/* every normal xid stored in the new relation is at least minxid */
 	if (TransactionIdIsValid(rs.minxid) && TransactionIdPrecedes(rs.minxid, *xid_cutoff))

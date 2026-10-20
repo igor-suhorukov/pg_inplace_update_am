@@ -299,7 +299,7 @@ iheap_get_buffer_for_tuple(Relation rel, Size len,
 			if (freespace < want_space &&
 				(IHeapPageGetOpaque(page)->ihp_flags & IHP_PRUNABLE))
 			{
-				(void) iheap_page_prune(rel, buffer, false, NULL, NULL);
+				(void) iheap_page_prune_opt(rel, buffer);
 				freespace = iheap_page_free_space(page);
 			}
 			if (freespace >= want_space)
@@ -333,6 +333,58 @@ iheap_get_buffer_for_tuple(Relation rel, Size len,
 	*page_init = true;
 	RelationSetTargetBlock(rel, BufferGetBlockNumber(buffer));
 	return buffer;
+}
+
+/*
+ * How many rows written frozen may have a compact header on one page
+ * (§21 D43), -1 for any number.  A later in-place update gives such a row a
+ * full header again, 4 bytes more: "auto" lets as many be compact as the
+ * space the table's fillfactor keeps free on a page covers.
+ */
+int
+iheap_compact_quota(Relation rel)
+{
+	switch (iheap_compact_headers)
+	{
+		case IHEAP_COMPACT_OFF:
+			return 0;
+		case IHEAP_COMPACT_ALWAYS:
+			return -1;
+		default:
+			return (int) (RelationGetTargetPageFreeSpace(rel, HEAP_DEFAULT_FILLFACTOR) /
+						  (IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ));
+	}
+}
+
+/* rows with a compact header on a page */
+int
+iheap_page_compact_count(Page page)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	int			n = 0;
+
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId		lp = PageGetItemId(page, off);
+
+		if (ItemIdIsNormal(lp) &&
+			(ih_hdr_infomask((char *) page + ItemIdGetOffset(lp)) & IHT_COMPACT))
+			n++;
+	}
+	return n;
+}
+
+/* how many more rows written frozen may get a compact header on page */
+static int
+ih_compact_budget(Relation rel, Page page)
+{
+	int			quota = iheap_compact_quota(rel);
+
+	if (quota < 0)
+		return PG_INT32_MAX;
+	if (quota == 0)
+		return 0;
+	return Max(quota - iheap_page_compact_count(page), 0);
 }
 
 /* ------------------------------------------------------------------------
@@ -401,6 +453,11 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 	buffer = iheap_get_buffer_for_tuple(rel, len, bistate, InvalidBuffer,
 										&page_init);
 	page = BufferGetPage(buffer);
+
+	/* a row written frozen may take a compact header (§21 D43) */
+	if (frozen && iheap_compact_headers != IHEAP_COMPACT_OFF &&
+		ih_tuple_can_compact(tup, len) && ih_compact_budget(rel, page) > 0)
+		len = ih_tuple_compact(tup, len);
 	if (PageIsAllVisible(page))
 	{
 		/* pin VM without holding the lock, then recheck */
@@ -450,7 +507,7 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 	}
 
 	ih_hdr_read(tup, &h);
-	h.infomask &= IHT_DATA_FLAGS;
+	h.infomask &= IHT_DATA_FLAGS | IHT_COMPACT;
 	if (speculative)
 		h.infomask |= IHT_SPECULATIVE;
 	if (frozen)
@@ -475,12 +532,16 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 	{
 		xl_iheap_insert xlrec;
 		XLogRecPtr	recptr;
+		char		walhdr[SizeOfIHeapWalHdr];
+		uint32		hs = ih_hdr_size(tup);
 
 		xlrec.offnum = offnum;
 		xlrec.flags = (page_init ? XLIH_INIT_PAGE : 0) |
 			(vm.cleared ? XLIH_VM_CLEARED : 0) |
 			(logical ? XLIH_LOGICAL : 0);
 
+		Assert(frozen || UndoRecPtrGetLPage(urp) == res.lpage);
+		iheap_walhdr_put(walhdr, &h);
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfIHeapInsert);
 		if (logical)
@@ -489,10 +550,11 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 		XLogRegisterBuffer(IH_BLK_DATA, buffer,
 						   REGBUF_STANDARD | (page_init ? REGBUF_WILL_INIT : 0) |
 						   (logical ? REGBUF_KEEP_DATA : 0));
-		XLogRegisterBufData(IH_BLK_DATA, tup, len);
+		XLogRegisterBufData(IH_BLK_DATA, walhdr, SizeOfIHeapWalHdr);
+		XLogRegisterBufData(IH_BLK_DATA, tup + hs, len - hs);
 		if (!frozen)
 			iheap_undo_register_wal(&res, IH_BLK_UNDO,
-									BufferGetBlockNumber(buffer));
+									BufferGetBlockNumber(buffer), false);
 		if (vm.cleared)
 			XLogRegisterBuffer(IH_BLK_VM, vm.vmbuf, 0);
 		recptr = XLogInsert(RM_IHEAP_ID, XLOG_IHEAP_INSERT);
@@ -608,8 +670,6 @@ iheap_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfIHeapSpecFinish);
 		XLogRegisterBuffer(IH_BLK_DATA, buffer, REGBUF_STANDARD);
-		if (succeeded)
-			XLogRegisterBufData(IH_BLK_DATA, tup, IHEAP_TUPHDR_SIZE);
 		recptr = XLogInsert(RM_IHEAP_ID, XLOG_IHEAP_SPEC_FINISH);
 		PageSetLSN(page, recptr);
 	}
@@ -626,7 +686,9 @@ iheap_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 
 /*
  * multi_insert (COPY): one MULTI_INSERT undo record and one WAL record per
- * page filled.
+ * page filled.  As heap's, it keeps the free space fillfactor asks for on
+ * each page, but always puts one row on the page it got for it.  Rows of a
+ * frozen load may take compact headers (§21 D43).
  */
 void
 iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
@@ -644,6 +706,7 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 	bool		logical = iheap_logically_logged(rel,
 												 (options & TABLE_INSERT_NO_LOGICAL) != 0);
 	IHeapLogicalPart logpart = {0};
+	Size		saveFreeSpace = RelationGetTargetPageFreeSpace(rel, HEAP_DEFAULT_FILLFACTOR);
 
 	/* as heap: the leader of a parallel CREATE TABLE AS may insert */
 	if (IsParallelWorker())
@@ -697,6 +760,7 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 		uint32		payload_len;
 		char	   *wp;
 		int			maxitems;
+		int			budget;
 
 		buffer = iheap_get_buffer_for_tuple(rel, lens[done], bistate,
 											InvalidBuffer, &page_init);
@@ -710,12 +774,26 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 		/* how many of the remaining tuples fit */
 		freespace = (Size) ((PageHeader) page)->pd_upper - ((PageHeader) page)->pd_lower;
 		maxitems = IHEAP_MAX_ITEMS - PageGetMaxOffsetNumber(page);
+		budget = (frozen && iheap_compact_headers != IHEAP_COMPACT_OFF) ?
+			ih_compact_budget(rel, page) : 0;
 		while (done + n < nslots && n < maxitems)
 		{
-			Size		need = lens[done + n] + sizeof(ItemIdData) + MAXIMUM_ALIGNOF;
+			uint32		tlen = lens[done + n];
+			bool		compact = budget > 0 &&
+				ih_tuple_can_compact(tuples[done + n], tlen);
+			Size		need;
 
-			if (used + need > freespace)
+			if (compact)
+				tlen -= IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
+			need = tlen + sizeof(ItemIdData) + MAXIMUM_ALIGNOF;
+			if (used + need > freespace ||
+				(n > 0 && used + need + saveFreeSpace > freespace))
 				break;
+			if (compact)
+			{
+				lens[done + n] = ih_tuple_compact(tuples[done + n], lens[done + n]);
+				budget--;
+			}
 			used += need;
 			n++;
 		}
@@ -745,22 +823,26 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 		{
 			IHeapHdr	h;
 			char	   *t = tuples[done + k];
-			uint16		l16 = (uint16) lens[done + k];
+			uint32		hs = ih_hdr_size(t);
+			uint16		bodylen = (uint16) (lens[done + k] - hs);
 
 			ih_hdr_read(t, &h);
-			h.infomask &= IHT_DATA_FLAGS;
+			h.infomask &= IHT_DATA_FLAGS | IHT_COMPACT;
 			h.xid = frozen ? FrozenTransactionId : xid;
 			h.urec = frozen ? InvalidUndoRecPtr : urp;
 			ih_hdr_write(t, &h);
 			offs[k] = iheap_page_add_item(page, t, lens[done + k], InvalidOffsetNumber);
 			if (!OffsetNumberIsValid(offs[k]))
 				elog(PANIC, "iheap: failed to add tuple during multi-insert");
+			/* offnum, body length, the header without xid and undo pointer */
 			memcpy(wp, &offs[k], sizeof(OffsetNumber));
-			wp += sizeof(OffsetNumber);
-			memcpy(wp, &l16, sizeof(uint16));
-			wp += sizeof(uint16);
-			memcpy(wp, t, lens[done + k]);
-			wp += lens[done + k];
+			memcpy(wp + 2, &bodylen, sizeof(uint16));
+			memcpy(wp + 4, &h.infomask2, sizeof(uint16));
+			memcpy(wp + 6, &h.infomask, sizeof(uint16));
+			wp[8] = (char) h.hoff;
+			wp += SizeOfIHeapMultiTuple;
+			memcpy(wp, t + hs, bodylen);
+			wp += bodylen;
 		}
 
 		if (!frozen)
@@ -791,6 +873,7 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 			XLogRecPtr	recptr;
 
 			xlrec.ntuples = n;
+			xlrec.urec_off = frozen ? 0 : (uint16) UndoRecPtrGetOffset(urp);
 			xlrec.flags = (page_init ? XLIH_INIT_PAGE : 0) |
 				(vm.cleared ? XLIH_VM_CLEARED : 0) |
 				(logical ? XLIH_LOGICAL : 0) |
@@ -805,7 +888,7 @@ iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 			XLogRegisterBufData(IH_BLK_DATA, walbuf, wp - walbuf);
 			if (!frozen)
 				iheap_undo_register_wal(&res, IH_BLK_UNDO,
-										BufferGetBlockNumber(buffer));
+										BufferGetBlockNumber(buffer), false);
 			if (vm.cleared)
 				XLogRegisterBuffer(IH_BLK_VM, vm.vmbuf, 0);
 			recptr = XLogInsert(RM_IHEAP_ID, XLOG_IHEAP_MULTI_INSERT);
@@ -1396,7 +1479,7 @@ iheap_put_lock_record(Relation rel, Buffer buf, OffsetNumber off,
 	iheap_lockers_serialize(payload, lockers, nlockers);
 
 	ih_hdr_read(tup, &cur);
-	memcpy(prevhdr, tup, IHEAP_TUPHDR_SIZE);
+	ih_hdr_write_image(prevhdr, &cur);
 	if (cur.infomask & IHT_LOCKED)
 	{
 		IHeapUndoRec *rec = iheap_undo_fetch(rel, cur.urec, true);
@@ -1408,7 +1491,7 @@ iheap_put_lock_record(Relation rel, Buffer buf, OffsetNumber off,
 			/* keep current hint bits; they describe the same creator */
 			ih_hdr_read(rec->hdr.ur_prev_hdr, &ph);
 			ph.infomask |= (cur.infomask & IHT_XID_HINTS);
-			ih_hdr_write(prevhdr, &ph);
+			ih_hdr_write_image(prevhdr, &ph);
 		}
 		if (rec)
 			pfree(rec);
@@ -1440,15 +1523,17 @@ iheap_put_lock_record(Relation rel, Buffer buf, OffsetNumber off,
 	{
 		xl_iheap_hdrchange xlrec;
 		XLogRecPtr	recptr;
+		char		change[SizeOfIHeapWalHdrChange];
 
 		xlrec.offnum = off;
 		xlrec.flags = 0;
+		iheap_walchange_put(change, &nh);
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfIHeapHdrChange);
 		XLogRegisterBuffer(IH_BLK_DATA, buf, REGBUF_STANDARD);
-		XLogRegisterBufData(IH_BLK_DATA, tup, IHEAP_TUPHDR_SIZE);
+		XLogRegisterBufData(IH_BLK_DATA, change, SizeOfIHeapWalHdrChange);
 		iheap_undo_register_wal(&res, IH_BLK_UNDO,
-								BufferGetBlockNumber(buf));
+								BufferGetBlockNumber(buf), false);
 		recptr = XLogInsert(RM_IHEAP_ID, XLOG_IHEAP_LOCK);
 		PageSetLSN(page, recptr);
 		iheap_undo_set_lsn(&res, recptr);
@@ -1586,6 +1671,8 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 	bool		logical = iheap_logically_logged(rel,
 												 (options & TABLE_DELETE_NO_LOGICAL) != 0);
 	IHeapLogicalPart logpart = {0};
+	bool		compact;
+	uint32		hs;
 
 	if (IsInParallelMode())
 		ereport(ERROR,
@@ -1661,16 +1748,25 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 
 	CheckForSerializableConflictIn(rel, tid, blk);
 
+	/*
+	 * The deleted row's body stays on the page until no snapshot can see it
+	 * any more, as heap's does (§21 D40): the undo record needs only the
+	 * header.  A compact header has no room for the deleter's xid (§21
+	 * D43): then the body goes to undo and the item becomes a stub, its
+	 * storage kept until the deletion commits.
+	 */
+	compact = (c.h.infomask & IHT_COMPACT) != 0;
+	hs = ih_hdr_size(tup);
 	memset(&uh, 0, sizeof(uh));
 	uh.ur_type = IHU_DELETE;
 	uh.ur_xid = xid;
 	uh.ur_cid = cid;
 	uh.ur_blkno = blk;
 	uh.ur_offnum = off;
-	memcpy(uh.ur_prev_hdr, tup, IHEAP_TUPHDR_SIZE);
+	ih_hdr_image(uh.ur_prev_hdr, tup);
 
 	memset(&res, 0, sizeof(res));
-	iheap_undo_reserve(rel, IHEAP_UNDOREC_HDRSZ + len - IHEAP_TUPHDR_SIZE, &res);
+	iheap_undo_reserve(rel, IHEAP_UNDOREC_HDRSZ + (compact ? len - hs : 0), &res);
 	ih_vm_prepare(rel, buf, &vm);
 
 	/* the page may have been compacted while we waited for undo space */
@@ -1679,15 +1775,23 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 
 	START_CRIT_SECTION();
 	uh.ur_xact_prev = iheap_xact_last_urp(rel);
-	urp = iheap_undo_write(rel, &res, &uh, tup + IHEAP_TUPHDR_SIZE,
-						   len - IHEAP_TUPHDR_SIZE);
+	urp = iheap_undo_write(rel, &res, &uh, compact ? tup + hs : NULL,
+						   compact ? len - hs : 0);
 
 	nh = c.h;
 	nh.xid = xid;
 	nh.urec = urp;
 	nh.infomask = (c.h.infomask & IHT_DATA_FLAGS) | IHT_DELETED | IHT_KEYS_UPDATED |
 		((options & TABLE_DELETE_CHANGING_PARTITION) ? IHT_MOVED_PART : 0);
-	ih_hdr_write(tup, &nh);
+	if (compact)
+	{
+		nh.infomask |= IHT_STUB;
+		nh.hoff += IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
+		ih_hdr_write(tup, &nh);
+		ItemIdSetNormal(lp, ItemIdGetOffset(lp), IHEAP_TUPHDR_SIZE);
+	}
+	else
+		ih_hdr_write(tup, &nh);
 	IHeapPageGetOpaque(page)->ihp_flags |= IHP_PRUNABLE;
 	ih_vm_clear(rel, buf, &vm);
 	MarkBufferDirty(buf);
@@ -1696,18 +1800,20 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 	{
 		xl_iheap_hdrchange xlrec;
 		XLogRecPtr	recptr;
+		char		change[SizeOfIHeapWalHdrChange];
 
 		xlrec.offnum = off;
 		xlrec.flags = (vm.cleared ? XLIH_VM_CLEARED : 0) |
 			(logical ? XLIH_LOGICAL : 0);
+		iheap_walchange_put(change, &nh);
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfIHeapHdrChange);
 		if (logical)
 			XLogRegisterData(logpart.data, logpart.len);
 		XLogRegisterBuffer(IH_BLK_DATA, buf, REGBUF_STANDARD);
-		XLogRegisterBufData(IH_BLK_DATA, tup, IHEAP_TUPHDR_SIZE);
+		XLogRegisterBufData(IH_BLK_DATA, change, SizeOfIHeapWalHdrChange);
 		iheap_undo_register_wal(&res, IH_BLK_UNDO,
-								BufferGetBlockNumber(buf));
+								BufferGetBlockNumber(buf), false);
 		if (vm.cleared)
 			XLogRegisterBuffer(IH_BLK_VM, vm.vmbuf, 0);
 		recptr = XLogInsert(RM_IHEAP_ID, XLOG_IHEAP_DELETE);
@@ -2077,6 +2183,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 												 (options & TABLE_UPDATE_NO_LOGICAL) != 0);
 	IHeapLogicalPart logpart = {0};
 	bool		dm_entries = false;
+	bool		grown = false;	/* the item's storage takes the new version */
 
 	*update_indexes = TU_None;
 	*lockmode = LockTupleExclusive;
@@ -2225,11 +2332,21 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			inplace = false;
 		else if ((int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
 		{
-			(void) iheap_page_prune(rel, buf, true, NULL, NULL);
+			/*
+			 * Too little room to put the new version elsewhere on the page.
+			 * A version without aligned values can still grow where it is:
+			 * compaction moves the tuples after it (a row whose compact
+			 * header becomes a full one grows by 4 bytes, §21 D43).
+			 */
+			if (newlen > curlen && !ih_tuple_needs_align(newtup))
+				grown = iheap_page_prune_grow(rel, buf, off, newlen);
+			else
+				(void) iheap_page_prune(rel, buf, true, NULL, NULL);
 			lp = PageGetItemId(page, off);
 			curlen = ItemIdGetLength(lp);
 			cap = Max(Max(newlen, curlen), iheap_item_reservation(rel, page, off));
-			if ((int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
+			if (!grown &&
+				(int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
 				inplace = false;
 		}
 	}
@@ -2244,6 +2361,8 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		uint32		payload_len;
 		uint32		oldbody;
 		uint32		newbody;
+		uint32		curhs;
+		uint32		newhs = ih_hdr_size(newtup);
 		UndoRecPtr	urp;
 		IHeapHdr	nh;
 		uint16		lp_off;
@@ -2252,11 +2371,13 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		IHeapLocker carried[IHEAP_MAX_LOCKERS];
 		int			ncarried = c.nlockers;
 
+		/* the delta of the bodies: a compact header grows (§21 D43) */
 		tup = (char *) page + ItemIdGetOffset(lp);
-		oldbody = curlen - IHEAP_TUPHDR_SIZE;
-		newbody = newlen - IHEAP_TUPHDR_SIZE;
-		ih_delta(tup + IHEAP_TUPHDR_SIZE, oldbody, newtup + IHEAP_TUPHDR_SIZE,
-				 newbody, &d.prefix, &d.suffix);
+		curhs = ih_hdr_size(tup);
+		oldbody = curlen - curhs;
+		newbody = newlen - newhs;
+		ih_delta(tup + curhs, oldbody, newtup + newhs, newbody,
+				 &d.prefix, &d.suffix);
 		d.old_len = (uint16) curlen;
 		d.mid_len = (uint16) (oldbody - d.prefix - d.suffix);
 		memcpy(carried, c.lockers, ncarried * sizeof(IHeapLocker));
@@ -2265,7 +2386,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			(ncarried > 0 ? iheap_lockers_size(ncarried) : 0);
 		payload = palloc(payload_len);
 		memcpy(payload, &d, sizeof(d));
-		memcpy(payload + sizeof(d), tup + IHEAP_TUPHDR_SIZE + d.prefix, d.mid_len);
+		memcpy(payload + sizeof(d), tup + curhs + d.prefix, d.mid_len);
 		if (ncarried > 0)
 			iheap_lockers_serialize(payload + sizeof(d) + d.mid_len, carried,
 									ncarried);
@@ -2278,11 +2399,12 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		uh.ur_cid = cid;
 		uh.ur_blkno = blk;
 		uh.ur_offnum = off;
-		memcpy(uh.ur_prev_hdr, tup, IHEAP_TUPHDR_SIZE);
+		ih_hdr_image(uh.ur_prev_hdr, tup);
 
 		/* before reserving undo: this reads undo, maybe our own page */
-		relocated = newlen > curlen ||
-			!iheap_tuple_aligned_at(newtup, ItemIdGetOffset(lp));
+		relocated = !grown &&
+			(newlen > curlen ||
+			 !iheap_tuple_aligned_at(newtup, ItemIdGetOffset(lp)));
 		if (relocated)
 			capacity = Max(Max(newlen, curlen),
 						   iheap_item_reservation(rel, page, off));
@@ -2331,6 +2453,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			xl_iheap_update xlrec;
 			XLogRecPtr	recptr;
 			uint32		newmid = newbody - d.prefix - d.suffix;
+			char		walhdr[SizeOfIHeapWalHdr];
 
 			xlrec.offnum = off;
 			xlrec.new_len = (uint16) newlen;
@@ -2348,19 +2471,22 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 				newmid = newbody;
 				xlrec.flags |= XLIH_LOGICAL;
 			}
+			Assert(UndoRecPtrGetLPage(urp) == res.lpage);
+			iheap_walhdr_put(walhdr, &nh);
 			XLogBeginInsert();
 			XLogRegisterData(&xlrec, SizeOfIHeapUpdate);
 			if (logical)
 				XLogRegisterData(logpart.data, logpart.len);
 			XLogRegisterBuffer(IH_BLK_DATA, buf,
 							   REGBUF_STANDARD | (logical ? REGBUF_KEEP_DATA : 0));
-			XLogRegisterBufData(IH_BLK_DATA, newtup, IHEAP_TUPHDR_SIZE);
+			XLogRegisterBufData(IH_BLK_DATA, walhdr, SizeOfIHeapWalHdr);
 			if (newmid > 0)
 				XLogRegisterBufData(IH_BLK_DATA,
-									newtup + IHEAP_TUPHDR_SIZE + xlrec.prefix,
+									newtup + newhs + xlrec.prefix,
 									newmid);
+			/* the undo delta's header comes from prefix and suffix here */
 			iheap_undo_register_wal(&res, IH_BLK_UNDO,
-									BufferGetBlockNumber(buf));
+									BufferGetBlockNumber(buf), !logical);
 			if (vm.cleared)
 				XLogRegisterBuffer(IH_BLK_VM, vm.vmbuf, 0);
 			recptr = XLogInsert(RM_IHEAP_ID, XLOG_IHEAP_UPDATE);
@@ -2399,11 +2525,13 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		IHeapHdr	nh;
 		ItemPointerData newtid;
 		int			ncarried = plan.key_changed ? 0 : c.nlockers;
+		uint32		curhs;
+		bool		compact;
 
 		same_page = iheap_page_free_space(page) >= newlen + sizeof(ItemIdData) + MAXIMUM_ALIGNOF;
 		if (!same_page && (IHeapPageGetOpaque(page)->ihp_flags & IHP_PRUNABLE))
 		{
-			(void) iheap_page_prune(rel, buf, false, NULL, NULL);
+			(void) iheap_page_prune_opt(rel, buf);
 			same_page = iheap_page_free_space(page) >= newlen + sizeof(ItemIdData) + MAXIMUM_ALIGNOF;
 		}
 
@@ -2444,11 +2572,19 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		else
 			ItemPointerSet(&newtid, BufferGetBlockNumber(newbuf), newoff);
 
-		mpayload_len = sizeof(ItemPointerData) + curlen - IHEAP_TUPHDR_SIZE;
+		/*
+		 * The old version's body stays on the page until no snapshot can see
+		 * it any more (§21 D40): the MOVE record carries the new TID only.
+		 * A compact header has no room for the mover's xid (§21 D43): then
+		 * the body goes along, and the old item becomes a stub.
+		 */
+		curhs = ih_hdr_size(tup);
+		compact = (c.h.infomask & IHT_COMPACT) != 0;
+		mpayload_len = sizeof(ItemPointerData) + (compact ? curlen - curhs : 0);
 		mpayload = palloc(mpayload_len);
 		memcpy(mpayload, &newtid, sizeof(ItemPointerData));
-		memcpy(mpayload + sizeof(ItemPointerData), tup + IHEAP_TUPHDR_SIZE,
-			   curlen - IHEAP_TUPHDR_SIZE);
+		if (compact)
+			memcpy(mpayload + sizeof(ItemPointerData), tup + curhs, curlen - curhs);
 
 		memset(&muh, 0, sizeof(muh));
 		muh.ur_type = IHU_MOVE;
@@ -2457,7 +2593,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		muh.ur_cid = cid;
 		muh.ur_blkno = blk;
 		muh.ur_offnum = off;
-		memcpy(muh.ur_prev_hdr, tup, IHEAP_TUPHDR_SIZE);
+		ih_hdr_image(muh.ur_prev_hdr, tup);
 
 		if (ncarried > 0)
 		{
@@ -2494,7 +2630,15 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		oh.urec = murp;
 		oh.infomask = (c.h.infomask & IHT_DATA_FLAGS) | IHT_MOVED |
 			(plan.key_changed ? IHT_KEYS_UPDATED : 0);
-		ih_hdr_write(tup, &oh);
+		if (compact)
+		{
+			oh.infomask |= IHT_STUB;
+			oh.hoff += IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
+			ih_hdr_write(tup, &oh);
+			ItemIdSetNormal(lp, ItemIdGetOffset(lp), IHEAP_TUPHDR_SIZE);
+		}
+		else
+			ih_hdr_write(tup, &oh);
 		IHeapPageGetOpaque(page)->ihp_flags |= IHP_PRUNABLE;
 
 		ih_hdr_read(newtup, &nh);
@@ -2517,6 +2661,10 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		{
 			xl_iheap_move xlrec;
 			XLogRecPtr	recptr;
+			char		change[SizeOfIHeapWalHdrChange];
+			char		walhdr[SizeOfIHeapWalHdr];
+			uint32		newhs = ih_hdr_size(newtup);
+			xl_iheap_move_delta mdelta = {0, 0};
 
 			xlrec.old_offnum = off;
 			xlrec.new_offnum = newoff;
@@ -2526,26 +2674,51 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 				(vm.cleared ? XLIH_VM_CLEARED : 0) |
 				(newvm.cleared ? XLIH_NEW_VM_CLEARED : 0) |
 				(logical ? XLIH_LOGICAL : 0);
+			iheap_walchange_put(change, &oh);
+			iheap_walhdr_put(walhdr, &nh);
+
+			/*
+			 * On the same page, the old body stays where it was (§21 D40):
+			 * the new one goes as the bytes that differ, as heap logs an
+			 * update on the same page.  Not with a full-page image (the
+			 * block's data does not go then), nor for logical decoding (it
+			 * reads the new tuple from the record alone), nor when the old
+			 * row had a compact header (its body is in undo now).
+			 */
+			if (same_page && !logical && !compact &&
+				!XLogCheckBufferNeedsBackup(buf))
+			{
+				ih_delta(tup + curhs, curlen - curhs, newtup + newhs,
+						 newlen - newhs, &mdelta.prefix, &mdelta.suffix);
+				xlrec.flags |= XLIH_MOVE_DELTA;
+			}
 			XLogBeginInsert();
 			XLogRegisterData(&xlrec, SizeOfIHeapMove);
+			if (xlrec.flags & XLIH_MOVE_DELTA)
+				XLogRegisterData(&mdelta, sizeof(mdelta));
 			if (logical)
 				XLogRegisterData(logpart.data, logpart.len);
 			/* decoding reads the new tuple even with a full-page image */
 			XLogRegisterBuffer(IH_BLK_DATA, buf,
 							   REGBUF_STANDARD |
 							   (logical && same_page ? REGBUF_KEEP_DATA : 0));
-			XLogRegisterBufData(IH_BLK_DATA, tup, IHEAP_TUPHDR_SIZE);
+			XLogRegisterBufData(IH_BLK_DATA, change, SizeOfIHeapWalHdrChange);
 			if (same_page)
-				XLogRegisterBufData(IH_BLK_DATA, newtup, newlen);
+			{
+				XLogRegisterBufData(IH_BLK_DATA, walhdr, SizeOfIHeapWalHdr);
+				XLogRegisterBufData(IH_BLK_DATA, newtup + newhs + mdelta.prefix,
+									newlen - newhs - mdelta.prefix - mdelta.suffix);
+			}
 			else
 			{
 				XLogRegisterBuffer(IH_BLK_NEWDATA, newbuf,
 								   REGBUF_STANDARD | (new_init ? REGBUF_WILL_INIT : 0) |
 								   (logical ? REGBUF_KEEP_DATA : 0));
-				XLogRegisterBufData(IH_BLK_NEWDATA, newtup, newlen);
+				XLogRegisterBufData(IH_BLK_NEWDATA, walhdr, SizeOfIHeapWalHdr);
+				XLogRegisterBufData(IH_BLK_NEWDATA, newtup + newhs, newlen - newhs);
 			}
 			iheap_undo_register_wal(&res, IH_BLK_UNDO,
-									BufferGetBlockNumber(buf));
+									BufferGetBlockNumber(buf), false);
 			/* a VM page shared by both pages is registered once, as VM */
 			if (vm.cleared || (newvm.cleared && newvm.borrowed))
 				XLogRegisterBuffer(IH_BLK_VM, vm.vmbuf, 0);

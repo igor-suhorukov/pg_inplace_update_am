@@ -174,19 +174,30 @@ iheap_rollback_tuple(Relation rel, Buffer buffer, OffsetNumber off)
 							keep[j].mode = Max(keep[j].mode, lk[i].mode);
 					}
 				}
-				pg_fallthrough;
+				goto restore_header;
 			case IHU_DELETE:
 			case IHU_MOVE:
-				/* the body is still on the page: restore the header */
-				START_CRIT_SECTION();
-				memcpy(tup, rec->hdr.ur_prev_hdr, IHEAP_TUPHDR_SIZE);
-				MarkBufferDirty(buffer);
-				log_rollback(rel, buffer, off, XLIH_RB_HEADER,
-							 ItemIdGetOffset(lp), tup, IHEAP_TUPHDR_SIZE);
-				END_CRIT_SECTION();
-				break;
+				/* a stub: a compact row's deletion, its body in the record */
+				if (ih_hdr_infomask(tup) & IHT_STUB)
+					goto restore_tuple;
+		restore_header:
+				{
+					/* the body is still on the page: restore the header */
+					IHeapHdr	ph;
+
+					ih_hdr_read(rec->hdr.ur_prev_hdr, &ph);
+					START_CRIT_SECTION();
+					ih_hdr_write(tup, &ph);
+					MarkBufferDirty(buffer);
+					log_rollback(rel, buffer, off, XLIH_RB_HEADER,
+								 ItemIdGetOffset(lp), rec->hdr.ur_prev_hdr,
+								 IHEAP_TUPHDR_SIZE);
+					END_CRIT_SECTION();
+					break;
+				}
 
 			case IHU_UPDATE:
+		restore_tuple:
 				{
 					char	   *old = tup;
 					uint32		oldlen = ItemIdGetLength(lp);

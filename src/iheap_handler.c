@@ -44,6 +44,14 @@ PG_MODULE_MAGIC_EXT(.name = "pg_inplace_update_am",.version = "0.1");
 
 bool		iheap_enable_inplace = true;
 int			iheap_foreground_undo_limit = 1024; /* kB */
+int			iheap_compact_headers = IHEAP_COMPACT_AUTO;
+
+static const struct config_enum_entry compact_headers_options[] = {
+	{"off", IHEAP_COMPACT_OFF, false},
+	{"auto", IHEAP_COMPACT_AUTO, false},
+	{"always", IHEAP_COMPACT_ALWAYS, false},
+	{NULL, 0, false}
+};
 
 /*
  * "error" was the default before decoding was implemented (it stopped
@@ -460,6 +468,18 @@ _PG_init(void)
 							 IHEAP_LOGICAL_ON,
 							 logical_decoding_options,
 							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("iheap.compact_headers",
+							 "Where rows written frozen get compact tuple headers.",
+							 "Table rewrites and frozen loads write rows every snapshot sees; "
+							 "\"auto\" compacts their headers as far as the space fillfactor keeps free "
+							 "lets them grow back on a later update, \"always\" compacts them all.",
+							 &iheap_compact_headers,
+							 IHEAP_COMPACT_AUTO,
+							 compact_headers_options,
+							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
 

@@ -21,6 +21,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xloginsert.h"
+#include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -264,6 +265,59 @@ undo_encode(char *dst, const IHeapUndoRecHeader *hdr, uint32 payload_len,
 	return p - dst;
 }
 
+/* the sizes of the fields of a compact header, which its format byte gives */
+typedef struct UndoEncLayout
+{
+	uint32		len_sz;			/* payload length: 1 or 2 */
+	uint32		cid_sz;			/* 2 or 4 */
+	uint32		blk_sz;			/* 2 or 4 */
+	uint32		off_sz;			/* 1 or 2 */
+	uint32		xp_sz;			/* ur_xact_prev: 0, 2 or 7 */
+	uint32		prev_sz;		/* ur_prev_hdr: 0, 9, 11 or 16 */
+	uint32		hdrlen;			/* all of it */
+} UndoEncLayout;
+
+static bool
+undo_layout(uint8 fmt, UndoEncLayout *l)
+{
+	l->len_sz = (fmt & IHUC_LEN8) ? 1 : 2;
+	l->cid_sz = (fmt & IHUC_CID16) ? 2 : 4;
+	l->blk_sz = (fmt & IHUC_BLK16) ? 2 : 4;
+	l->off_sz = (fmt & IHUC_OFF8) ? 1 : 2;
+	switch (fmt & IHUC_XP_MASK)
+	{
+		case IHUC_XP_NONE:
+			l->xp_sz = 0;
+			break;
+		case IHUC_XP_LOCAL:
+			l->xp_sz = 2;
+			break;
+		case IHUC_XP_FULL:
+			l->xp_sz = 7;
+			break;
+		default:
+			return false;
+	}
+	switch (fmt & IHUC_PH_MASK)
+	{
+		case IHUC_PH_NONE:
+			l->prev_sz = 0;
+			break;
+		case IHUC_PH_FROZEN:
+			l->prev_sz = 9;
+			break;
+		case IHUC_PH_LOCAL:
+			l->prev_sz = 11;
+			break;
+		default:
+			l->prev_sz = 16;
+			break;
+	}
+	l->hdrlen = 2 + l->len_sz + 4 + l->cid_sz + l->blk_sz + l->off_sz +
+		l->xp_sz + l->prev_sz;
+	return true;
+}
+
 /*
  * Decode the compact header at src, which has "avail" bytes before the end
  * of the page's records.  Returns false if they do not hold the header and
@@ -277,41 +331,16 @@ undo_decode(const char *src, uint32 avail, uint64 lpage,
 	uint8		fmt;
 	uint64		v;
 	uint32		need;
+	UndoEncLayout l;
 
 	if (avail < 2)
 		return false;
 	fmt = (uint8) src[1];
 
 	/* the header's length follows from the format bits */
-	need = 2 + ((fmt & IHUC_LEN8) ? 1 : 2) + 4 + ((fmt & IHUC_CID16) ? 2 : 4) +
-		((fmt & IHUC_BLK16) ? 2 : 4) + ((fmt & IHUC_OFF8) ? 1 : 2);
-	switch (fmt & IHUC_XP_MASK)
-	{
-		case IHUC_XP_NONE:
-			break;
-		case IHUC_XP_LOCAL:
-			need += 2;
-			break;
-		case IHUC_XP_FULL:
-			need += 7;
-			break;
-		default:
-			return false;
-	}
-	switch (fmt & IHUC_PH_MASK)
-	{
-		case IHUC_PH_NONE:
-			break;
-		case IHUC_PH_FROZEN:
-			need += 9;
-			break;
-		case IHUC_PH_LOCAL:
-			need += 11;
-			break;
-		default:
-			need += 16;
-			break;
-	}
+	if (!undo_layout(fmt, &l))
+		return false;
+	need = l.hdrlen;
 	if (avail < need)
 		return false;
 
@@ -370,7 +399,7 @@ undo_decode(const char *src, uint32 avail, uint64 lpage,
 				ph.urec = InvalidUndoRecPtr;
 				break;
 		}
-		ih_hdr_write(hdr->ur_prev_hdr, &ph);
+		ih_hdr_write_image(hdr->ur_prev_hdr, &ph);
 	}
 
 	Assert(p - src == need);
@@ -499,8 +528,8 @@ undo_page_account(Page page, const IHeapUndoRecHeader *hdr,
 }
 
 /*
- * Append a record to an undo page, in the page's format (also used by
- * redo).  Sets hdr->ur_len and returns it.
+ * Append a record to an undo page, in the page's format (also used by the
+ * table rewrite, on pages of its own).  Sets hdr->ur_len and returns it.
  */
 uint32
 iheap_undo_put_record(Page page, uint32 offset, IHeapUndoRecHeader *hdr,
@@ -745,7 +774,7 @@ iheap_undo_write(Relation rel, IHeapUndoReservation *res,
 	if (UndoRecPtrIsValid(prev.urec) && prev.urec < res->discard)
 	{
 		prev.urec = InvalidUndoRecPtr;
-		ih_hdr_write(hdr->ur_prev_hdr, &prev);
+		ih_hdr_write_image(hdr->ur_prev_hdr, &prev);
 	}
 
 	len = iheap_undo_put_record(page, off, hdr, payload, payload_len);
@@ -768,12 +797,16 @@ iheap_undo_write(Relation rel, IHeapUndoReservation *res,
 
 /*
  * Register the undo page and the records written so far in the WAL record
- * being assembled, in the compact form described in iheap.h.  datablk is the
- * block registered as IH_BLK_DATA, or InvalidBlockNumber.
+ * being assembled, in the form described in iheap.h: each record as its
+ * page encodes it, less the writer's xid when it is the WAL record's, the
+ * target block when it is datablk (the block registered as IH_BLK_DATA, or
+ * InvalidBlockNumber), and, with delta_derived, the delta header of an
+ * in-place update, which redo derives from the update record's prefix and
+ * suffix.
  */
 void
 iheap_undo_register_wal(IHeapUndoReservation *res, uint8 block_id,
-						BlockNumber datablk)
+						BlockNumber datablk, bool delta_derived)
 {
 	Page		page = BufferGetPage(res->buffer);
 	TransactionId recxid = GetCurrentTransactionIdIfAny();
@@ -781,130 +814,321 @@ iheap_undo_register_wal(IHeapUndoReservation *res, uint8 block_id,
 	XLogRegisterBuffer(block_id, res->buffer, REGBUF_STANDARD);
 	for (int i = 0; i < res->nwal; i++)
 	{
+		const char *rec = (char *) page + res->wal[i].offset;
+		const char *s = rec;
 		const char *payload;
 		uint32		plen;
-		uint16		payload_len;
 		IHeapUndoRecHeader hdr;
-		char	   *p = res->walhdr[i];
-		uint8	   *wflags = (uint8 *) p;
+		UndoEncLayout l;
+		char	   *p = res->walhdr[i] + 1;
+		uint8		wflags = 0;
 
-		if (!iheap_undo_read_record(page, res->wal[i].offset,
+		if (IHeapUndoPageGetHeader(page)->uph_format != IHEAP_UNDO_FORMAT_COMPACT ||
+			!iheap_undo_read_record(page, res->wal[i].offset,
 									res->wal[i].offset + res->wal[i].len,
-									&hdr, &payload, &plen))
+									&hdr, &payload, &plen) ||
+			!undo_layout((uint8) rec[1], &l))
 			elog(PANIC, "iheap: undo record just written cannot be read");
-		payload_len = (uint16) plen;
-		*wflags = 0;
-		p[1] = (char) hdr.ur_type;
-		p[2] = (char) hdr.ur_flags;
-		p += 3;
-		memcpy(p, &payload_len, sizeof(uint16));
-		p += sizeof(uint16);
-		memcpy(p, &hdr.ur_cid, sizeof(CommandId));
-		p += sizeof(CommandId);
-		memcpy(p, &hdr.ur_offnum, sizeof(OffsetNumber));
-		p += sizeof(OffsetNumber);
+
+		/* type and flags, format, payload length */
+		memcpy(p, s, 2 + l.len_sz);
+		p += 2 + l.len_sz;
+		s += 2 + l.len_sz;
 		if (!TransactionIdEquals(hdr.ur_xid, recxid))
 		{
-			*wflags |= IHUW_XID;
-			memcpy(p, &hdr.ur_xid, sizeof(TransactionId));
-			p += sizeof(TransactionId);
+			wflags |= IHUW_XID;
+			memcpy(p, s, 4);
+			p += 4;
 		}
+		s += 4;
+		memcpy(p, s, l.cid_sz);
+		p += l.cid_sz;
+		s += l.cid_sz;
 		if (hdr.ur_blkno != datablk || !BlockNumberIsValid(datablk))
 		{
-			*wflags |= IHUW_BLKNO;
-			memcpy(p, &hdr.ur_blkno, sizeof(BlockNumber));
-			p += sizeof(BlockNumber);
+			wflags |= IHUW_BLKNO;
+			memcpy(p, s, l.blk_sz);
+			p += l.blk_sz;
 		}
-		if (!UndoRecPtrIsValid(hdr.ur_xact_prev))
-			*wflags |= IHUW_PREV_NONE;
-		else if (UndoRecPtrGetLPage(hdr.ur_xact_prev) == res->lpage)
-		{
-			uint16		off = (uint16) UndoRecPtrGetOffset(hdr.ur_xact_prev);
+		s += l.blk_sz;
+		/* offset number, the transaction's previous record, prev header */
+		memcpy(p, s, l.off_sz + l.xp_sz + l.prev_sz);
+		p += l.off_sz + l.xp_sz + l.prev_sz;
+		s += l.off_sz + l.xp_sz + l.prev_sz;
+		Assert(s == payload);
 
-			*wflags |= IHUW_PREV_LOCAL;
-			memcpy(p, &off, sizeof(uint16));
-			p += sizeof(uint16);
-		}
-		else
+		if (delta_derived && hdr.ur_type == IHU_UPDATE)
 		{
-			memcpy(p, &hdr.ur_xact_prev, sizeof(UndoRecPtr));
-			p += sizeof(UndoRecPtr);
+			Assert(plen >= sizeof(IHeapUpdateDelta));
+			wflags |= IHUW_DELTA;
+			payload += sizeof(IHeapUpdateDelta);
+			plen -= sizeof(IHeapUpdateDelta);
 		}
-		memcpy(p, hdr.ur_prev_hdr, IHEAP_TUPHDR_SIZE);
-		p += IHEAP_TUPHDR_SIZE;
 
+		res->walhdr[i][0] = (char) wflags;
 		XLogRegisterBufData(block_id, res->walhdr[i], p - res->walhdr[i]);
-		if (payload_len > 0)
-			XLogRegisterBufData(block_id, payload, payload_len);
+		if (plen > 0)
+			XLogRegisterBufData(block_id, payload, plen);
 	}
 }
 
 /*
- * Redo: append the undo records carried in compact form by "record" to the
- * undo page.
+ * Rebuild the page encoding of the record a WAL entry at *src describes,
+ * into dst (BLCKSZ bytes), and advance *src past the entry.  Returns the
+ * record's length, or 0 if the entry is malformed.
  */
-void
-iheap_undo_redo_records(XLogReaderState *record, Page page, const char *data,
-						Size len)
+static uint32
+undo_wal_entry_rebuild(XLogReaderState *record, const char **src,
+					   const char *end, const IHeapUndoDeltaSrc *delta,
+					   char *dst)
 {
-	const char *end = data + len;
-	uint64		lpage = IHeapUndoPageGetHeader(page)->uph_lpage;
+	const char *s = *src;
+	char	   *p = dst;
+	uint8		wflags;
+	uint8		fmt;
+	UndoEncLayout l;
+	uint64		payload_len;
+	uint32		walpayload;
+	TransactionId xid;
+	BlockNumber blkno;
 
-	while (data < end)
+	if (end - s < 3)
+		return 0;
+	wflags = (uint8) s[0];
+	fmt = (uint8) s[2];
+	s++;
+	if (!undo_layout(fmt, &l) ||
+		end - s < (ptrdiff_t) (l.hdrlen - ((wflags & IHUW_XID) ? 0 : 4) -
+							   ((wflags & IHUW_BLKNO) ? 0 : l.blk_sz)))
+		return 0;
+
+	memcpy(p, s, 2 + l.len_sz);
+	(void) get_uint(s + 2, &payload_len, l.len_sz);
+	p += 2 + l.len_sz;
+	s += 2 + l.len_sz;
+	if (wflags & IHUW_XID)
+	{
+		memcpy(p, s, 4);
+		s += 4;
+	}
+	else
+	{
+		xid = XLogRecGetXid(record);
+		(void) put_uint(p, xid, 4);
+	}
+	p += 4;
+	memcpy(p, s, l.cid_sz);
+	p += l.cid_sz;
+	s += l.cid_sz;
+	if (wflags & IHUW_BLKNO)
+	{
+		memcpy(p, s, l.blk_sz);
+		s += l.blk_sz;
+	}
+	else
+	{
+		if (!XLogRecGetBlockTagExtended(record, IH_BLK_DATA, NULL, NULL,
+										&blkno, NULL))
+			elog(PANIC, "iheap: undo record refers to a missing data block");
+		(void) put_uint(p, blkno, l.blk_sz);
+	}
+	p += l.blk_sz;
+	memcpy(p, s, l.off_sz + l.xp_sz + l.prev_sz);
+	p += l.off_sz + l.xp_sz + l.prev_sz;
+	s += l.off_sz + l.xp_sz + l.prev_sz;
+
+	walpayload = (uint32) payload_len;
+	if (wflags & IHUW_DELTA)
+	{
+		/* an in-place update: the delta header from the update record */
+		IHeapUpdateDelta d;
+		uint32		lockers = 0;
+		uint32		prevhdrsz = IHEAP_TUPHDR_SIZE;
+		const char *prev = p - l.prev_sz;
+
+		if (delta == NULL || payload_len < sizeof(d) || l.prev_sz == 0)
+			return 0;
+		walpayload = (uint32) payload_len - sizeof(d);
+		if (end - s < (ptrdiff_t) walpayload)
+			return 0;
+		if (((uint8) dst[0] >> 4) & IHUF_LOCKERS)
+		{
+			uint16		n;
+
+			if (walpayload < sizeof(uint16))
+				return 0;
+			memcpy(&n, s + walpayload - sizeof(uint16), sizeof(uint16));
+			lockers = iheap_lockers_size(n);
+			if (lockers > walpayload)
+				return 0;
+		}
+		/* the previous header's infomask: its form gives its size */
+		{
+			uint64		im;
+
+			(void) get_uint(prev + 2, &im, 2);
+			if (im & IHT_COMPACT)
+				prevhdrsz = IHEAP_COMPACT_HDRSZ;
+		}
+		d.prefix = delta->prefix;
+		d.suffix = delta->suffix;
+		d.mid_len = (uint16) (walpayload - lockers);
+		d.old_len = (uint16) (prevhdrsz + d.prefix + d.suffix + d.mid_len);
+		memcpy(p, &d, sizeof(d));
+		p += sizeof(d);
+	}
+	else if (end - s < (ptrdiff_t) walpayload)
+		return 0;
+	memcpy(p, s, walpayload);
+	p += walpayload;
+	s += walpayload;
+
+	*src = s;
+	return p - dst;
+}
+
+/* append a record that is already in its page encoding (redo) */
+static void
+undo_put_encoded(Page page, const char *rec, uint32 len)
+{
+	IHeapUndoPageHeaderData *uph = IHeapUndoPageGetHeader(page);
+	PageHeader	ph = (PageHeader) page;
+	IHeapUndoRecHeader hdr;
+	uint32		hdrlen;
+	uint32		payload_len;
+
+	if (uph->uph_format != IHEAP_UNDO_FORMAT_COMPACT ||
+		!undo_decode(rec, len, uph->uph_lpage, &hdr, &hdrlen, &payload_len) ||
+		hdrlen + payload_len != len)
+		elog(PANIC, "iheap: corrupt undo record in WAL record");
+	if ((uint32) ph->pd_lower + len > ph->pd_upper)
+		elog(PANIC, "iheap: bad undo record placement at %u (upper %u, len %u)",
+			 ph->pd_lower, ph->pd_upper, len);
+	memcpy((char *) page + ph->pd_lower, rec, len);
+	undo_page_account(page, &hdr, rec + hdrlen, payload_len);
+	ph->pd_lower += len;
+}
+
+/*
+ * Does an undo page that redo found newer than the record (BLK_DONE) hold
+ * the record's undo record "rec" at offset "off"?  Then the page has not
+ * been reused since.  The page's records are walked from its start, so that
+ * a match is a record and not bytes inside one; and no record of a page
+ * reused since can match: it was written after the discard that freed the
+ * page, which came after the writer of "rec" had ended, and an undo record
+ * names a writer that is still running (rewrites write into a new
+ * relfilenode).
+ */
+static bool
+undo_page_holds(Page page, uint32 off, const char *rec, uint32 len)
+{
+	uint32		pos = IHEAP_UNDO_DATA_START;
+	uint32		lower = ((PageHeader) page)->pd_lower;
+
+	if (IHeapPageGetType(page) != IHEAP_PAGE_UNDO ||
+		IHeapUndoPageGetHeader(page)->uph_format != IHEAP_UNDO_FORMAT_COMPACT ||
+		lower > BLCKSZ - IHEAP_SPECIAL_SIZE)
+		return false;
+	while (pos < off)
 	{
 		IHeapUndoRecHeader hdr;
-		uint8		wflags = (uint8) data[0];
-		uint16		payload_len;
+		const char *payload;
+		uint32		payload_len;
 
-		memset(&hdr, 0, sizeof(hdr));
-		hdr.ur_type = (uint8) data[1];
-		hdr.ur_flags = (uint8) data[2];
-		data += 3;
-		memcpy(&payload_len, data, sizeof(uint16));
-		data += sizeof(uint16);
-		memcpy(&hdr.ur_cid, data, sizeof(CommandId));
-		data += sizeof(CommandId);
-		memcpy(&hdr.ur_offnum, data, sizeof(OffsetNumber));
-		data += sizeof(OffsetNumber);
-		if (wflags & IHUW_XID)
-		{
-			memcpy(&hdr.ur_xid, data, sizeof(TransactionId));
-			data += sizeof(TransactionId);
-		}
-		else
-			hdr.ur_xid = XLogRecGetXid(record);
-		if (wflags & IHUW_BLKNO)
-		{
-			memcpy(&hdr.ur_blkno, data, sizeof(BlockNumber));
-			data += sizeof(BlockNumber);
-		}
-		else if (!XLogRecGetBlockTagExtended(record, IH_BLK_DATA, NULL, NULL,
-											 &hdr.ur_blkno, NULL))
-			elog(PANIC, "iheap: undo record refers to a missing data block");
-		if (wflags & IHUW_PREV_NONE)
-			hdr.ur_xact_prev = InvalidUndoRecPtr;
-		else if (wflags & IHUW_PREV_LOCAL)
-		{
-			uint16		off;
-
-			memcpy(&off, data, sizeof(uint16));
-			data += sizeof(uint16);
-			hdr.ur_xact_prev = MakeUndoRecPtr(lpage, off);
-		}
-		else
-		{
-			memcpy(&hdr.ur_xact_prev, data, sizeof(UndoRecPtr));
-			data += sizeof(UndoRecPtr);
-		}
-		memcpy(hdr.ur_prev_hdr, data, IHEAP_TUPHDR_SIZE);
-		data += IHEAP_TUPHDR_SIZE;
-
-		if (data + payload_len > end)
-			elog(PANIC, "iheap: corrupt undo data in WAL record");
-		(void) iheap_undo_put_record(page, ((PageHeader) page)->pd_lower, &hdr,
-									 data, payload_len);
-		data += payload_len;
+		if (!iheap_undo_page_next(page, &pos, &hdr, &payload, &payload_len))
+			return false;
 	}
+	return pos == off && off + len <= lower &&
+		memcmp((char *) page + off, rec, len) == 0;
+}
+
+/*
+ * Redo of the undo block of a record, before its data blocks: the undo
+ * records it carries are appended if the page needs it.  Returns the
+ * logical number of the undo page they are on, which the tuple headers of
+ * the data blocks need (they carry offsets on that page), or 0 when the page
+ * has been reused for something else since (or is gone): its records were
+ * discarded then, and the headers that pointed at them are frozen.
+ *
+ * known_entry and known_off: an entry of the record whose page offset a data
+ * block names (-1: none), to tell whether a page that is newer than the
+ * record still holds its records.  delta: the source of update deltas left
+ * out of WAL (IHUW_DELTA), or NULL.
+ */
+uint64
+iheap_undo_redo_block(XLogReaderState *record, uint8 block_id,
+					  int known_entry, uint16 known_off,
+					  const IHeapUndoDeltaSrc *delta)
+{
+	Buffer		buf;
+	XLogRedoAction action;
+	uint64		lpage = 0;
+	Page		page;
+	Size		len;
+	const char *data;
+	const char *end;
+	PGAlignedBlock rec;
+
+	if (!XLogRecHasBlockRef(record, block_id))
+		return 0;
+
+	action = XLogReadBufferForRedo(record, block_id, &buf);
+	page = BufferIsValid(buf) ? BufferGetPage(buf) : NULL;
+	data = XLogRecGetBlockData(record, block_id, &len);
+	if (data == NULL)
+		len = 0;
+	end = data ? data + len : data;
+	switch (action)
+	{
+		case BLK_NEEDS_REDO:
+			if (IHeapPageGetType(page) != IHEAP_PAGE_UNDO)
+				elog(PANIC, "iheap redo: block %u is not an undo page",
+					 BufferGetBlockNumber(buf));
+			lpage = IHeapUndoPageGetHeader(page)->uph_lpage;
+			for (int i = 0; data < end; i++)
+			{
+				uint32		rlen = undo_wal_entry_rebuild(record, &data, end,
+														  delta, rec.data);
+
+				if (rlen == 0)
+					elog(PANIC, "iheap: corrupt undo data in WAL record");
+				if (i == known_entry &&
+					((PageHeader) page)->pd_lower != known_off)
+					elog(PANIC, "iheap redo: undo record placed at %u, the record says %u",
+						 ((PageHeader) page)->pd_lower, known_off);
+				undo_put_encoded(page, rec.data, rlen);
+			}
+			PageSetLSN(page, record->EndRecPtr);
+			MarkBufferDirty(buf);
+			break;
+		case BLK_RESTORED:
+			if (IHeapPageGetType(page) == IHEAP_PAGE_UNDO)
+				lpage = IHeapUndoPageGetHeader(page)->uph_lpage;
+			break;
+		case BLK_DONE:
+			if (known_entry >= 0 && data != NULL)
+			{
+				uint32		rlen = 0;
+				int			i;
+
+				for (i = 0; i <= known_entry && data < end; i++)
+				{
+					rlen = undo_wal_entry_rebuild(record, &data, end, delta,
+												  rec.data);
+					if (rlen == 0)
+						break;
+				}
+				if (i == known_entry + 1 && rlen > 0 &&
+					undo_page_holds(page, known_off, rec.data, rlen))
+					lpage = IHeapUndoPageGetHeader(page)->uph_lpage;
+			}
+			break;
+		case BLK_NOTFOUND:
+			break;
+	}
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+	return lpage;
 }
 
 void
