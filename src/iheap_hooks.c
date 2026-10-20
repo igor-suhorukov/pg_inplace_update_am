@@ -15,6 +15,8 @@
  *	  btree.  Execution goes through the index's own access method.  (The
  *	  copies of btree's families keep their names, which maps partitioned
  *	  indexes, for which plancat finds no sort families.)
+ *	- An object access hook drops the cumulative statistics of an iheap
+ *	  relation with the relation (iheap_stats.c).
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -27,6 +29,7 @@
 #include "access/tableam.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
@@ -77,6 +80,7 @@ static int	iheap_unique_index_am = IHEAP_INDEX_AM_BTREE;
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static build_simple_rel_hook_type prev_build_simple_rel = NULL;
+static object_access_hook_type prev_object_access = NULL;
 
 static bool
 default_table_am_is_iheap(void)
@@ -728,6 +732,21 @@ iheap_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	}
 }
 
+/* ------------------------------------------------------------------------
+ * The object access hook
+ * ------------------------------------------------------------------------
+ */
+static void
+iheap_object_access(ObjectAccessType access, Oid classId, Oid objectId,
+					int subId, void *arg)
+{
+	if (prev_object_access)
+		prev_object_access(access, classId, objectId, subId, arg);
+
+	if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
+		iheap_stat_relation_dropped(objectId);
+}
+
 void
 iheap_hooks_init(void)
 {
@@ -757,6 +776,8 @@ iheap_hooks_init(void)
 	ProcessUtility_hook = iheap_ProcessUtility;
 	prev_build_simple_rel = build_simple_rel_hook;
 	build_simple_rel_hook = iheap_build_simple_rel;
+	prev_object_access = object_access_hook;
+	object_access_hook = iheap_object_access;
 	CacheRegisterSyscacheCallback(AMOPSTRATEGY, family_inval_callback, (Datum) 0);
 	CacheRegisterSyscacheCallback(AMPROCNUM, family_inval_callback, (Datum) 0);
 }

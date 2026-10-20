@@ -72,11 +72,69 @@ RETURNS int8
 AS 'MODULE_PATHNAME', 'iheap_discard_undo'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
+-- Verification (DESIGN.md §15): one row per problem found.
+CREATE FUNCTION iheap_check(rel regclass, check_indexes boolean DEFAULT true,
+    OUT blkno int8,
+    OUT offnum int4,
+    OUT msg text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'iheap_check'
+LANGUAGE C STRICT PARALLEL RESTRICTED;
+
 REVOKE ALL ON FUNCTION iheap_metapage_info(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION iheap_page_items(regclass, int8) FROM PUBLIC;
 REVOKE ALL ON FUNCTION iheap_undo_page_records(regclass, int8) FROM PUBLIC;
 REVOKE ALL ON FUNCTION iheap_relation_stats(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION iheap_discard(regclass) FROM PUBLIC;
+REVOKE ALL ON FUNCTION iheap_check(regclass, boolean) FROM PUBLIC;
+
+-- Cumulative statistics (DESIGN.md §15), readable by everybody as core's
+-- are; resetting them takes a superuser.
+CREATE FUNCTION iheap_stat(rel regclass,
+    OUT inplace_updates int8,
+    OUT inplace_key_updates int8,
+    OUT moved_updates int8,
+    OUT moved_for_index int8,
+    OUT moved_for_trigger int8,
+    OUT moved_for_size int8,
+    OUT moved_for_setting int8,
+    OUT undo_records int8,
+    OUT undo_bytes int8,
+    OUT rollback_eager int8,
+    OUT rollback_lazy int8,
+    OUT rollback_discard int8,
+    OUT rollback_bytes int8,
+    OUT discarded_pages int8,
+    OUT discarded_bytes int8,
+    OUT undo_walks int8,
+    OUT undo_walk_steps int8,
+    OUT undo_walk_max int8,
+    OUT stats_reset timestamptz)
+AS 'MODULE_PATHNAME', 'iheap_stat'
+LANGUAGE C STRICT STABLE PARALLEL RESTRICTED;
+
+CREATE FUNCTION iheap_stat_reset(rel regclass)
+RETURNS void
+AS 'MODULE_PATHNAME', 'iheap_stat_reset'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION iheap_stat_reset()
+RETURNS void
+AS 'MODULE_PATHNAME', 'iheap_stat_reset_all'
+LANGUAGE C PARALLEL UNSAFE;
+
+REVOKE ALL ON FUNCTION iheap_stat_reset(regclass) FROM PUBLIC;
+REVOKE ALL ON FUNCTION iheap_stat_reset() FROM PUBLIC;
+
+CREATE VIEW iheap_stat_tables AS
+SELECT c.oid AS relid, n.nspname AS schemaname, c.relname, s.*
+FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     JOIN pg_am a ON a.oid = c.relam
+     CROSS JOIN LATERAL iheap_stat(c.oid) s
+WHERE a.amname = 'iheap' AND c.relkind IN ('r', 'm');
+
+GRANT SELECT ON iheap_stat_tables TO PUBLIC;
 
 -- dmbtree: B-tree with delete-marking, for in-place updates of the key
 -- columns of iheap tables (DESIGN.md §11.5).
@@ -198,3 +256,27 @@ AS 'MODULE_PATHNAME', 'dmbtree_index_stats'
 LANGUAGE C STRICT PARALLEL SAFE;
 
 REVOKE ALL ON FUNCTION dmbtree_index_stats(regclass) FROM PUBLIC;
+
+-- Verification: a port of amcheck's bt_index_check() and
+-- bt_index_parent_check() (DESIGN.md §11.5.8, §21 D34).  checkmarks also
+-- checks the entries against the rows: each points to a used line pointer,
+-- and an unmarked entry matches the newest committed version of its row.
+CREATE FUNCTION dmbtree_check(index regclass,
+    heapallindexed boolean DEFAULT false,
+    checkunique boolean DEFAULT false,
+    checkmarks boolean DEFAULT false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'dmbtree_check'
+LANGUAGE C STRICT PARALLEL RESTRICTED;
+
+CREATE FUNCTION dmbtree_parent_check(index regclass,
+    heapallindexed boolean DEFAULT false,
+    rootdescend boolean DEFAULT false,
+    checkunique boolean DEFAULT false,
+    checkmarks boolean DEFAULT false)
+RETURNS void
+AS 'MODULE_PATHNAME', 'dmbtree_parent_check'
+LANGUAGE C STRICT PARALLEL RESTRICTED;
+
+REVOKE ALL ON FUNCTION dmbtree_check(regclass, boolean, boolean, boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION dmbtree_parent_check(regclass, boolean, boolean, boolean, boolean) FROM PUBLIC;

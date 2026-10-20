@@ -61,6 +61,13 @@ $primary->safe_psql('postgres', 'VACUUM');
 
 $primary->wait_for_catchup($standby);
 
+# the structure checks, on both sides (the standby replays every page)
+for my $t (qw(ti tf tt tu))
+{
+	is(iheap_verify($primary, $t), '', "structure checks of $t on the primary");
+	is(iheap_verify($standby, $t), '', "structure checks of $t on the standby");
+}
+
 is(iheap_snapshot($standby, 'ti'), iheap_snapshot($primary, 'ti'),
 	'standby has the same data');
 is(iheap_snapshot($standby, 'ti'), iheap_snapshot($primary, 'th'),
@@ -106,6 +113,7 @@ VACUUM ti;
 });
 is($standby->safe_psql('postgres', 'SELECT count(*) FROM ti WHERE id = 999999'),
 	'0', 'writes after promotion');
+is(iheap_verify($standby, 'ti'), '', 'structure checks after promotion');
 
 # no consistency check failure ("inconsistent page found") in the log
 my $log = slurp_file($standby->logfile);

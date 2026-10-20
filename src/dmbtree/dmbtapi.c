@@ -2,8 +2,8 @@
  *
  * dmbtapi.c
  *	  dmbtree's side of dmbtree_api.h: what iheap calls when it updates a
- *	  key column in place (DESIGN.md §11.6), and the index property it
- *	  decides that by (§7.4).
+ *	  key column in place (DESIGN.md §11.6), the index property it decides
+ *	  that by (§7.4), and the reading of leaf pages iheap_check() does.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -169,4 +169,107 @@ dmbtree_index_stats(PG_FUNCTION_ARGS)
 	values[3] = Int64GetDatum(marked);
 	values[4] = Int64GetDatum(dead_items);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/* ------------------------------------------------------------------------
+ * For iheap_check(): the heap TIDs of leaf pages
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * The heap TIDs (unmarked) of a leaf page of a btree or dmbtree index,
+ * which have nbtree's page layout; -1 if the page is no leaf page in use.
+ * The page may be corrupt: nothing is read beyond what its own bounds allow,
+ * and malformed items are passed over (verifying the index is the index
+ * checkers' job).
+ */
+static int
+leaf_page_heap_tids(Page page, ItemPointerData *tids)
+{
+	BTPageOpaque opaque;
+	OffsetNumber maxoff;
+	Size		limit = BLCKSZ - MAXALIGN(sizeof(BTPageOpaqueData));
+	int			n = 0;
+
+	if (PageIsNew(page) ||
+		PageGetSpecialSize(page) != MAXALIGN(sizeof(BTPageOpaqueData)))
+		return -1;
+	opaque = BTPageGetOpaque(page);
+	if (!P_ISLEAF(opaque) || P_IGNORE(opaque) || P_ISMETA(opaque))
+		return -1;
+
+	maxoff = Min(PageGetMaxOffsetNumber(page), MaxIndexTuplesPerPage);
+	for (OffsetNumber off = P_FIRSTDATAKEY(opaque); off <= maxoff;
+		 off = OffsetNumberNext(off))
+	{
+		ItemId		iid = PageGetItemId(page, off);
+		IndexTuple	itup;
+
+		if (!ItemIdHasStorage(iid) ||
+			ItemIdGetLength(iid) < sizeof(IndexTupleData) ||
+			ItemIdGetOffset(iid) + ItemIdGetLength(iid) > limit)
+			continue;
+		itup = (IndexTuple) PageGetItem(page, iid);
+		if (IndexTupleSize(itup) > ItemIdGetLength(iid) ||
+			BTreeTupleIsPivot(itup))
+			continue;
+		if (BTreeTupleIsPosting(itup))
+		{
+			int			np = BTreeTupleGetNPosting(itup);
+
+			if (BTreeTupleGetPostingOffset(itup) + np * sizeof(ItemPointerData) >
+				IndexTupleSize(itup))
+				continue;
+			for (int i = 0; i < np && n < MaxTIDsPerBTreePage; i++)
+				tids[n++] = DmbtTidUnmarked(BTreeTupleGetPostingN(itup, i));
+		}
+		else if (n < MaxTIDsPerBTreePage)
+			tids[n++] = DmbtTidUnmarked(&itup->t_tid);
+	}
+	return n;
+}
+
+int
+dmbtree_max_leaf_tids(void)
+{
+	return MaxTIDsPerBTreePage;
+}
+
+int
+dmbtree_leaf_heap_tids(Relation index, BlockNumber blkno,
+					   BufferAccessStrategy strategy, ItemPointerData *tids)
+{
+	Buffer		buf;
+	int			n;
+
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, blkno, RBM_NORMAL, strategy);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	n = leaf_page_heap_tids(BufferGetPage(buf), tids);
+	UnlockReleaseBuffer(buf);
+	return n;
+}
+
+bool
+dmbtree_leaf_recheck(Relation index, BlockNumber blkno, ItemPointer tid,
+					 bool (*check) (void *arg), void *arg)
+{
+	ItemPointerData *tids = palloc(MaxTIDsPerBTreePage * sizeof(ItemPointerData));
+	Buffer		buf;
+	bool		result = true;
+	int			n;
+
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	n = leaf_page_heap_tids(BufferGetPage(buf), tids);
+	for (int i = 0; i < n; i++)
+	{
+		if (ItemPointerEquals(&tids[i], tid))
+		{
+			result = check(arg);
+			break;
+		}
+	}
+	UnlockReleaseBuffer(buf);
+	pfree(tids);
+	return result;
 }

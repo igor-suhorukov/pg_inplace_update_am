@@ -137,6 +137,20 @@ ih_set_hint(Buffer buffer, char *tup, TransactionId xid, uint16 flag)
 }
 
 /*
+ * Is a locker's xid still running?  As TransactionIdIsInProgress(), except
+ * for the aborting backend's own top-level xid during its eager rollback
+ * (see iheap_xid_status()): its locks go with its changes.
+ */
+bool
+iheap_xid_running(TransactionId xid)
+{
+	if (!IsTransactionState() && TransactionIdIsCurrentTransactionId(xid) &&
+		TransactionIdDidAbort(xid))
+		return false;
+	return TransactionIdIsInProgress(xid);
+}
+
+/*
  * Status of xid, using hint bits of "tup" (the on-page tuple whose t_xid
  * is xid, or NULL) and setting them when possible.
  */
@@ -160,7 +174,16 @@ iheap_xid_status(TransactionId xid, Buffer buffer, char *tup)
 	}
 
 	if (TransactionIdIsCurrentTransactionId(xid))
+	{
+		/*
+		 * The aborting backend's own change, which its eager rollback
+		 * (iheap_rollback.c) applies: the top-level xid stays "current"
+		 * until CleanupTransaction(), while clog has it aborted already.
+		 */
+		if (!IsTransactionState() && TransactionIdDidAbort(xid))
+			return IHX_ABORTED;
 		return IHX_CURRENT;
+	}
 
 	if (xid_cache_get(xid, &status))
 		return status;
@@ -403,6 +426,7 @@ iheap_resolve_version_ext(Relation rel, Buffer buffer, char *pagetup,
 	bool		from_undo = false;
 	UndoRecPtr	discard = iheap_discard_ptr(rel);
 	int			steps = 0;
+	int			rebuilt = 0;	/* older versions rebuilt from undo */
 	CommandId	cmin = InvalidCommandId;
 
 	ih_hdr_read(pagetup, &h);
@@ -638,11 +662,14 @@ iheap_resolve_version_ext(Relation rel, Buffer buffer, char *pagetup,
 		}
 		pfree(rec);
 		from_undo = true;
+		rebuilt++;
 		hinttup = NULL;
 		cmin = InvalidCommandId;
 	}
 
 found:
+	if (rebuilt > 0)
+		iheap_stat_count_walk(rel, rebuilt);
 	v->tuple = cur;
 	v->len = curlen;
 	v->mem = curmem;
@@ -672,6 +699,8 @@ found:
 	return true;
 
 invisible:
+	if (rebuilt > 0)
+		iheap_stat_count_walk(rel, rebuilt);
 	if (curmem)
 		pfree(curmem);
 	v->mem = NULL;

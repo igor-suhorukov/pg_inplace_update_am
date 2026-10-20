@@ -50,6 +50,8 @@ is($node->safe_psql('postgres', q{
 SET enable_seqscan = off; SET enable_bitmapscan = off;
 SELECT count(*) FROM ti WHERE k < -1000000}),
 	'0', 'key changes of the crashed transaction are not found by the index');
+is(iheap_verify($node, 'ti'), '',
+	'structure checks pass with the crashed transaction\'s changes left over');
 
 # the prepared transaction is still there and can commit
 $node->safe_psql('postgres', "COMMIT PREPARED 'p1'");
@@ -79,6 +81,7 @@ is($node->safe_psql('postgres', 'SELECT live_undo_pages FROM iheap_metapage_info
 is($node->safe_psql('postgres',
 	'SELECT live_items = frozen_items FROM iheap_relation_stats(\'ti\')'),
 	't', 'all rows frozen');
+is(iheap_verify($node, 'ti'), '', 'structure checks pass after VACUUM');
 
 # a second crash right after a VACUUM and more work
 iheap_workload($node, 8);
@@ -86,6 +89,7 @@ $node->stop('immediate');
 $node->start;
 is(iheap_snapshot($node, 'ti'), iheap_snapshot($node, 'th'),
 	'second crash recovery');
+is(iheap_verify($node, 'ti'), '', 'structure checks pass after the second crash');
 
 # unlogged tables come back empty but usable
 $node->safe_psql('postgres', q{
@@ -104,6 +108,7 @@ UPDATE tu SET v = v * 2;
 });
 is($node->safe_psql('postgres', 'SELECT sum(v) FROM tu'), '10100',
 	'unlogged table usable after crash');
+is(iheap_verify($node, 'tu'), '', 'structure checks pass on the unlogged table');
 
 $node->stop;
 done_testing();

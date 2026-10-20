@@ -146,6 +146,7 @@ iheap_rollback_tuple(Relation rel, Buffer buffer, OffsetNumber off)
 				MarkBufferDirty(buffer);
 				log_rollback(rel, buffer, off, XLIH_RB_KILL, 0, NULL, 0);
 				END_CRIT_SECTION();
+				iheap_stat_rollback_applied(rec->hdr.ur_len);
 				pfree(rec);
 				return true;
 
@@ -162,7 +163,7 @@ iheap_rollback_tuple(Relation rel, Buffer buffer, OffsetNumber off)
 					{
 						int			j;
 
-						if (!TransactionIdIsInProgress(lk[i].xid))
+						if (!iheap_xid_running(lk[i].xid))
 							continue;
 						for (j = 0; j < nkeep; j++)
 							if (TransactionIdEquals(keep[j].xid, lk[i].xid))
@@ -229,6 +230,7 @@ iheap_rollback_tuple(Relation rel, Buffer buffer, OffsetNumber off)
 				elog(ERROR, "iheap: unknown undo record type %u", rec->hdr.ur_type);
 		}
 
+		iheap_stat_rollback_applied(rec->hdr.ur_len);
 		pfree(rec);
 		changed = true;
 	}
@@ -276,6 +278,7 @@ iheap_rollback_page(Relation rel, Buffer buffer)
 typedef struct XactRelEnt
 {
 	RelFileLocator key;
+	Oid			relid;			/* for statistics */
 	char		persistence;
 	bool		needs_wal;
 	UndoRecPtr	last_urp;		/* latest record of this transaction */
@@ -313,6 +316,7 @@ xact_rel_entry(Relation rel, bool create)
 					  create ? HASH_ENTER : HASH_FIND, &found);
 	if (create && !found)
 	{
+		ent->relid = RelationGetRelid(rel);
 		ent->persistence = rel->rd_rel->relpersistence;
 		ent->needs_wal = RelationNeedsWAL(rel);
 		ent->last_urp = InvalidUndoRecPtr;
@@ -423,6 +427,7 @@ rollback_relation(XactRelEnt *ent, bool subxact)
 	ent->last_urp = subxact ? urp : InvalidUndoRecPtr;
 
 	iheap_fake_relation_close(rel);
+	iheap_stat_rollback_report(ent->relid, IHEAP_ROLLBACK_EAGER);
 }
 
 static void
@@ -502,6 +507,7 @@ rollback_all(bool subxact)
 							edata->message)));
 			FreeErrorData(edata);
 			MemoryContextReset(rollback_cxt);
+			iheap_stat_rollback_forget();
 		}
 		PG_END_TRY();
 		/* a standalone owner (no parent) is released as a top-level one */
@@ -534,6 +540,9 @@ xact_cleanup(void)
 static void
 iheap_xact_callback(XactEvent event, void *arg)
 {
+	/* rollback statistics an error left unreported */
+	iheap_stat_rollback_forget();
+
 	switch (event)
 	{
 		case XACT_EVENT_ABORT:

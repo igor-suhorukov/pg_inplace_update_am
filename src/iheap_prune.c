@@ -78,6 +78,32 @@ ih_place_start(int upper, const char *tuple, uint32 len)
 }
 
 /*
+ * Is page offset "start" a place for "tuple"?  A tuple holding values that
+ * need alignment (IHT_ALIGNDATA) needs its data area MAXALIGNed there; the
+ * others can be anywhere, their fields being read with memcpy.
+ */
+bool
+iheap_tuple_aligned_at(const char *tuple, uint32 start)
+{
+	return !ih_tuple_needs_align(tuple) ||
+		(start + ih_hdr_hoff(tuple)) % MAXIMUM_ALIGNOF == 0;
+}
+
+/*
+ * Does every place aligned for "tuple" suit "other" too?  A rollback puts
+ * the version an in-place update replaced (other) back where the new one
+ * (tuple) went.
+ */
+bool
+iheap_tuple_alignment_covers(const char *tuple, const char *other)
+{
+	if (!ih_tuple_needs_align(other))
+		return true;
+	return ih_tuple_needs_align(tuple) &&
+		ih_hdr_hoff(tuple) % MAXIMUM_ALIGNOF == ih_hdr_hoff(other) % MAXIMUM_ALIGNOF;
+}
+
+/*
  * Add a tuple to the page.  "want" is the offset number to use (redo), or
  * InvalidOffsetNumber to pick one.  Returns InvalidOffsetNumber if it does
  * not fit.
@@ -378,6 +404,7 @@ iheap_page_prune(Relation rel, Buffer buffer, bool force,
 
 	/* first, apply undo of aborted transactions */
 	(void) iheap_rollback_page(rel, buffer);
+	iheap_stat_rollback_report(RelationGetRelid(rel), IHEAP_ROLLBACK_LAZY);
 
 	discard = iheap_discard_ptr(rel);
 	maxoff = PageGetMaxOffsetNumber(page);

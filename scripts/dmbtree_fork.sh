@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Mechanical part of the dmbtree fork (DESIGN.md §21 D21): copy PostgreSQL's
-# nbtree sources and rename what would clash with the server's own nbtree.
+# Mechanical part of the dmbtree fork (DESIGN.md §21 D30): copy PostgreSQL's
+# nbtree sources, and amcheck's B-tree verification (§21 D34), and rename what
+# would clash with the server's own nbtree and with amcheck.
 #
 #   scripts/dmbtree_fork.sh <postgres-source-root> <output-dir>
 #
@@ -40,6 +41,10 @@ copy() {
 		-e 's|"access/nbtxlog\.h"|"dmbtxlog.h"|' \
 		-e 's/\bNBTREE_H\b/DMBTREE_H/g' \
 		-e 's/\bNBTXLOG_H\b/DMBTXLOG_H/g' \
+		-e 's/\bbt_index_check\b/dmbtree_check/g' \
+		-e 's/\bbt_index_parent_check\b/dmbtree_parent_check/g' \
+		-e 's/\bamcheck_lock_relation_and_check\b/dmbt_amcheck_lock_relation_and_check/g' \
+		-e 's|"verify_common\.h"|"dmbtverify_common.h"|' \
 		"$1" >"$out/$2"
 }
 
@@ -50,3 +55,6 @@ done
 copy "$src/src/backend/access/rmgrdesc/nbtdesc.c" dmbtdesc.c
 copy "$src/src/include/access/nbtree.h" dmbtree.h
 copy "$src/src/include/access/nbtxlog.h" dmbtxlog.h
+copy "$src/contrib/amcheck/verify_nbtree.c" dmbtverify.c
+copy "$src/contrib/amcheck/verify_common.c" dmbtverify_common.c
+copy "$src/contrib/amcheck/verify_common.h" dmbtverify_common.h

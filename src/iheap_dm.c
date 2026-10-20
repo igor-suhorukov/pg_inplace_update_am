@@ -19,8 +19,9 @@
  *	- the index maintenance after an in-place update;
  *	- the key check (iheap_dm_matches), used by index fetches (iheap_scan.c)
  *	  and by the functions dmbtree calls (dmbtree_api.h): the check for
- *	  index-only scans, the probe for uniqueness checks, and the fate of
- *	  marked entries for cleanup.
+ *	  index-only scans, the probe for uniqueness checks, the fate of marked
+ *	  entries for cleanup, and the check of entries against their rows for
+ *	  dmbtree_check().
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -718,4 +719,218 @@ iheap_dm_check_entries(Relation rel, Relation index, DmbtEntryCheck *entries,
 	MemoryContextDelete(cxt);
 
 	return horizon;
+}
+
+/* ------------------------------------------------------------------------
+ * Checking entries against their rows (dmbtree_check)
+ * ------------------------------------------------------------------------
+ */
+
+static int
+dm_verify_cmp(const void *a, const void *b)
+{
+	const DmbtEntryVerify *ea = (const DmbtEntryVerify *) a;
+	const DmbtEntryVerify *eb = (const DmbtEntryVerify *) b;
+
+	return ItemPointerCompare(&ea->tid, &eb->tid);
+}
+
+/*
+ * Does the newest committed version of the row at "off" of the locked page
+ * buf have the key of the unmarked entry dm?  Returns 1 or 0; -1 when there
+ * is nothing to compare: no committed version (an insert that is still
+ * running or was rolled back), or a deletion or move (the row's entries
+ * wait for VACUUM), or a walk that cannot tell.  Returns -2 when the
+ * version's key is stored out of line: *copy (and *copymem) are then set to
+ * a copy of the version, to compare with the page unlocked.
+ *
+ * Versions of running transactions, ours included, and of aborted ones are
+ * passed over, as in dm_entry_status(), which this follows.
+ */
+static int
+dm_verify_unmarked(Relation rel, Buffer buf, OffsetNumber off,
+				   const IHeapDmEntry *dm, char **copy, char **copymem)
+{
+	Page		page = BufferGetPage(buf);
+	UndoRecPtr	discard = iheap_discard_ptr(rel);
+	ItemId		lp = PageGetItemId(page, off);
+	char	   *cur = (char *) page + ItemIdGetOffset(lp);
+	uint32		curlen = ItemIdGetLength(lp);
+	char	   *mem = NULL;
+	bool		onpage = true;
+	int			steps = 0;
+	int			match;
+	IHeapHdr	h;
+
+	ih_hdr_read(cur, &h);
+	for (;;)
+	{
+		IHeapUndoRec *rec;
+		IHeapXidStatus st;
+		char	   *newmem;
+
+		if (++steps > 100000)
+			return -1;
+		if (h.urec < discard)
+			break;				/* frozen: committed */
+
+		/* a LOCK record in front of the version is transparent */
+		if (h.infomask & IHT_LOCKED)
+		{
+			rec = iheap_undo_fetch(rel, h.urec, true);
+			if (rec == NULL)
+				break;			/* discarded under us: committed */
+			if (rec->hdr.ur_type == IHU_LOCK)
+			{
+				IHeapHdr	ph;
+
+				ih_hdr_read(rec->hdr.ur_prev_hdr, &ph);
+				h.infomask = ph.infomask | (h.infomask & (IHT_XID_HINTS | IHT_STUB));
+				h.urec = ph.urec;
+				h.xid = ph.xid;
+				pfree(rec);
+				continue;
+			}
+			pfree(rec);
+		}
+
+		st = iheap_xid_status(h.xid, InvalidBuffer, NULL);
+		if (st == IHX_COMMITTED)
+			break;
+
+		/* running, ours or aborted: the version before it */
+		rec = iheap_undo_fetch(rel, h.urec, true);
+		if (rec == NULL)
+		{
+			/* discarded under us: committed, unless it is aborted */
+			if (st == IHX_ABORTED)
+				return -1;
+			break;
+		}
+		if (!iheap_rebuild_prior(rel, &cur, &curlen, &h, rec, &newmem))
+		{
+			pfree(rec);
+			return -1;			/* the insert: nothing committed before it */
+		}
+		pfree(rec);
+		if (mem)
+			pfree(mem);
+		mem = newmem;
+		onpage = false;
+	}
+
+	if (h.infomask & (IHT_DELETED | IHT_MOVED))
+		return -1;
+
+	match = iheap_dm_matches(rel, dm, cur, false);
+	if (match >= 0)
+		return match;
+
+	if (onpage)
+		*copy = ih_copy_tuple_aligned(CurrentMemoryContext, cur, curlen, copymem);
+	else
+	{
+		*copy = cur;
+		*copymem = mem;
+	}
+	return -2;
+}
+
+/*
+ * dmbtree_check(checkmarks): check entries of a leaf page against their
+ * rows.  Every entry must point to a used line pointer of a data page:
+ * line pointers become unused only after index vacuum removed the entries
+ * pointing at them (§10.5), and index vacuum needs the leaf page, which the
+ * caller holds share-locked.  An unmarked entry must match the newest
+ * committed version of its row (§11.5.4).  With the leaf page locked, no
+ * entry of the rows can be added or marked meanwhile: a writer changes a row
+ * first, a version not committed yet that this check passes over, and the
+ * index after.
+ *
+ * A key stored out of line is compared after the table page is unlocked
+ * (TOAST access takes locks and may read), from a copy of the version: the
+ * newest committed version's TOAST data stays while the leaf page is locked.
+ */
+void
+iheap_dm_verify_entries(Relation rel, Relation index, DmbtEntryVerify *entries,
+						int nentries)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	Buffer		buf = InvalidBuffer;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	DmbtEntryVerify **later;
+	char	  **latercopy;
+	int			nlater = 0;
+
+	qsort(entries, nentries, sizeof(DmbtEntryVerify), dm_verify_cmp);
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "iheap dmbtree verify",
+								ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+	later = palloc(Max(nentries, 1) * sizeof(DmbtEntryVerify *));
+	latercopy = palloc(Max(nentries, 1) * sizeof(char *));
+
+	for (int i = 0; i < nentries; i++)
+	{
+		DmbtEntryVerify *e = &entries[i];
+		BlockNumber blk = ItemPointerGetBlockNumber(&e->tid);
+		OffsetNumber off = ItemPointerGetOffsetNumber(&e->tid);
+		IHeapDmEntry dm = {index, e->itup, false, true};
+		Page		page;
+		ItemId		lp;
+		char	   *copy;
+		char	   *copymem = NULL;
+		int			match;
+
+		e->result = DMBT_VERIFY_OK;
+		if (blk >= nblocks)
+		{
+			e->result = DMBT_VERIFY_NO_ROWS;
+			continue;
+		}
+		if (!BufferIsValid(buf) || BufferGetBlockNumber(buf) != blk)
+		{
+			if (BufferIsValid(buf))
+				UnlockReleaseBuffer(buf);
+			buf = ReadBufferExtended(rel, MAIN_FORKNUM, blk, RBM_NORMAL, NULL);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+		}
+		page = BufferGetPage(buf);
+		if (!IHeapPageIsData(page))
+		{
+			e->result = DMBT_VERIFY_NO_ROWS;
+			continue;
+		}
+		if (off < FirstOffsetNumber || off > PageGetMaxOffsetNumber(page) ||
+			!ItemIdIsUsed(lp = PageGetItemId(page, off)))
+		{
+			e->result = DMBT_VERIFY_UNUSED;
+			continue;
+		}
+		if (e->marked || !ItemIdIsNormal(lp))
+			continue;			/* LP_DEAD: waiting for index vacuum */
+
+		match = dm_verify_unmarked(rel, buf, off, &dm, &copy, &copymem);
+		if (match == 0)
+			e->result = DMBT_VERIFY_KEY;
+		else if (match == -2)
+		{
+			later[nlater] = e;
+			latercopy[nlater++] = copy;
+		}
+	}
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+
+	for (int i = 0; i < nlater; i++)
+	{
+		IHeapDmEntry dm = {index, later[i]->itup, false, true};
+
+		if (iheap_dm_matches(rel, &dm, latercopy[i], true) == 0)
+			later[i]->result = DMBT_VERIFY_KEY;
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
 }

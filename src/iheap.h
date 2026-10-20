@@ -35,6 +35,7 @@
 #include "storage/buf.h"
 #include "storage/bufpage.h"
 #include "storage/itemptr.h"
+#include "storage/lockdefs.h"
 #include "storage/read_stream.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
@@ -613,6 +614,7 @@ typedef struct IHeapUndoWalEnt
 
 typedef struct IHeapUndoReservation
 {
+	Relation	rel;			/* whose undo, for statistics */
 	Buffer		buffer;			/* locked undo page */
 	uint64		lpage;
 	bool		init;			/* page initialized by this operation */
@@ -662,6 +664,7 @@ typedef enum IHeapXidStatus
 extern IHeapXidStatus iheap_xid_status(TransactionId xid, Buffer buffer,
 									   char *tuple_on_page);
 extern bool iheap_xid_aborted(TransactionId xid);
+extern bool iheap_xid_running(TransactionId xid);
 extern bool iheap_fetch_version(Relation rel, Buffer buffer, Page page,
 								OffsetNumber off, Snapshot snapshot,
 								IHeapVersion *v);
@@ -752,6 +755,8 @@ extern bool iheap_page_place_item_ext(Page page, OffsetNumber off,
 									  const char *tuple, uint32 len,
 									  uint32 capacity);
 extern uint32 iheap_item_reservation(Relation rel, Page page, OffsetNumber off);
+extern bool iheap_tuple_aligned_at(const char *tuple, uint32 start);
+extern bool iheap_tuple_alignment_covers(const char *tuple, const char *other);
 
 /* iheap_xlog.c */
 #define RM_IHEAP_ID		RM_EXPERIMENTAL_ID
@@ -846,6 +851,43 @@ extern void iheap_dm_update_indexes(Relation rel, ItemPointer tid,
 									const bool *newisnull);
 extern int	iheap_dm_matches(Relation rel, const IHeapDmEntry *dm,
 							 const char *tuple, bool allow_external);
+
+/* iheap_stats.c */
+typedef enum IHeapMoveReason
+{
+	IHEAP_MOVE_NONE = 0,		/* updated in place */
+	IHEAP_MOVE_INDEX,			/* a changed column is in an index that cannot
+								 * take in-place updates (rule b) */
+	IHEAP_MOVE_TRIGGER,			/* a trigger needs the old row by TID (rule 3) */
+	IHEAP_MOVE_SIZE,			/* the new version did not fit on the page */
+	IHEAP_MOVE_SETTING,			/* iheap.enable_inplace is off */
+} IHeapMoveReason;
+
+#define IHEAP_MOVE_NREASONS		(IHEAP_MOVE_SETTING + 1)
+
+typedef enum IHeapRollbackKind
+{
+	IHEAP_ROLLBACK_EAGER,		/* by the aborting backend */
+	IHEAP_ROLLBACK_LAZY,		/* by a later writer, or pruning */
+	IHEAP_ROLLBACK_DISCARD,		/* by discard's verification */
+} IHeapRollbackKind;
+
+#define IHEAP_ROLLBACK_NKINDS	(IHEAP_ROLLBACK_DISCARD + 1)
+
+extern void iheap_stats_init(void);
+extern void iheap_stat_count_update(Relation rel, IHeapMoveReason reason,
+									bool keys);
+extern void iheap_stat_count_undo(Relation rel, int nrecords, uint64 nbytes);
+extern void iheap_stat_count_walk(Relation rel, int steps);
+extern void iheap_stat_count_discard(Relation rel, int64 pages, int64 bytes);
+extern void iheap_stat_rollback_applied(uint32 len);
+extern void iheap_stat_rollback_report(Oid relid, IHeapRollbackKind kind);
+extern void iheap_stat_rollback_forget(void);
+extern void iheap_stat_relation_created(Oid relid);
+extern void iheap_stat_relation_dropped(Oid relid);
+
+/* iheap_funcs.c */
+extern Relation iheap_open_relation(Oid relid, LOCKMODE lockmode);
 
 /* iheap_toast.c */
 typedef struct IHeapToastState

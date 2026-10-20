@@ -7,6 +7,7 @@
 MODULE_big = pg_inplace_update_am
 OBJS = \
 	$(WIN32RES) \
+	src/iheap_check.o \
 	src/iheap_discard.o \
 	src/iheap_dm.o \
 	src/iheap_dml.o \
@@ -20,6 +21,7 @@ OBJS = \
 	src/iheap_rollback.o \
 	src/iheap_scan.o \
 	src/iheap_slot.o \
+	src/iheap_stats.o \
 	src/iheap_toast.o \
 	src/iheap_tuple.o \
 	src/iheap_undo.o \
@@ -39,6 +41,8 @@ OBJS = \
 	src/dmbtree/dmbtsplitloc.o \
 	src/dmbtree/dmbtutils.o \
 	src/dmbtree/dmbtvalidate.o \
+	src/dmbtree/dmbtverify.o \
+	src/dmbtree/dmbtverify_common.o \
 	src/dmbtree/dmbtxlog.o
 
 EXTENSION = pg_inplace_update_am

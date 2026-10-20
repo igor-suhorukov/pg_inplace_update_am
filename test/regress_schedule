@@ -5,3 +5,5 @@ iheap_dmbtree
 iheap_toast
 iheap_ddl
 iheap_bloat
+iheap_stats
+iheap_check

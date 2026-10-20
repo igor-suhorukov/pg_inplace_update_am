@@ -103,6 +103,10 @@ iheap_relation_set_new_filelocator(Relation rel,
 
 	srel = RelationCreateStorage(*newrlocator, persistence, true);
 
+	/* a new relation: its statistics go if its creation rolls back */
+	if (rel->rd_createSubid == GetCurrentSubTransactionId())
+		iheap_stat_relation_created(RelationGetRelid(rel));
+
 	/*
 	 * A permanent relation's new storage is WAL-logged unless wal_level is
 	 * minimal, in which case RelationCreateStorage() arranged a sync at
@@ -457,6 +461,8 @@ _PG_init(void)
 	iheap_hooks_init();
 
 	MarkGUCPrefixReserved("iheap");
+
+	iheap_stats_init();
 
 	iheap_rmgr_register();
 	dmbtree_rmgr_register();

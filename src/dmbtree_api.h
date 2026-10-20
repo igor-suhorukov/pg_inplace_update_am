@@ -17,6 +17,7 @@
 
 #include "access/itup.h"
 #include "access/relscan.h"
+#include "storage/buf.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 
@@ -117,5 +118,58 @@ extern TransactionId iheap_dm_check_entries(Relation heaprel, Relation index,
  * until it moves past them.
  */
 extern TransactionId iheap_dm_horizon(Relation heaprel);
+
+/* what dmbtree_check(checkmarks) finds out about an entry */
+typedef enum DmbtVerifyResult
+{
+	DMBT_VERIFY_OK = 0,
+	DMBT_VERIFY_NO_ROWS,		/* its block holds no rows */
+	DMBT_VERIFY_UNUSED,			/* its line pointer is not in use */
+	DMBT_VERIFY_KEY,			/* unmarked, and the newest committed version
+								 * of its row has another key */
+} DmbtVerifyResult;
+
+typedef struct DmbtEntryVerify
+{
+	ItemPointerData tid;		/* row (unmarked TID) */
+	IndexTuple	itup;			/* the entry, for its key */
+	bool		marked;
+	OffsetNumber offnum;		/* caller's: where the entry is */
+	DmbtVerifyResult result;	/* result */
+} DmbtEntryVerify;
+
+/*
+ * dmbtree_check(checkmarks): check the entries of a leaf page, which the
+ * caller holds share-locked, against their rows (DESIGN.md §11.5.4, §21
+ * D34).  entries[] is sorted by TID here.
+ */
+extern void iheap_dm_verify_entries(Relation heaprel, Relation index,
+									DmbtEntryVerify *entries, int nentries);
+
+/* ------------------------------------------------------------------------
+ * dmbtree, for iheap_check()
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * The heap TIDs (unmarked) of the entries of leaf page blkno of a btree or
+ * dmbtree index, which have nbtree's page layout.  Returns how many were
+ * written to tids[] (room for MaxTIDsPerBTreePage), or -1 when the block is
+ * not a leaf page in use.  Only what the page's own bounds allow is read.
+ * dmbtree_max_leaf_tids() is the room a leaf page can need.
+ */
+extern int	dmbtree_max_leaf_tids(void);
+extern int	dmbtree_leaf_heap_tids(Relation index, BlockNumber blkno,
+								   BufferAccessStrategy strategy,
+								   ItemPointerData *tids);
+
+/*
+ * Is tid still the heap TID of an entry of leaf page blkno?  If so, calls
+ * check(arg) with the page share-locked, so that index vacuum cannot remove
+ * the entry meanwhile, and returns its result; returns true otherwise.
+ */
+extern bool dmbtree_leaf_recheck(Relation index, BlockNumber blkno,
+								 ItemPointer tid,
+								 bool (*check) (void *arg), void *arg);
 
 #endif							/* DMBTREE_API_H */

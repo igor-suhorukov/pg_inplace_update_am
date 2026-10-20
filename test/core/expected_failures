@@ -39,7 +39,6 @@ regress/insert_conflict    plan (seq scan instead of an index-only scan in a sub
 regress/join               plan (incl. Memoize cache mode), order
 regress/partition_aggregate plan
 regress/partition_join     plan
-regress/partition_prune    plan
 regress/predicate          plan
 regress/select_views       plan, order
 regress/subselect          plan

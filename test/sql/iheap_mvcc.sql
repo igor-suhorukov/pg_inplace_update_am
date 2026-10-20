@@ -119,6 +119,23 @@ PREPARE TRANSACTION 'im2';
 COMMIT PREPARED 'im2';
 SELECT id, v FROM im WHERE id = 20;
 
+-- the abort undoes the transaction's changes, so an index built next finds
+-- no aborted version and is usable at once; a change left to lazy rollback
+-- makes the build mark the index indcheckxmin (as heap's broken HOT chains do)
+CREATE TABLE ia (id int, s text) USING iheap;
+INSERT INTO ia VALUES (1, 'a');
+CREATE VIEW ia_v AS SELECT * FROM ia WHERE s <> 'z' WITH CHECK OPTION;
+UPDATE ia_v SET s = 'z';                    -- in place, then fails the check
+CREATE INDEX ia_eager ON ia USING btree (id);
+SET iheap.foreground_undo_limit = 0;
+UPDATE ia_v SET s = 'z';
+RESET iheap.foreground_undo_limit;
+CREATE INDEX ia_lazy ON ia USING btree (id);
+SELECT indexrelid::regclass, indcheckxmin FROM pg_index
+WHERE indrelid = 'ia'::regclass ORDER BY indexrelid;
+DROP VIEW ia_v;
+DROP TABLE ia;
+
 -- the abort callback leaves big transactions to lazy rollback
 SET iheap.foreground_undo_limit = 0;
 BEGIN;

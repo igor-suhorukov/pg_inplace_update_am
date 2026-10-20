@@ -360,6 +360,32 @@ SELECT id, v FROM im WHERE id = 20;
  20 | 2021
 (1 row)
 
+-- the abort undoes the transaction's changes, so an index built next finds
+-- no aborted version and is usable at once; a change left to lazy rollback
+-- makes the build mark the index indcheckxmin (as heap's broken HOT chains do)
+CREATE TABLE ia (id int, s text) USING iheap;
+INSERT INTO ia VALUES (1, 'a');
+CREATE VIEW ia_v AS SELECT * FROM ia WHERE s <> 'z' WITH CHECK OPTION;
+UPDATE ia_v SET s = 'z';                    -- in place, then fails the check
+ERROR:  new row violates check option for view "ia_v"
+DETAIL:  Failing row contains (1, z).
+CREATE INDEX ia_eager ON ia USING btree (id);
+SET iheap.foreground_undo_limit = 0;
+UPDATE ia_v SET s = 'z';
+ERROR:  new row violates check option for view "ia_v"
+DETAIL:  Failing row contains (1, z).
+RESET iheap.foreground_undo_limit;
+CREATE INDEX ia_lazy ON ia USING btree (id);
+SELECT indexrelid::regclass, indcheckxmin FROM pg_index
+WHERE indrelid = 'ia'::regclass ORDER BY indexrelid;
+ indexrelid | indcheckxmin 
+------------+--------------
+ ia_eager   | f
+ ia_lazy    | t
+(2 rows)
+
+DROP VIEW ia_v;
+DROP TABLE ia;
 -- the abort callback leaves big transactions to lazy rollback
 SET iheap.foreground_undo_limit = 0;
 BEGIN;

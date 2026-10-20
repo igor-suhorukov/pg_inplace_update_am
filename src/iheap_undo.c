@@ -338,6 +338,7 @@ iheap_undo_reserve(Relation rel, Size len, IHeapUndoReservation *res)
 		elog(ERROR, "iheap: undo record of %zu bytes is too large", len);
 
 	ent = undo_append_entry(rel);
+	res->rel = rel;
 	res->init = false;
 	res->nwal = 0;
 
@@ -561,12 +562,23 @@ iheap_undo_set_lsn(IHeapUndoReservation *res, XLogRecPtr lsn)
 	PageSetLSN(BufferGetPage(res->buffer), lsn);
 }
 
+/* release the undo page; the records written are counted now */
 void
 iheap_undo_release(IHeapUndoReservation *res)
 {
 	if (BufferIsValid(res->buffer))
 		UnlockReleaseBuffer(res->buffer);
 	res->buffer = InvalidBuffer;
+
+	if (res->nwal > 0 && res->rel != NULL)
+	{
+		uint64		bytes = 0;
+
+		for (int i = 0; i < res->nwal; i++)
+			bytes += res->wal[i].len;
+		iheap_stat_count_undo(res->rel, res->nwal, bytes);
+		res->nwal = 0;
+	}
 }
 
 /*

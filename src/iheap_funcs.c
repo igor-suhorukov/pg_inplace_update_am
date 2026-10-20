@@ -30,10 +30,11 @@ PG_FUNCTION_INFO_V1(iheap_undo_page_records);
 PG_FUNCTION_INFO_V1(iheap_relation_stats);
 PG_FUNCTION_INFO_V1(iheap_discard_undo);
 
-static Relation
-open_iheap_rel(Oid relid)
+/* open relid with lockmode, insisting that it is an iheap relation */
+Relation
+iheap_open_relation(Oid relid, LOCKMODE lockmode)
 {
-	Relation	rel = relation_open(relid, AccessShareLock);
+	Relation	rel = relation_open(relid, lockmode);
 
 	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind) ||
 		rel->rd_tableam == NULL ||
@@ -88,7 +89,7 @@ Datum
 iheap_metapage_info(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = open_iheap_rel(relid);
+	Relation	rel = iheap_open_relation(relid, AccessShareLock);
 	PGIOAlignedBlock page;
 	IHeapMetaPageData *meta;
 	TupleDesc	tupdesc;
@@ -180,7 +181,7 @@ iheap_page_items(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid block number " INT64_FORMAT, blkno)));
 
-	rel = open_iheap_rel(relid);
+	rel = iheap_open_relation(relid, AccessShareLock);
 	read_page_copy(rel, (BlockNumber) blkno, page.data);
 	discard = iheap_discard_ptr(rel);
 
@@ -273,7 +274,7 @@ iheap_undo_page_records(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid block number " INT64_FORMAT, blkno)));
 
-	rel = open_iheap_rel(relid);
+	rel = iheap_open_relation(relid, AccessShareLock);
 	read_page_copy(rel, (BlockNumber) blkno, page.data);
 
 	if (IHeapPageGetType(page.data) != IHEAP_PAGE_UNDO)
@@ -330,7 +331,7 @@ Datum
 iheap_relation_stats(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	Relation	rel = open_iheap_rel(relid);
+	Relation	rel = iheap_open_relation(relid, AccessShareLock);
 	TupleDesc	tupdesc;
 	BlockNumber nblocks;
 	int64		data_pages = 0,

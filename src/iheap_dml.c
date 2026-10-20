@@ -989,6 +989,7 @@ ih_check_modify_ext(Relation rel, Buffer buf, OffsetNumber off, CommandId cid,
 		if (!iheap_rollback_tuple(rel, buf, off))
 			elog(ERROR, "iheap: could not roll back aborted version of (%u,%u) in relation \"%s\"",
 				 BufferGetBlockNumber(buf), off, RelationGetRelationName(rel));
+		iheap_stat_rollback_report(RelationGetRelid(rel), IHEAP_ROLLBACK_LAZY);
 	}
 
 	if (c->h.infomask & (IHT_DELETED | IHT_MOVED))
@@ -1504,7 +1505,7 @@ iheap_relock_after_rollback(Relation rel, Buffer buf, OffsetNumber off,
 			int			m = iheap_undo_lockers(rec, lk);
 
 			for (int i = 0; i < m; i++)
-				if (TransactionIdIsInProgress(lk[i].xid))
+				if (iheap_xid_running(lk[i].xid))
 					all[n++] = lk[i];
 			pfree(rec);
 		}
@@ -1514,7 +1515,7 @@ iheap_relock_after_rollback(Relation rel, Buffer buf, OffsetNumber off,
 	{
 		int			j;
 
-		if (!TransactionIdIsInProgress(keep[i].xid))
+		if (!iheap_xid_running(keep[i].xid))
 			continue;
 		for (j = 0; j < n; j++)
 		{
@@ -1913,6 +1914,7 @@ typedef struct IHUpdatePlan
 	Bitmapset  *modified;
 	bool		key_changed;
 	bool		inplace;
+	IHeapMoveReason move_reason;	/* why not in place, if not */
 	bool		summarized;
 	bool		dm_changed;		/* a dmbtree index's key changes (§11.6) */
 	bool		valid;
@@ -1979,9 +1981,15 @@ ih_plan_update(Relation rel, Buffer buf, OffsetNumber off,
 	p->modified = ih_modified_attrs(desc, p->oldvalues, p->oldisnull, newv, newn);
 	p->key_changed = bms_overlap(p->modified, key_attrs);
 	p->summarized = bms_overlap(p->modified, sum_attrs);
-	p->inplace = iheap_enable_inplace &&
-		!bms_overlap(p->modified, dm->blocking) &&
-		!ih_triggers_block_inplace(rel, desc, p->oldtup, p->oldlen, newslot);
+	if (!iheap_enable_inplace)
+		p->move_reason = IHEAP_MOVE_SETTING;
+	else if (bms_overlap(p->modified, dm->blocking))
+		p->move_reason = IHEAP_MOVE_INDEX;
+	else if (ih_triggers_block_inplace(rel, desc, p->oldtup, p->oldlen, newslot))
+		p->move_reason = IHEAP_MOVE_TRIGGER;
+	else
+		p->move_reason = IHEAP_MOVE_NONE;
+	p->inplace = (p->move_reason == IHEAP_MOVE_NONE);
 	p->dm_changed = p->inplace && bms_overlap(p->modified, dm->dmattrs);
 	p->valid = true;
 
@@ -2134,21 +2142,33 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 	lp = PageGetItemId(page, off);
 	curlen = ItemIdGetLength(lp);
 
-	/* growing in place needs free space for the larger storage */
-	if (inplace && newlen > curlen)
+	/*
+	 * The new version is written over the old one, unless it is larger or
+	 * its data area would not be aligned there (gaining or losing its null
+	 * bitmap changes its header length): then it goes to the page's free
+	 * space, with room for the old version, which a rollback puts back in
+	 * its place.  That place must suit the old version's alignment too; when
+	 * no place can suit both, the row moves.
+	 */
+	if (inplace &&
+		(newlen > curlen ||
+		 !iheap_tuple_aligned_at(newtup, ItemIdGetOffset(lp))))
 	{
-		uint32		cap = Max(newlen, iheap_item_reservation(rel, page, off));
+		uint32		cap = Max(Max(newlen, curlen),
+							  iheap_item_reservation(rel, page, off));
 		PageHeader	ph = (PageHeader) page;
 
-		if ((int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
+		if (!iheap_tuple_alignment_covers(newtup, (char *) page + ItemIdGetOffset(lp)))
+			inplace = false;
+		else if ((int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
 		{
 			(void) iheap_page_prune(rel, buf, true, NULL, NULL);
 			lp = PageGetItemId(page, off);
 			curlen = ItemIdGetLength(lp);
-			cap = Max(newlen, iheap_item_reservation(rel, page, off));
+			cap = Max(Max(newlen, curlen), iheap_item_reservation(rel, page, off));
+			if ((int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
+				inplace = false;
 		}
-		if ((int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
-			inplace = false;
 	}
 
 	if (inplace)
@@ -2198,9 +2218,11 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		memcpy(uh.ur_prev_hdr, tup, IHEAP_TUPHDR_SIZE);
 
 		/* before reserving undo: this reads undo, maybe our own page */
-		relocated = newlen > curlen;
+		relocated = newlen > curlen ||
+			!iheap_tuple_aligned_at(newtup, ItemIdGetOffset(lp));
 		if (relocated)
-			capacity = Max(newlen, iheap_item_reservation(rel, page, off));
+			capacity = Max(Max(newlen, curlen),
+						   iheap_item_reservation(rel, page, off));
 
 		memset(&res, 0, sizeof(res));
 		iheap_undo_reserve(rel, IHEAP_UNDOREC_HDRSZ + payload_len, &res);
@@ -2492,6 +2514,11 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		iheap_dm_update_indexes(rel, otid, plan.modified,
 								plan.oldvalues, plan.oldisnull,
 								newvalues, newisnull);
+
+	iheap_stat_count_update(rel,
+							inplace ? IHEAP_MOVE_NONE :
+							plan.inplace ? IHEAP_MOVE_SIZE : plan.move_reason,
+							inplace && plan.dm_changed);
 
 	if (ts)
 	{

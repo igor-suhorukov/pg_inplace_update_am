@@ -59,6 +59,9 @@ ROLLBACK;
 },
 		'004_check' => q{
 SELECT check_total();
+},
+		'010_verify' => q{
+SELECT iheap_verify_strict('acct');
 }
 	});
 
@@ -110,6 +113,9 @@ COMMIT;
 },
 		'007_vacuum' => q{
 VACUUM acct;
+},
+		'011_verify' => q{
+SELECT iheap_verify_strict('acct');
 }
 	});
 
@@ -157,6 +163,9 @@ BEGIN;
 UPDATE codes SET code = -code WHERE id = :a;
 UPDATE codes SET code = -code WHERE id = :a;
 COMMIT;
+},
+		'012_verify' => q{
+SELECT iheap_verify_strict('codes');
 }
 	});
 is($node->safe_psql('postgres', 'SELECT count(*), count(DISTINCT code) FROM codes'),
@@ -169,6 +178,10 @@ WHERE (SELECT count(*) FROM codes c2 WHERE c2.code = c.code) <> 1}),
 $node->safe_psql('postgres', 'VACUUM codes');
 is($node->safe_psql('postgres', 'SELECT tids, marked FROM dmbtree_index_stats(\'codes_code\')'),
 	'100|0', 'marked entries cleaned up');
+for my $t (qw(acct hist codes))
+{
+	is(iheap_verify($node, $t), '', "structure checks of $t after the workloads");
+}
 
 $node->stop;
 done_testing();

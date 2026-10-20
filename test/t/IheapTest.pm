@@ -7,15 +7,18 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Exporter 'import';
 
-our @EXPORT = qw(iheap_node iheap_workload iheap_snapshot);
+our @EXPORT = qw(iheap_node iheap_workload iheap_snapshot iheap_verify);
 
-# A node with the module preloaded and the extension created in "postgres".
+# A node with the module preloaded and the extension created in "postgres",
+# with amcheck and iheap_verify() for structure checks.
 sub iheap_node
 {
 	my ($name, %params) = @_;
 	my $extra_conf = $params{extra_conf} // '';
 	my $node = PostgreSQL::Test::Cluster->new($name);
-	$node->init(allows_streaming => $params{allows_streaming} // 0);
+	$node->init(
+		allows_streaming => $params{allows_streaming} // 0,
+		no_data_checksums => $params{no_data_checksums} // 0);
 	$node->append_conf('postgresql.conf', qq{
 shared_preload_libraries = 'pg_inplace_update_am'
 max_prepared_transactions = 10
@@ -24,7 +27,55 @@ $extra_conf
 });
 	$node->start;
 	$node->safe_psql('postgres', 'CREATE EXTENSION pg_inplace_update_am');
+	$node->safe_psql('postgres', 'CREATE EXTENSION amcheck');
+	$node->safe_psql('postgres', q{
+-- every problem iheap_check() and the index checkers find in a table: its
+-- dmbtree indexes with every option, its btree ones with amcheck
+CREATE FUNCTION iheap_verify(rel regclass) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN SELECT * FROM iheap_check(rel) LOOP
+    RETURN NEXT format('%s: block %s, offset %s: %s', rel, r.blkno, r.offnum, r.msg);
+  END LOOP;
+  FOR r IN
+    SELECT i.indexrelid::regclass AS idx, a.amname, i.indisunique
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+         JOIN pg_am a ON a.oid = c.relam
+    WHERE i.indrelid = rel AND i.indisvalid ORDER BY i.indexrelid::regclass::text
+  LOOP
+    BEGIN
+      IF r.amname = 'dmbtree' THEN
+        PERFORM dmbtree_check(r.idx, true, r.indisunique, true);
+      ELSIF r.amname = 'btree' THEN
+        PERFORM bt_index_check(r.idx, true, r.indisunique);
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      RETURN NEXT format('%s: %s', r.idx, SQLERRM);
+    END;
+  END LOOP;
+END $$;
+-- the same, as an error (for pgbench scripts)
+CREATE FUNCTION iheap_verify_strict(rel regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  p text;
+BEGIN
+  FOR p IN SELECT * FROM iheap_verify(rel) LOOP
+    RAISE EXCEPTION 'verification failed: %', p;
+  END LOOP;
+END $$;
+});
 	return $node;
+}
+
+# Problems the structure checks find in a table, one per line ('' if none).
+sub iheap_verify
+{
+	my ($node, $table, %opts) = @_;
+	return $node->safe_psql($opts{db} // 'postgres',
+		"SELECT string_agg(p, E'\\n') FROM iheap_verify('$table') p");
 }
 
 # Every kind of change, applied identically to an iheap table and a heap

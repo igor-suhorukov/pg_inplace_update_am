@@ -76,6 +76,7 @@ iheap_discard(Relation rel, bool force)
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	int64		npages = 0;
+	int64		nbytes = 0;		/* of the records on the pages passed */
 
 	if (RecoveryInProgress())
 		return 0;
@@ -161,6 +162,8 @@ iheap_discard(Relation rel, bool force)
 			UnlockReleaseBuffer(buf);
 			break;
 		}
+
+		nbytes += ((PageHeader) page)->pd_lower - IHEAP_UNDO_DATA_START;
 
 		/* no more appends to this page */
 		if (BufferBeginSetHintBits(buf))
@@ -289,6 +292,9 @@ iheap_discard(Relation rel, bool force)
 	UnlockPage(rel, IHEAP_METAPAGE_BLKNO, ExclusiveLock);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
+
+	iheap_stat_rollback_report(RelationGetRelid(rel), IHEAP_ROLLBACK_DISCARD);
+	iheap_stat_count_discard(rel, npages, nbytes);
 
 	return npages;
 }
