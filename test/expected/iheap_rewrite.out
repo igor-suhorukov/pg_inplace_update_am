@@ -1,0 +1,81 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1rr s2upd s2del s2ins s2full s1sel s2sel s1c s1sel
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2upd: UPDATE rw SET v = v * 10 WHERE id <= 2; UPDATE rw SET v = v + 1 WHERE id = 1; UPDATE rw SET v = v + 1 WHERE id = 1; UPDATE rw SET v = v + 1 WHERE id = 1; UPDATE rw SET v = v + 1 WHERE id = 1; UPDATE rw SET v = v + 1 WHERE id = 1;
+step s2del: DELETE FROM rw WHERE id = 3;
+step s2ins: INSERT INTO rw VALUES (5, 5);
+step s2full: VACUUM FULL rw;
+step s1sel: SELECT * FROM rw ORDER BY id;
+id|v
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+(4 rows)
+
+step s2sel: SELECT * FROM rw ORDER BY id;
+id| v
+--+--
+ 1|15
+ 2|20
+ 4| 4
+ 5| 5
+(4 rows)
+
+step s1c: COMMIT;
+step s1sel: SELECT * FROM rw ORDER BY id;
+id| v
+--+--
+ 1|15
+ 2|20
+ 4| 4
+ 5| 5
+(4 rows)
+
+
+starting permutation: s1rr s2upd s2del s2ins s2clu s1sel s2sel s1c s1sel
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2upd: UPDATE rw SET v = v * 10 WHERE id <= 2; UPDATE rw SET v = v + 1 WHERE id = 1; UPDATE rw SET v = v + 1 WHERE id = 1; UPDATE rw SET v = v + 1 WHERE id = 1; UPDATE rw SET v = v + 1 WHERE id = 1; UPDATE rw SET v = v + 1 WHERE id = 1;
+step s2del: DELETE FROM rw WHERE id = 3;
+step s2ins: INSERT INTO rw VALUES (5, 5);
+step s2clu: CLUSTER rw USING rw_pkey;
+step s1sel: SELECT * FROM rw ORDER BY id;
+id|v
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+(4 rows)
+
+step s2sel: SELECT * FROM rw ORDER BY id;
+id| v
+--+--
+ 1|15
+ 2|20
+ 4| 4
+ 5| 5
+(4 rows)
+
+step s1c: COMMIT;
+step s1sel: SELECT * FROM rw ORDER BY id;
+id| v
+--+--
+ 1|15
+ 2|20
+ 4| 4
+ 5| 5
+(4 rows)
+

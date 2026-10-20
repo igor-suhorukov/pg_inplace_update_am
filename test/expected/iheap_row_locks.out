@@ -1,0 +1,161 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1b s1ks s2upd s1c s3sel
+step s1b: BEGIN;
+step s1ks: SELECT id FROM rl WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2upd: UPDATE rl SET v = v + 10 WHERE id = 1;
+step s1c: COMMIT;
+step s3sel: SELECT * FROM rl ORDER BY id;
+id| v
+--+--
+ 1|11
+ 2| 2
+ 3| 3
+(3 rows)
+
+
+starting permutation: s1b s1ks s2key s1c s3sel
+step s1b: BEGIN;
+step s1ks: SELECT id FROM rl WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2key: UPDATE rl SET id = 11 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2key: <... completed>
+step s3sel: SELECT * FROM rl ORDER BY id;
+id|v
+--+-
+ 2|2
+ 3|3
+11|1
+(3 rows)
+
+
+starting permutation: s1b s1sh s2upd s1c s3sel
+step s1b: BEGIN;
+step s1sh: SELECT id FROM rl WHERE id = 1 FOR SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2upd: UPDATE rl SET v = v + 10 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2upd: <... completed>
+step s3sel: SELECT * FROM rl ORDER BY id;
+id| v
+--+--
+ 1|11
+ 2| 2
+ 3| 3
+(3 rows)
+
+
+starting permutation: s1b s1ks s2b s2ks s1c s2c s3sel
+step s1b: BEGIN;
+step s1ks: SELECT id FROM rl WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2b: BEGIN;
+step s2ks: SELECT id FROM rl WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s1c: COMMIT;
+step s2c: COMMIT;
+step s3sel: SELECT * FROM rl ORDER BY id;
+id|v
+--+-
+ 1|1
+ 2|2
+ 3|3
+(3 rows)
+
+
+starting permutation: s1b s1nku s2ks s1c s3sel
+step s1b: BEGIN;
+step s1nku: SELECT id FROM rl WHERE id = 1 FOR NO KEY UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2ks: SELECT id FROM rl WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s1c: COMMIT;
+step s3sel: SELECT * FROM rl ORDER BY id;
+id|v
+--+-
+ 1|1
+ 2|2
+ 3|3
+(3 rows)
+
+
+starting permutation: s1b s1nku s2upd s1c s3sel
+step s1b: BEGIN;
+step s1nku: SELECT id FROM rl WHERE id = 1 FOR NO KEY UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2upd: UPDATE rl SET v = v + 10 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2upd: <... completed>
+step s3sel: SELECT * FROM rl ORDER BY id;
+id| v
+--+--
+ 1|11
+ 2| 2
+ 3| 3
+(3 rows)
+
+
+starting permutation: s1b s1fu s2now s1c
+step s1b: BEGIN;
+step s1fu: SELECT id FROM rl WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2now: SELECT id FROM rl WHERE id = 1 FOR UPDATE NOWAIT;
+ERROR:  could not obtain lock on row in relation "rl"
+step s1c: COMMIT;
+
+starting permutation: s1b s1fu s2b s2skip s2c s1c
+step s1b: BEGIN;
+step s1fu: SELECT id FROM rl WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2b: BEGIN;
+step s2skip: SELECT id FROM rl ORDER BY id FOR UPDATE SKIP LOCKED;
+id
+--
+ 2
+ 3
+(2 rows)
+
+step s2c: COMMIT;
+step s1c: COMMIT;

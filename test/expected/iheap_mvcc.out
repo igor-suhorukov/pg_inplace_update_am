@@ -1,0 +1,416 @@
+--
+-- Rollback, savepoints and snapshots within one session
+--
+CREATE TABLE im (id int PRIMARY KEY, v int, s text) USING iheap;
+INSERT INTO im SELECT g, g, 'v' || g FROM generate_series(1, 20) g;
+-- rollback of each kind of change
+BEGIN;
+INSERT INTO im VALUES (21, 21, 'new');
+UPDATE im SET v = -v WHERE id <= 5;                 -- in place
+UPDATE im SET s = repeat('x', 300) WHERE id = 6;    -- in place, grows
+UPDATE im SET id = id + 100 WHERE id = 7;           -- moves
+DELETE FROM im WHERE id = 8;
+SELECT count(*), sum(v) FROM im;
+ count | sum 
+-------+-----
+    20 | 193
+(1 row)
+
+ROLLBACK;
+SELECT count(*), sum(v), max(length(s)) FROM im;
+ count | sum | max 
+-------+-----+-----
+    20 | 210 |   3
+(1 row)
+
+SELECT * FROM im WHERE id IN (5, 6, 7, 8, 107) ORDER BY id;
+ id | v | s  
+----+---+----
+  5 | 5 | v5
+  6 | 6 | v6
+  7 | 7 | v7
+  8 | 8 | v8
+(4 rows)
+
+-- savepoints: partial rollback keeps earlier changes of the transaction
+BEGIN;
+UPDATE im SET v = 100 WHERE id = 1;
+SAVEPOINT a;
+UPDATE im SET v = 200 WHERE id = 1;
+UPDATE im SET v = 200 WHERE id = 2;
+DELETE FROM im WHERE id = 3;
+INSERT INTO im VALUES (30, 30, 'sp');
+SAVEPOINT b;
+UPDATE im SET v = 300 WHERE id = 1;
+ROLLBACK TO b;
+SELECT id, v FROM im WHERE id IN (1, 2, 3, 30) ORDER BY id;
+ id |  v  
+----+-----
+  1 | 200
+  2 | 200
+ 30 |  30
+(3 rows)
+
+ROLLBACK TO a;
+SELECT id, v FROM im WHERE id IN (1, 2, 3, 30) ORDER BY id;
+ id |  v  
+----+-----
+  1 | 100
+  2 |   2
+  3 |   3
+(3 rows)
+
+UPDATE im SET v = 101 WHERE id = 1;
+COMMIT;
+SELECT id, v FROM im WHERE id IN (1, 2, 3, 30) ORDER BY id;
+ id |  v  
+----+-----
+  1 | 101
+  2 |   2
+  3 |   3
+(3 rows)
+
+-- an error inside a subtransaction (PL/pgSQL exception block)
+DO $$
+BEGIN
+  UPDATE im SET v = 999 WHERE id = 10;
+  BEGIN
+    UPDATE im SET v = 888 WHERE id = 11;
+    DELETE FROM im WHERE id = 12;
+    PERFORM 1 / 0;
+  EXCEPTION WHEN division_by_zero THEN
+    RAISE NOTICE 'caught';
+  END;
+END $$;
+NOTICE:  caught
+SELECT id, v FROM im WHERE id IN (10, 11, 12) ORDER BY id;
+ id |  v  
+----+-----
+ 10 | 999
+ 11 |  11
+ 12 |  12
+(3 rows)
+
+-- many subtransactions touching the same row
+BEGIN;
+SELECT format('SAVEPOINT s%s; UPDATE im SET v = v + 1 WHERE id = 13;%s', g,
+              CASE WHEN g % 2 = 0 THEN ' ROLLBACK TO s' || g || ';' ELSE '' END)
+FROM generate_series(1, 100) g \gexec
+SAVEPOINT s1; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s2; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s2;
+SAVEPOINT s3; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s4; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s4;
+SAVEPOINT s5; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s6; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s6;
+SAVEPOINT s7; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s8; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s8;
+SAVEPOINT s9; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s10; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s10;
+SAVEPOINT s11; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s12; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s12;
+SAVEPOINT s13; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s14; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s14;
+SAVEPOINT s15; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s16; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s16;
+SAVEPOINT s17; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s18; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s18;
+SAVEPOINT s19; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s20; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s20;
+SAVEPOINT s21; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s22; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s22;
+SAVEPOINT s23; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s24; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s24;
+SAVEPOINT s25; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s26; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s26;
+SAVEPOINT s27; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s28; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s28;
+SAVEPOINT s29; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s30; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s30;
+SAVEPOINT s31; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s32; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s32;
+SAVEPOINT s33; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s34; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s34;
+SAVEPOINT s35; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s36; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s36;
+SAVEPOINT s37; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s38; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s38;
+SAVEPOINT s39; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s40; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s40;
+SAVEPOINT s41; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s42; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s42;
+SAVEPOINT s43; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s44; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s44;
+SAVEPOINT s45; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s46; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s46;
+SAVEPOINT s47; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s48; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s48;
+SAVEPOINT s49; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s50; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s50;
+SAVEPOINT s51; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s52; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s52;
+SAVEPOINT s53; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s54; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s54;
+SAVEPOINT s55; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s56; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s56;
+SAVEPOINT s57; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s58; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s58;
+SAVEPOINT s59; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s60; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s60;
+SAVEPOINT s61; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s62; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s62;
+SAVEPOINT s63; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s64; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s64;
+SAVEPOINT s65; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s66; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s66;
+SAVEPOINT s67; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s68; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s68;
+SAVEPOINT s69; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s70; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s70;
+SAVEPOINT s71; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s72; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s72;
+SAVEPOINT s73; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s74; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s74;
+SAVEPOINT s75; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s76; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s76;
+SAVEPOINT s77; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s78; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s78;
+SAVEPOINT s79; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s80; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s80;
+SAVEPOINT s81; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s82; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s82;
+SAVEPOINT s83; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s84; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s84;
+SAVEPOINT s85; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s86; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s86;
+SAVEPOINT s87; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s88; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s88;
+SAVEPOINT s89; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s90; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s90;
+SAVEPOINT s91; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s92; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s92;
+SAVEPOINT s93; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s94; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s94;
+SAVEPOINT s95; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s96; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s96;
+SAVEPOINT s97; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s98; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s98;
+SAVEPOINT s99; UPDATE im SET v = v + 1 WHERE id = 13;
+SAVEPOINT s100; UPDATE im SET v = v + 1 WHERE id = 13; ROLLBACK TO s100;
+SELECT v FROM im WHERE id = 13;
+ v  
+----
+ 63
+(1 row)
+
+COMMIT;
+SELECT v FROM im WHERE id = 13;
+ v  
+----
+ 63
+(1 row)
+
+-- a cursor keeps its snapshot while the rows change underneath
+BEGIN;
+DECLARE c CURSOR FOR SELECT id, v FROM im WHERE id <= 4 ORDER BY id;
+FETCH 1 FROM c;
+ id |  v  
+----+-----
+  1 | 101
+(1 row)
+
+UPDATE im SET v = v * 10 WHERE id <= 4;
+FETCH ALL FROM c;
+ id | v 
+----+---
+  2 | 2
+  3 | 3
+  4 | 4
+(3 rows)
+
+SELECT id, v FROM im WHERE id <= 4 ORDER BY id;
+ id |  v   
+----+------
+  1 | 1010
+  2 |   20
+  3 |   30
+  4 |   40
+(4 rows)
+
+COMMIT;
+-- command ids: a statement does not see its own changes
+UPDATE im SET v = v + (SELECT max(v) FROM im) WHERE id = 14;
+SELECT v FROM im WHERE id = 14;
+  v   
+------
+ 1024
+(1 row)
+
+-- REPEATABLE READ sees its snapshot; updates by itself are visible
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT sum(v) FROM im;
+ sum  
+------
+ 3349
+(1 row)
+
+UPDATE im SET v = 0 WHERE id = 15;
+SELECT v FROM im WHERE id = 15;
+ v 
+---
+ 0
+(1 row)
+
+COMMIT;
+-- WITH HOLD cursor survives the commit of the updates it must not see
+BEGIN;
+DECLARE h CURSOR WITH HOLD FOR SELECT id, v FROM im WHERE id IN (16, 17) ORDER BY id;
+COMMIT;
+UPDATE im SET v = -1 WHERE id IN (16, 17);
+FETCH ALL FROM h;
+ id | v  
+----+----
+ 16 | 16
+ 17 | 17
+(2 rows)
+
+CLOSE h;
+-- row locks by ourselves, then modification
+BEGIN;
+SELECT id FROM im WHERE id = 18 FOR KEY SHARE;
+ id 
+----
+ 18
+(1 row)
+
+SELECT id FROM im WHERE id = 18 FOR SHARE;
+ id 
+----
+ 18
+(1 row)
+
+SELECT id FROM im WHERE id = 18 FOR NO KEY UPDATE;
+ id 
+----
+ 18
+(1 row)
+
+SELECT id FROM im WHERE id = 18 FOR UPDATE;
+ id 
+----
+ 18
+(1 row)
+
+UPDATE im SET v = 1818 WHERE id = 18;
+SELECT id, v FROM im WHERE id = 18;
+ id |  v   
+----+------
+ 18 | 1818
+(1 row)
+
+ROLLBACK;
+SELECT id, v FROM im WHERE id = 18;
+ id | v  
+----+----
+ 18 | 18
+(1 row)
+
+-- locking then rolling back to a savepoint
+BEGIN;
+SAVEPOINT x;
+SELECT id FROM im WHERE id = 19 FOR UPDATE;
+ id 
+----
+ 19
+(1 row)
+
+ROLLBACK TO x;
+UPDATE im SET v = 1919 WHERE id = 19;
+COMMIT;
+SELECT id, v FROM im WHERE id = 19;
+ id |  v   
+----+------
+ 19 | 1919
+(1 row)
+
+-- prepared transactions
+BEGIN;
+UPDATE im SET v = 2020 WHERE id = 20;
+INSERT INTO im VALUES (40, 40, 'prepared');
+PREPARE TRANSACTION 'im1';
+SELECT id, v FROM im WHERE id IN (20, 40) ORDER BY id;
+ id | v  
+----+----
+ 20 | 20
+(1 row)
+
+ROLLBACK PREPARED 'im1';
+SELECT id, v FROM im WHERE id IN (20, 40) ORDER BY id;
+ id | v  
+----+----
+ 20 | 20
+(1 row)
+
+BEGIN;
+UPDATE im SET v = 2021 WHERE id = 20;
+PREPARE TRANSACTION 'im2';
+COMMIT PREPARED 'im2';
+SELECT id, v FROM im WHERE id = 20;
+ id |  v   
+----+------
+ 20 | 2021
+(1 row)
+
+-- the abort callback leaves big transactions to lazy rollback
+SET iheap.foreground_undo_limit = 0;
+BEGIN;
+UPDATE im SET v = v + 1000;
+DELETE FROM im WHERE id > 15;
+ROLLBACK;
+RESET iheap.foreground_undo_limit;
+SELECT count(*), sum(v) FROM im;
+ count | sum  
+-------+------
+    20 | 7200
+(1 row)
+
+UPDATE im SET v = v + 1 WHERE id = 1;     -- writer rolls back first
+SELECT count(*), sum(v) FROM im;
+ count | sum  
+-------+------
+    20 | 7201
+(1 row)
+
+VACUUM im;
+SELECT count(*), sum(v) FROM im;
+ count | sum  
+-------+------
+    20 | 7201
+(1 row)
+
+-- final state
+SELECT * FROM im ORDER BY id;
+ id |  v   |  s  
+----+------+-----
+  1 | 1011 | v1
+  2 |   20 | v2
+  3 |   30 | v3
+  4 |   40 | v4
+  5 |    5 | v5
+  6 |    6 | v6
+  7 |    7 | v7
+  8 |    8 | v8
+  9 |    9 | v9
+ 10 |  999 | v10
+ 11 |   11 | v11
+ 12 |   12 | v12
+ 13 |   63 | v13
+ 14 | 1024 | v14
+ 15 |    0 | v15
+ 16 |   -1 | v16
+ 17 |   -1 | v17
+ 18 |   18 | v18
+ 19 | 1919 | v19
+ 20 | 2021 | v20
+(20 rows)
+
+DROP TABLE im;

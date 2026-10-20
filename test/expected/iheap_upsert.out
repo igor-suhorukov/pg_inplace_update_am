@@ -1,0 +1,53 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1ins s2ins s1c s2sel
+step s1b: BEGIN;
+step s1ins: INSERT INTO up VALUES (1, 1, 's1') ON CONFLICT (k) DO UPDATE SET v = up.v + excluded.v, note = up.note || '+s1';
+step s2ins: INSERT INTO up VALUES (1, 10, 's2') ON CONFLICT (k) DO UPDATE SET v = up.v + excluded.v, note = up.note || '+s2'; <waiting ...>
+step s1c: COMMIT;
+step s2ins: <... completed>
+step s2sel: SELECT * FROM up;
+k| v|note 
+-+--+-----
+1|11|s1+s2
+(1 row)
+
+
+starting permutation: s1b s1ins s2ins s1a s2sel
+step s1b: BEGIN;
+step s1ins: INSERT INTO up VALUES (1, 1, 's1') ON CONFLICT (k) DO UPDATE SET v = up.v + excluded.v, note = up.note || '+s1';
+step s2ins: INSERT INTO up VALUES (1, 10, 's2') ON CONFLICT (k) DO UPDATE SET v = up.v + excluded.v, note = up.note || '+s2'; <waiting ...>
+step s1a: ROLLBACK;
+step s2ins: <... completed>
+step s2sel: SELECT * FROM up;
+k| v|note
+-+--+----
+1|10|s2  
+(1 row)
+
+
+starting permutation: s1b s1ins s2nothing s1c s2sel
+step s1b: BEGIN;
+step s1ins: INSERT INTO up VALUES (1, 1, 's1') ON CONFLICT (k) DO UPDATE SET v = up.v + excluded.v, note = up.note || '+s1';
+step s2nothing: INSERT INTO up VALUES (1, 100, 's2') ON CONFLICT DO NOTHING; <waiting ...>
+step s1c: COMMIT;
+step s2nothing: <... completed>
+step s2sel: SELECT * FROM up;
+k|v|note
+-+-+----
+1|1|s1  
+(1 row)
+
+
+starting permutation: s1b s1ins s2nothing s1a s2sel
+step s1b: BEGIN;
+step s1ins: INSERT INTO up VALUES (1, 1, 's1') ON CONFLICT (k) DO UPDATE SET v = up.v + excluded.v, note = up.note || '+s1';
+step s2nothing: INSERT INTO up VALUES (1, 100, 's2') ON CONFLICT DO NOTHING; <waiting ...>
+step s1a: ROLLBACK;
+step s2nothing: <... completed>
+step s2sel: SELECT * FROM up;
+k|  v|note
+-+---+----
+1|100|s2  
+(1 row)
+

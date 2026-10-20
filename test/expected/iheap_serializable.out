@@ -1,0 +1,143 @@
+Parsed test spec with 4 sessions
+
+starting permutation: wx1 rxy1 c1 wy2 rxy2 c2 s4sel
+step wx1: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking';
+step rxy1: SELECT SUM(balance) FROM accounts;
+ sum
+----
+1000
+(1 row)
+
+step c1: COMMIT;
+step wy2: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'savings';
+step rxy2: SELECT SUM(balance) FROM accounts;
+sum
+---
+800
+(1 row)
+
+step c2: COMMIT;
+step s4sel: SELECT * FROM accounts ORDER BY accountid;
+accountid|balance
+---------+-------
+checking |    400
+savings  |    400
+(2 rows)
+
+
+starting permutation: wx1 rxy1 wy2 c1 rxy2 c2 s4sel
+s3: WARNING:  there is already a transaction in progress
+step wx1: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking';
+step rxy1: SELECT SUM(balance) FROM accounts;
+ sum
+----
+1000
+(1 row)
+
+step wy2: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'savings';
+step c1: COMMIT;
+step rxy2: SELECT SUM(balance) FROM accounts;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step c2: COMMIT;
+step s4sel: SELECT * FROM accounts ORDER BY accountid;
+accountid|balance
+---------+-------
+checking |    400
+savings  |    600
+(2 rows)
+
+
+starting permutation: wx1 wy2 rxy1 rxy2 c1 c2 s4sel
+s3: WARNING:  there is already a transaction in progress
+step wx1: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking';
+step wy2: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'savings';
+step rxy1: SELECT SUM(balance) FROM accounts;
+ sum
+----
+1000
+(1 row)
+
+step rxy2: SELECT SUM(balance) FROM accounts;
+ sum
+----
+1000
+(1 row)
+
+step c1: COMMIT;
+step c2: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s4sel: SELECT * FROM accounts ORDER BY accountid;
+accountid|balance
+---------+-------
+checking |    400
+savings  |    600
+(2 rows)
+
+
+starting permutation: wx1 wy2 rxy2 rxy1 c2 c1 s4sel
+s3: WARNING:  there is already a transaction in progress
+step wx1: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking';
+step wy2: UPDATE accounts SET balance = balance - 200 WHERE accountid = 'savings';
+step rxy2: SELECT SUM(balance) FROM accounts;
+ sum
+----
+1000
+(1 row)
+
+step rxy1: SELECT SUM(balance) FROM accounts;
+ sum
+----
+1000
+(1 row)
+
+step c2: COMMIT;
+step c1: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s4sel: SELECT * FROM accounts ORDER BY accountid;
+accountid|balance
+---------+-------
+checking |    600
+savings  |    400
+(2 rows)
+
+
+starting permutation: s2rx s2ry s1ry s1wy c1 s3r c3 s2wx c2 s4bank
+s3: WARNING:  there is already a transaction in progress
+step s2rx: SELECT balance FROM bank_account WHERE id = 'X';
+balance
+-------
+      0
+(1 row)
+
+step s2ry: SELECT balance FROM bank_account WHERE id = 'Y';
+balance
+-------
+      0
+(1 row)
+
+step s1ry: SELECT balance FROM bank_account WHERE id = 'Y';
+balance
+-------
+      0
+(1 row)
+
+step s1wy: UPDATE bank_account SET balance = 20 WHERE id = 'Y';
+step c1: COMMIT;
+step s3r: SELECT id, balance FROM bank_account WHERE id IN ('X', 'Y') ORDER BY id;
+id|balance
+--+-------
+X |      0
+Y |     20
+(2 rows)
+
+step c3: COMMIT;
+step s2wx: UPDATE bank_account SET balance = -11 WHERE id = 'X';
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step c2: COMMIT;
+step s4bank: SELECT * FROM bank_account ORDER BY id;
+id|balance
+--+-------
+X |      0
+Y |     20
+(2 rows)
+

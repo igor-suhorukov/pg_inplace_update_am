@@ -1,0 +1,64 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1beat s2pick s1c s2sel
+step s1b: BEGIN;
+step s1beat: UPDATE jobs SET beat = beat + 1 WHERE id = 1;
+step s2pick: 
+  UPDATE jobs SET status = 'taken'
+  WHERE id = (SELECT id FROM jobs WHERE status = 'new' ORDER BY id LIMIT 1 FOR UPDATE)
+  RETURNING *;
+ <waiting ...>
+step s1c: COMMIT;
+step s2pick: <... completed>
+id|status|beat
+--+------+----
+ 1|taken |   1
+(1 row)
+
+step s2sel: SELECT * FROM jobs ORDER BY id;
+id|status|beat
+--+------+----
+ 1|taken |   1
+ 2|new   |   0
+(2 rows)
+
+
+starting permutation: s1b s1take s2pick s1c s2sel
+step s1b: BEGIN;
+step s1take: UPDATE jobs SET status = 'done' WHERE id = 1;
+step s2pick: 
+  UPDATE jobs SET status = 'taken'
+  WHERE id = (SELECT id FROM jobs WHERE status = 'new' ORDER BY id LIMIT 1 FOR UPDATE)
+  RETURNING *;
+ <waiting ...>
+step s1c: COMMIT;
+step s2pick: <... completed>
+id|status|beat
+--+------+----
+ 2|taken |   0
+(1 row)
+
+step s2sel: SELECT * FROM jobs ORDER BY id;
+id|status|beat
+--+------+----
+ 1|done  |   0
+ 2|taken |   0
+(2 rows)
+
+
+starting permutation: s1b s1bal s2join s1c
+step s1b: BEGIN;
+step s1bal: UPDATE acct SET bal = bal + 1000 WHERE id = 1;
+step s2join: 
+  SELECT a1.id, a1.bal, a2.bal AS bal_unlocked
+  FROM acct a1 JOIN acct a2 ON a1.id = a2.id
+  WHERE a1.id = 1
+  FOR UPDATE OF a1;
+ <waiting ...>
+step s1c: COMMIT;
+step s2join: <... completed>
+id| bal|bal_unlocked
+--+----+------------
+ 1|1100|         100
+(1 row)
+

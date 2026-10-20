@@ -1,0 +1,312 @@
+--
+-- Basic DML, in-place updates and the on-page format
+--
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE TABLE ib (id int PRIMARY KEY, v int, s text) USING iheap;
+SELECT amname FROM pg_am a JOIN pg_class c ON c.relam = a.oid
+WHERE c.relname = 'ib';
+ amname 
+--------
+ iheap
+(1 row)
+
+INSERT INTO ib SELECT g, g * 10, 'row ' || g FROM generate_series(1, 10) g;
+SELECT * FROM ib ORDER BY id;
+ id |  v  |   s    
+----+-----+--------
+  1 |  10 | row 1
+  2 |  20 | row 2
+  3 |  30 | row 3
+  4 |  40 | row 4
+  5 |  50 | row 5
+  6 |  60 | row 6
+  7 |  70 | row 7
+  8 |  80 | row 8
+  9 |  90 | row 9
+ 10 | 100 | row 10
+(10 rows)
+
+-- an update of a non-indexed column stays at the same TID
+CREATE TEMP TABLE tids AS SELECT id, ctid AS old_ctid FROM ib;
+UPDATE ib SET v = v + 1 WHERE id <= 5;
+SELECT i.id, i.v, i.ctid = t.old_ctid AS same_tid
+FROM ib i JOIN tids t USING (id) ORDER BY id;
+ id |  v  | same_tid 
+----+-----+----------
+  1 |  11 | t
+  2 |  21 | t
+  3 |  31 | t
+  4 |  41 | t
+  5 |  51 | t
+  6 |  60 | t
+  7 |  70 | t
+  8 |  80 | t
+  9 |  90 | t
+ 10 | 100 | t
+(10 rows)
+
+-- growing and shrinking in place
+UPDATE ib SET s = s || repeat('+', 200) WHERE id = 6;
+SELECT id, length(s), ctid = (SELECT old_ctid FROM tids WHERE id = 6) AS same_tid
+FROM ib WHERE id = 6;
+ id | length | same_tid 
+----+--------+----------
+  6 |    205 | t
+(1 row)
+
+UPDATE ib SET s = 'short' WHERE id = 6;
+SELECT id, s, ctid = (SELECT old_ctid FROM tids WHERE id = 6) AS same_tid
+FROM ib WHERE id = 6;
+ id |   s   | same_tid 
+----+-------+----------
+  6 | short | t
+(1 row)
+
+-- updating an indexed column moves the row (new index entry needed)
+UPDATE ib SET id = 100 WHERE id = 7;
+SELECT id, ctid = (SELECT old_ctid FROM tids WHERE id = 7) AS same_tid
+FROM ib WHERE id = 100;
+ id  | same_tid 
+-----+----------
+ 100 | f
+(1 row)
+
+SELECT count(*) FROM ib WHERE id = 7;
+ count 
+-------
+     0
+(1 row)
+
+-- NULLs, setting to and from NULL
+UPDATE ib SET v = NULL WHERE id = 8;
+UPDATE ib SET s = NULL WHERE id = 9;
+SELECT * FROM ib WHERE id IN (8, 9) ORDER BY id;
+ id | v  |   s   
+----+----+-------
+  8 |    | row 8
+  9 | 90 | 
+(2 rows)
+
+UPDATE ib SET v = 81, s = 'back' WHERE id = 8;
+SELECT * FROM ib WHERE id = 8;
+ id | v  |  s   
+----+----+------
+  8 | 81 | back
+(1 row)
+
+DELETE FROM ib WHERE id IN (2, 4);
+SELECT id FROM ib ORDER BY id;
+ id  
+-----
+   1
+   3
+   5
+   6
+   8
+   9
+  10
+ 100
+(8 rows)
+
+-- several updates of a row in one transaction
+BEGIN;
+UPDATE ib SET v = 1000 WHERE id = 1;
+UPDATE ib SET v = v + 1 WHERE id = 1;
+UPDATE ib SET s = 'changed' WHERE id = 1;
+SELECT * FROM ib WHERE id = 1;
+ id |  v   |    s    
+----+------+---------
+  1 | 1001 | changed
+(1 row)
+
+COMMIT;
+SELECT * FROM ib WHERE id = 1;
+ id |  v   |    s    
+----+------+---------
+  1 | 1001 | changed
+(1 row)
+
+-- system columns
+SELECT xmin = xmax AS no, cmin, cmax FROM ib WHERE id = 1;
+ no | cmin | cmax 
+----+------+------
+ f  |    0 |    0
+(1 row)
+
+BEGIN;
+UPDATE ib SET v = v WHERE id = 3;
+SELECT xmin = pg_current_xact_id()::xid AS updated_by_us FROM ib WHERE id = 3;
+ updated_by_us 
+---------------
+ t
+(1 row)
+
+COMMIT;
+-- the 16-byte header, unaligned pass-by-value attributes
+CREATE TABLE ifmt (a int2, b int8, c bool, d int4, e float8) USING iheap;
+INSERT INTO ifmt VALUES (1, 2, true, 3, 4.5);
+SELECT lp, lp_len, natts, hoff, flags FROM iheap_page_items('ifmt', 1);
+ lp | lp_len | natts | hoff | flags 
+----+--------+-------+------+-------
+  1 |     39 |     5 |   16 | {}
+(1 row)
+
+SELECT * FROM ifmt;
+ a | b | c | d |  e  
+---+---+---+---+-----
+ 1 | 2 | t | 3 | 4.5
+(1 row)
+
+CREATE TABLE hfmt (a int2, b int8, c bool, d int4, e float8);
+INSERT INTO hfmt VALUES (1, 2, true, 3, 4.5);
+SELECT lp_len AS heap_lp_len FROM heap_page_items(get_raw_page('hfmt', 0));
+ heap_lp_len 
+-------------
+          56
+(1 row)
+
+-- pass-by-reference values after unaligned ones
+CREATE TABLE imix (a int2, n numeric, b int8, t text, ts timestamptz, i interval,
+                   arr int[], c char(3)) USING iheap;
+INSERT INTO imix VALUES (7, 3.14159, 1234567890123, 'text',
+                         '2026-01-02 03:04:05+00', '1 day 2 hours', '{1,2,3}', 'ab');
+INSERT INTO imix VALUES (NULL, NULL, 5, NULL, NULL, '3 years', NULL, 'xyz');
+SELECT * FROM imix ORDER BY b;
+ a |    n    |       b       |  t   |              ts              |        i        |   arr   |  c  
+---+---------+---------------+------+------------------------------+-----------------+---------+-----
+   |         |             5 |      |                              | @ 3 years       |         | xyz
+ 7 | 3.14159 | 1234567890123 | text | Thu Jan 01 19:04:05 2026 PST | @ 1 day 2 hours | {1,2,3} | ab 
+(2 rows)
+
+UPDATE imix SET n = n * 2, arr = arr || 4 WHERE a = 7;
+SELECT * FROM imix ORDER BY b;
+ a |    n    |       b       |  t   |              ts              |        i        |    arr    |  c  
+---+---------+---------------+------+------------------------------+-----------------+-----------+-----
+   |         |             5 |      |                              | @ 3 years       |           | xyz
+ 7 | 6.28318 | 1234567890123 | text | Thu Jan 01 19:04:05 2026 PST | @ 1 day 2 hours | {1,2,3,4} | ab 
+(2 rows)
+
+-- many columns, wide null bitmap
+SELECT 'CREATE TABLE iwide (' ||
+       string_agg('c' || g || ' int', ', ') || ') USING iheap'
+FROM generate_series(1, 100) g \gexec
+CREATE TABLE iwide (c1 int, c2 int, c3 int, c4 int, c5 int, c6 int, c7 int, c8 int, c9 int, c10 int, c11 int, c12 int, c13 int, c14 int, c15 int, c16 int, c17 int, c18 int, c19 int, c20 int, c21 int, c22 int, c23 int, c24 int, c25 int, c26 int, c27 int, c28 int, c29 int, c30 int, c31 int, c32 int, c33 int, c34 int, c35 int, c36 int, c37 int, c38 int, c39 int, c40 int, c41 int, c42 int, c43 int, c44 int, c45 int, c46 int, c47 int, c48 int, c49 int, c50 int, c51 int, c52 int, c53 int, c54 int, c55 int, c56 int, c57 int, c58 int, c59 int, c60 int, c61 int, c62 int, c63 int, c64 int, c65 int, c66 int, c67 int, c68 int, c69 int, c70 int, c71 int, c72 int, c73 int, c74 int, c75 int, c76 int, c77 int, c78 int, c79 int, c80 int, c81 int, c82 int, c83 int, c84 int, c85 int, c86 int, c87 int, c88 int, c89 int, c90 int, c91 int, c92 int, c93 int, c94 int, c95 int, c96 int, c97 int, c98 int, c99 int, c100 int) USING iheap
+INSERT INTO iwide (c1, c50, c100) VALUES (1, 50, 100);
+SELECT c1, c2, c50, c99, c100 FROM iwide;
+ c1 | c2 | c50 | c99 | c100 
+----+----+-----+-----+------
+  1 |    |  50 |     |  100
+(1 row)
+
+UPDATE iwide SET c2 = 2, c99 = 99;
+SELECT c1, c2, c50, c99, c100 FROM iwide;
+ c1 | c2 | c50 | c99 | c100 
+----+----+-----+-----+------
+  1 |  2 |  50 |  99 |  100
+(1 row)
+
+-- empty and zero-column tables
+CREATE TABLE izero () USING iheap;
+INSERT INTO izero DEFAULT VALUES;
+INSERT INTO izero DEFAULT VALUES;
+SELECT count(*) FROM izero;
+ count 
+-------
+     2
+(1 row)
+
+DELETE FROM izero;
+SELECT count(*) FROM izero;
+ count 
+-------
+     0
+(1 row)
+
+-- TID range scans, serial and parallel, bounded and unbounded
+CREATE TABLE itid (id int, pad text) USING iheap WITH (fillfactor = 10);
+INSERT INTO itid SELECT g, repeat('x', 100) FROM generate_series(1, 300) g;
+SELECT count(*) FROM itid WHERE ctid > '(3,0)';
+ count 
+-------
+   294
+(1 row)
+
+SELECT count(*) FROM itid WHERE ctid < '(20,1)';
+ count 
+-------
+    90
+(1 row)
+
+SELECT count(*) FROM itid WHERE ctid > '(3,0)' AND ctid < '(20,1)';
+ count 
+-------
+    84
+(1 row)
+
+SELECT count(*) FROM itid WHERE ctid > '(100000,0)';
+ count 
+-------
+     0
+(1 row)
+
+BEGIN;
+SET LOCAL parallel_setup_cost = 0;
+SET LOCAL parallel_tuple_cost = 0;
+SET LOCAL min_parallel_table_scan_size = 0;
+SET LOCAL max_parallel_workers_per_gather = 4;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM itid WHERE ctid > '(3,0)';
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 4
+         ->  Partial Aggregate
+               ->  Parallel Tid Range Scan on itid
+                     TID Cond: (ctid > '(3,0)'::tid)
+(6 rows)
+
+SELECT count(*) FROM itid WHERE ctid > '(3,0)';
+ count 
+-------
+   294
+(1 row)
+
+SELECT count(*) FROM itid WHERE ctid < '(20,1)';
+ count 
+-------
+    90
+(1 row)
+
+SELECT count(*) FROM itid WHERE ctid > '(3,0)' AND ctid < '(20,1)';
+ count 
+-------
+    84
+(1 row)
+
+SELECT count(*) FROM itid WHERE ctid > '(100000,0)';
+ count 
+-------
+     0
+(1 row)
+
+COMMIT;
+DROP TABLE itid;
+-- inspection functions
+SELECT nextents >= 1 AS has_undo, live_undo_pages >= 0 AS ok
+FROM iheap_metapage_info('ib');
+ has_undo | ok 
+----------+----
+ t        | t
+(1 row)
+
+SELECT nblocks > 0, data_pages, live_items FROM iheap_relation_stats('ib');
+ ?column? | data_pages | live_items 
+----------+------------+------------
+ t        |          1 |          8
+(1 row)
+
+SELECT iheap_page_items('ib', 0);  -- metapage: error
+ERROR:  block 0 of "ib" is a meta page, not a data page
+SELECT iheap_page_items('tids', 0);  -- not iheap: error
+ERROR:  "tids" is not an iheap relation
+DROP TABLE ib, ifmt, hfmt, imix, iwide, izero;

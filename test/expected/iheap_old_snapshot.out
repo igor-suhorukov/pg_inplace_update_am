@@ -1,0 +1,73 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1rr s2upd s2grow s2key s2del s2ins s1sel s1idx s2vac s1sel s2sel s1c s2vac s2disc s2sel
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2upd: UPDATE os SET v = v + 1; UPDATE os SET v = v + 1 WHERE id <= 2;
+step s2grow: UPDATE os SET note = repeat('g', 300) WHERE id = 3;
+step s2key: UPDATE os SET k = k + 100 WHERE id = 4;
+step s2del: DELETE FROM os WHERE id = 5;
+step s2ins: INSERT INTO os VALUES (6, 6, 60, 'new');
+step s1sel: SELECT id, k, v, note FROM os ORDER BY id;
+id|k| v|note
+--+-+--+----
+ 1|1|10|n1  
+ 2|2|20|n2  
+ 3|3|30|n3  
+ 4|4|40|n4  
+ 5|5|50|n5  
+(5 rows)
+
+step s1idx: SET enable_seqscan = off; SELECT id, k, v FROM os WHERE k BETWEEN 1 AND 5 ORDER BY k; RESET enable_seqscan;
+id|k| v
+--+-+--
+ 1|1|10
+ 2|2|20
+ 3|3|30
+ 4|4|40
+ 5|5|50
+(5 rows)
+
+step s2vac: VACUUM os;
+step s1sel: SELECT id, k, v, note FROM os ORDER BY id;
+id|k| v|note
+--+-+--+----
+ 1|1|10|n1  
+ 2|2|20|n2  
+ 3|3|30|n3  
+ 4|4|40|n4  
+ 5|5|50|n5  
+(5 rows)
+
+step s2sel: SELECT id, k, v, left(note, 5) AS note FROM os ORDER BY id;
+id|  k| v|note 
+--+---+--+-----
+ 1|  1|12|n1   
+ 2|  2|22|n2   
+ 3|  3|31|ggggg
+ 4|104|41|n4   
+ 6|  6|60|new  
+(5 rows)
+
+step s1c: COMMIT;
+step s2vac: VACUUM os;
+step s2disc: SELECT live_undo_pages = 0 AS discarded FROM iheap_metapage_info('os');
+discarded
+---------
+t        
+(1 row)
+
+step s2sel: SELECT id, k, v, left(note, 5) AS note FROM os ORDER BY id;
+id|  k| v|note 
+--+---+--+-----
+ 1|  1|12|n1   
+ 2|  2|22|n2   
+ 3|  3|31|ggggg
+ 4|104|41|n4   
+ 6|  6|60|new  
+(5 rows)
+

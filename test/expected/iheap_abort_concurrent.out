@@ -1,0 +1,127 @@
+Parsed test spec with 3 sessions
+
+starting permutation: ab au am mm ar tsel
+step ab: BEGIN;
+step au: UPDATE ac SET balance = balance + 1000000 WHERE id = 1;
+step am: UPDATE ac SET branch = branch + 100 WHERE id = 1;
+step mm: UPDATE ac SET branch = 5, note = repeat('m', 50) WHERE id = 1; <waiting ...>
+step ar: ROLLBACK;
+step mm: <... completed>
+step tsel: SELECT id, branch, balance, length(note) AS notelen FROM ac ORDER BY id;
+id|branch|balance|notelen
+--+------+-------+-------
+ 1|     5|   1000|     50
+ 2|     2|   1000|      1
+(2 rows)
+
+
+starting permutation: ab au mm am ar tsel
+step ab: BEGIN;
+step au: UPDATE ac SET balance = balance + 1000000 WHERE id = 1;
+step mm: UPDATE ac SET branch = 5, note = repeat('m', 50) WHERE id = 1; <waiting ...>
+step am: UPDATE ac SET branch = branch + 100 WHERE id = 1;
+step ar: ROLLBACK;
+step mm: <... completed>
+step tsel: SELECT id, branch, balance, length(note) AS notelen FROM ac ORDER BY id;
+id|branch|balance|notelen
+--+------+-------+-------
+ 1|     5|   1000|     50
+ 2|     2|   1000|      1
+(2 rows)
+
+
+starting permutation: ab au am ms ar tsel
+step ab: BEGIN;
+step au: UPDATE ac SET balance = balance + 1000000 WHERE id = 1;
+step am: UPDATE ac SET branch = branch + 100 WHERE id = 1;
+step ms: UPDATE ac SET branch = branch, note = repeat('s', 80) WHERE id = 1; <waiting ...>
+step ar: ROLLBACK;
+step ms: <... completed>
+step tsel: SELECT id, branch, balance, length(note) AS notelen FROM ac ORDER BY id;
+id|branch|balance|notelen
+--+------+-------+-------
+ 1|     1|   1000|     80
+ 2|     2|   1000|      1
+(2 rows)
+
+
+starting permutation: ab au am mm tu ar tsel
+step ab: BEGIN;
+step au: UPDATE ac SET balance = balance + 1000000 WHERE id = 1;
+step am: UPDATE ac SET branch = branch + 100 WHERE id = 1;
+step mm: UPDATE ac SET branch = 5, note = repeat('m', 50) WHERE id = 1; <waiting ...>
+step tu: UPDATE ac SET balance = balance + 1 WHERE id = 1; <waiting ...>
+step ar: ROLLBACK;
+step mm: <... completed>
+step tu: <... completed>
+step tsel: SELECT id, branch, balance, length(note) AS notelen FROM ac ORDER BY id;
+id|branch|balance|notelen
+--+------+-------+-------
+ 1|     5|   1001|     50
+ 2|     2|   1000|      1
+(2 rows)
+
+
+starting permutation: ab au am mm ac tsel
+step ab: BEGIN;
+step au: UPDATE ac SET balance = balance + 1000000 WHERE id = 1;
+step am: UPDATE ac SET branch = branch + 100 WHERE id = 1;
+step mm: UPDATE ac SET branch = 5, note = repeat('m', 50) WHERE id = 1; <waiting ...>
+step ac: COMMIT;
+step mm: <... completed>
+step tsel: SELECT id, branch, balance, length(note) AS notelen FROM ac ORDER BY id;
+id|branch|balance|notelen
+--+------+-------+-------
+ 1|     5|1001000|     50
+ 2|     2|   1000|      1
+(2 rows)
+
+
+starting permutation: ab au am tu ac tsel
+step ab: BEGIN;
+step au: UPDATE ac SET balance = balance + 1000000 WHERE id = 1;
+step am: UPDATE ac SET branch = branch + 100 WHERE id = 1;
+step tu: UPDATE ac SET balance = balance + 1 WHERE id = 1; <waiting ...>
+step ac: COMMIT;
+step tu: <... completed>
+step tsel: SELECT id, branch, balance, length(note) AS notelen FROM ac ORDER BY id;
+id|branch|balance|notelen
+--+------+-------+-------
+ 1|   101|1001001|      1
+ 2|     2|   1000|      1
+(2 rows)
+
+
+starting permutation: mb mm ab au mc am ar tsel
+step mb: BEGIN;
+step mm: UPDATE ac SET branch = 5, note = repeat('m', 50) WHERE id = 1;
+step ab: BEGIN;
+step au: UPDATE ac SET balance = balance + 1000000 WHERE id = 1; <waiting ...>
+step mc: COMMIT;
+step au: <... completed>
+step am: UPDATE ac SET branch = branch + 100 WHERE id = 1;
+step ar: ROLLBACK;
+step tsel: SELECT id, branch, balance, length(note) AS notelen FROM ac ORDER BY id;
+id|branch|balance|notelen
+--+------+-------+-------
+ 1|     5|   1000|     50
+ 2|     2|   1000|      1
+(2 rows)
+
+
+starting permutation: mb ms ab au mc am ar tsel
+step mb: BEGIN;
+step ms: UPDATE ac SET branch = branch, note = repeat('s', 80) WHERE id = 1;
+step ab: BEGIN;
+step au: UPDATE ac SET balance = balance + 1000000 WHERE id = 1; <waiting ...>
+step mc: COMMIT;
+step au: <... completed>
+step am: UPDATE ac SET branch = branch + 100 WHERE id = 1;
+step ar: ROLLBACK;
+step tsel: SELECT id, branch, balance, length(note) AS notelen FROM ac ORDER BY id;
+id|branch|balance|notelen
+--+------+-------+-------
+ 1|     1|   1000|     80
+ 2|     2|   1000|      1
+(2 rows)
+

@@ -1,0 +1,155 @@
+--
+-- Large values: compression and out-of-line storage in a heap TOAST table
+--
+SET default_toast_compression = pglz;
+CREATE TABLE it (id int PRIMARY KEY, small text, big text, b bytea) USING iheap;
+SELECT reltoastrelid <> 0 AS has_toast FROM pg_class WHERE relname = 'it';
+ has_toast 
+-----------
+ t
+(1 row)
+
+-- incompressible data so that values really go out of line
+CREATE FUNCTION rnd_text(n int, seed float8) RETURNS text LANGUAGE sql AS $$
+  SELECT string_agg(md5(seed::text || g::text), '') FROM generate_series(1, n / 32 + 1) g
+$$;
+INSERT INTO it VALUES
+  (1, 'a', repeat('x', 100000), NULL),                     -- compressible
+  (2, 'b', rnd_text(20000, 0.2), NULL),                    -- external
+  (3, 'c', rnd_text(5000, 0.3), decode(rnd_text(3000, 0.4), 'escape')),
+  (4, 'd', 'short', NULL);
+SELECT id, length(big), md5(big) = md5(CASE id WHEN 1 THEN repeat('x', 100000)
+                                         WHEN 2 THEN rnd_text(20000, 0.2)
+                                         WHEN 3 THEN rnd_text(5000, 0.3)
+                                         ELSE 'short' END) AS ok,
+       pg_column_compression(big) AS compression
+FROM it ORDER BY id;
+ id | length | ok | compression 
+----+--------+----+-------------
+  1 | 100000 | t  | pglz
+  2 |  20032 | t  | 
+  3 |   5024 | t  | 
+  4 |      5 | t  | 
+(4 rows)
+
+-- every stored row is below the TOAST target: values compressed or external
+SELECT lp, lp_len <= 2048 AS below_target FROM iheap_page_items('it', 1) ORDER BY lp;
+ lp | below_target 
+----+--------------
+  1 | t
+  2 | t
+  3 | t
+  4 | t
+(4 rows)
+
+-- update a small column: the toast pointer is kept (in place)
+CREATE TEMP TABLE it_tids AS SELECT id, ctid AS t FROM it;
+UPDATE it SET small = small || '!' WHERE id IN (1, 2, 3);
+SELECT id, small, it.ctid = t AS same_tid, md5(big) = md5(rnd_text(20000, 0.2)) AS big2_ok
+FROM it JOIN it_tids USING (id) WHERE id IN (1, 2, 3) ORDER BY id;
+ id | small | same_tid | big2_ok 
+----+-------+----------+---------
+  1 | a!    | t        | f
+  2 | b!    | t        | t
+  3 | c!    | t        | f
+(3 rows)
+
+-- replace a toasted value; old snapshots of the cursor still see the old one
+BEGIN;
+DECLARE c CURSOR FOR SELECT id, md5(big) = md5(rnd_text(20000, 0.2)) AS old_value
+  FROM it WHERE id = 2;
+UPDATE it SET big = rnd_text(30000, 0.5) WHERE id = 2;
+FETCH ALL FROM c;
+ id | old_value 
+----+-----------
+  2 | t
+(1 row)
+
+SELECT length(big), md5(big) = md5(rnd_text(30000, 0.5)) AS new_value FROM it WHERE id = 2;
+ length | new_value 
+--------+-----------
+  30016 | t
+(1 row)
+
+COMMIT;
+-- rollback restores the old pointer
+BEGIN;
+UPDATE it SET big = 'tiny' WHERE id = 2;
+DELETE FROM it WHERE id = 3;
+ROLLBACK;
+SELECT id, length(big), length(b) FROM it ORDER BY id;
+ id | length | length 
+----+--------+--------
+  1 | 100000 |       
+  2 |  30016 |       
+  3 |   5024 |   3008
+  4 |      5 |       
+(4 rows)
+
+SELECT md5(big) = md5(rnd_text(30000, 0.5)) AS still_new FROM it WHERE id = 2;
+ still_new 
+-----------
+ t
+(1 row)
+
+-- moving a row with toasted values (key change)
+UPDATE it SET id = 30 WHERE id = 3;
+SELECT id, md5(big) = md5(rnd_text(5000, 0.3)) AS ok,
+       b = decode(rnd_text(3000, 0.4), 'escape') AS b_ok FROM it WHERE id = 30;
+ id | ok | b_ok 
+----+----+------
+ 30 | t  | t
+(1 row)
+
+-- delete frees the toast values (after vacuum of the toast table)
+DELETE FROM it WHERE id = 2;
+VACUUM it;
+SELECT count(*) FROM it;
+ count 
+-------
+     3
+(1 row)
+
+-- a wide row whose plain values exceed a page cannot be stored
+CREATE TABLE it_plain (a text STORAGE PLAIN) USING iheap;
+INSERT INTO it_plain VALUES (repeat('z', 9000));
+ERROR:  row is too big: size 9020, maximum size 7660
+INSERT INTO it_plain VALUES (repeat('z', 7000));
+SELECT length(a) FROM it_plain;
+ length 
+--------
+   7000
+(1 row)
+
+-- main storage: compressed in line
+CREATE TABLE it_main (a text STORAGE MAIN) USING iheap;
+INSERT INTO it_main VALUES (repeat('m', 50000));
+SELECT length(a), pg_column_compression(a) IS NOT NULL AS compressed FROM it_main;
+ length | compressed 
+--------+------------
+  50000 | t
+(1 row)
+
+UPDATE it_main SET a = a || 'n';
+SELECT length(a) FROM it_main;
+ length 
+--------
+  50001
+(1 row)
+
+-- many toasted rows, updated in place repeatedly
+CREATE TABLE it_many (id int PRIMARY KEY, n int, v text) USING iheap;
+INSERT INTO it_many SELECT g, 0, rnd_text(4000, g) FROM generate_series(1, 50) g;
+UPDATE it_many SET n = n + 1;
+UPDATE it_many SET n = n + 1;
+UPDATE it_many SET v = rnd_text(4000, id + 1000) WHERE id % 2 = 0;
+SELECT sum(n), count(*) FILTER (WHERE md5(v) = md5(rnd_text(4000, id + 1000))) AS replaced,
+       count(*) FILTER (WHERE md5(v) = md5(rnd_text(4000, id))) AS original
+FROM it_many;
+ sum | replaced | original 
+-----+----------+----------
+ 100 |       25 |       25
+(1 row)
+
+DROP TABLE it, it_plain, it_main, it_many;
+DROP FUNCTION rnd_text(int, float8);

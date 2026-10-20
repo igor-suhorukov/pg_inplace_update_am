@@ -1,0 +1,271 @@
+--
+-- Indexes: which updates stay in place, index builds, scans
+--
+CREATE TABLE ix (id int PRIMARY KEY, k int, tag text, doc jsonb, rng int4range,
+                 extra text, b int) USING iheap;
+CREATE INDEX ix_k ON ix (k);
+CREATE INDEX ix_tag_hash ON ix USING hash (tag);
+CREATE INDEX ix_doc ON ix USING gin (doc);
+CREATE INDEX ix_rng ON ix USING gist (rng);
+CREATE INDEX ix_b_brin ON ix USING brin (b);
+CREATE INDEX ix_partial ON ix (extra) WHERE extra IS NOT NULL;
+CREATE INDEX ix_expr ON ix (lower(tag));
+INSERT INTO ix
+SELECT g, g % 50, 'Tag' || (g % 20), jsonb_build_object('a', g % 7, 'b', 'x'),
+       int4range(g, g + 10), NULL, g
+FROM generate_series(1, 2000) g;
+ANALYZE ix;
+CREATE TEMP TABLE ix_tids AS SELECT id, ctid AS t FROM ix;
+-- column covered by no index: in place
+UPDATE ix SET extra = NULL WHERE id <= 100;
+-- covered by BRIN only (a summarizing index): in place too
+UPDATE ix SET b = b + 1 WHERE id BETWEEN 101 AND 200;
+-- btree-indexed column: moves
+UPDATE ix SET k = k + 1 WHERE id BETWEEN 201 AND 300;
+-- hash / gin / gist / expression / partial index columns: move
+UPDATE ix SET tag = tag || 'x' WHERE id BETWEEN 301 AND 400;
+UPDATE ix SET doc = doc || '{"c": 1}' WHERE id BETWEEN 401 AND 500;
+UPDATE ix SET rng = int4range(lower(rng), upper(rng) + 1) WHERE id BETWEEN 501 AND 600;
+UPDATE ix SET extra = 'set' WHERE id BETWEEN 601 AND 700;
+SELECT CASE WHEN id <= 100 THEN 'no index'
+            WHEN id <= 200 THEN 'brin only'
+            WHEN id <= 300 THEN 'btree'
+            WHEN id <= 400 THEN 'hash+expr'
+            WHEN id <= 500 THEN 'gin'
+            WHEN id <= 600 THEN 'gist'
+            WHEN id <= 700 THEN 'partial'
+            ELSE 'untouched' END AS what,
+       count(*) FILTER (WHERE ix.ctid = t) AS stayed,
+       count(*) FILTER (WHERE ix.ctid <> t) AS moved
+FROM ix JOIN ix_tids USING (id)
+GROUP BY 1 ORDER BY min(id);
+   what    | stayed | moved 
+-----------+--------+-------
+ no index  |    100 |     0
+ brin only |    100 |     0
+ btree     |      0 |   100
+ hash+expr |      0 |   100
+ gin       |      0 |   100
+ gist      |      0 |   100
+ partial   |      0 |   100
+ untouched |   1300 |     0
+(8 rows)
+
+-- an update that sets an indexed column to the same value stays in place
+UPDATE ix SET k = k, tag = tag WHERE id BETWEEN 701 AND 750;
+SELECT count(*) FILTER (WHERE ix.ctid = t) AS stayed FROM ix JOIN ix_tids USING (id)
+WHERE id BETWEEN 701 AND 750;
+ stayed 
+--------
+     50
+(1 row)
+
+-- the indexes agree with the table
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM ix WHERE k = 10;
+ count 
+-------
+    40
+(1 row)
+
+SELECT count(*) FROM ix WHERE tag = 'Tag5x';
+ count 
+-------
+     5
+(1 row)
+
+SELECT count(*) FROM ix WHERE lower(tag) = 'tag5x';
+ count 
+-------
+     5
+(1 row)
+
+SELECT count(*) FROM ix WHERE extra = 'set';
+ count 
+-------
+   100
+(1 row)
+
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+SELECT count(*) FROM ix WHERE doc @> '{"c": 1}';
+ count 
+-------
+   100
+(1 row)
+
+SELECT count(*) FROM ix WHERE rng @> 555;
+ count 
+-------
+    11
+(1 row)
+
+SELECT count(*) FROM ix WHERE k BETWEEN 10 AND 12;
+ count 
+-------
+   120
+(1 row)
+
+SELECT count(*) FROM ix WHERE b BETWEEN 150 AND 160;
+ count 
+-------
+    11
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_seqscan;
+SELECT count(*) FROM ix WHERE k = 10;
+ count 
+-------
+    40
+(1 row)
+
+SELECT count(*) FROM ix WHERE tag = 'Tag5x';
+ count 
+-------
+     5
+(1 row)
+
+SELECT count(*) FROM ix WHERE doc @> '{"c": 1}';
+ count 
+-------
+   100
+(1 row)
+
+SELECT count(*) FROM ix WHERE rng @> 555;
+ count 
+-------
+    11
+(1 row)
+
+-- unique constraint violations, and keys reused after delete
+INSERT INTO ix (id, k) VALUES (1, 0);
+ERROR:  duplicate key value violates unique constraint "ix_pkey"
+DETAIL:  Key (id)=(1) already exists.
+DELETE FROM ix WHERE id = 1;
+INSERT INTO ix (id, k) VALUES (1, 0);
+BEGIN;
+DELETE FROM ix WHERE id = 2;
+INSERT INTO ix (id, k) VALUES (2, 0);
+ROLLBACK;
+SELECT id, k, tag FROM ix WHERE id IN (1, 2) ORDER BY id;
+ id | k | tag  
+----+---+------
+  1 | 0 | 
+  2 | 2 | Tag2
+(2 rows)
+
+-- primary key change and back in one transaction
+BEGIN;
+UPDATE ix SET id = -3 WHERE id = 3;
+UPDATE ix SET id = 3 WHERE id = -3;
+COMMIT;
+SELECT id, k FROM ix WHERE id IN (3, -3);
+ id | k 
+----+---
+  3 | 3
+(1 row)
+
+-- deferrable unique constraint
+CREATE TABLE ixd (a int UNIQUE DEFERRABLE INITIALLY DEFERRED) USING iheap;
+INSERT INTO ixd VALUES (1), (2), (3);
+UPDATE ixd SET a = a + 1;
+SELECT * FROM ixd ORDER BY a;
+ a 
+---
+ 2
+ 3
+ 4
+(3 rows)
+
+BEGIN;
+INSERT INTO ixd VALUES (2);
+COMMIT;
+ERROR:  duplicate key value violates unique constraint "ixd_a_key"
+DETAIL:  Key (a)=(2) already exists.
+-- index-only scans need the visibility map
+VACUUM ix;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT k FROM ix WHERE k = 7;
+            QUERY PLAN            
+----------------------------------
+ Index Only Scan using ix_k on ix
+   Index Cond: (k = 7)
+(2 rows)
+
+SELECT count(k) FROM ix WHERE k = 7;
+ count 
+-------
+    40
+(1 row)
+
+UPDATE ix SET k = 7 WHERE id = 1000;
+SELECT count(k) FROM ix WHERE k = 7;
+ count 
+-------
+    41
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- building indexes on a table with history and uncommitted changes
+CREATE TABLE ixb (id int, v int, s text) USING iheap;
+INSERT INTO ixb SELECT g, g, 's' || g FROM generate_series(1, 1000) g;
+UPDATE ixb SET v = v + 1 WHERE id % 3 = 0;
+DELETE FROM ixb WHERE id % 5 = 0;
+BEGIN;
+UPDATE ixb SET v = -v WHERE id % 7 = 0;
+CREATE INDEX ixb_v ON ixb (v);
+SET LOCAL enable_seqscan = off;
+SELECT count(*) FROM ixb WHERE v < 0;
+ count 
+-------
+   114
+(1 row)
+
+ROLLBACK;
+CREATE INDEX ixb_v ON ixb (v);
+CREATE UNIQUE INDEX CONCURRENTLY ixb_id ON ixb (id);
+REINDEX TABLE ixb;
+REINDEX TABLE CONCURRENTLY ixb;
+SET enable_seqscan = off;
+SELECT count(*) FROM ixb WHERE v < 0;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM ixb WHERE id = 10;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM ixb WHERE id = 11;
+ count 
+-------
+     1
+(1 row)
+
+RESET enable_seqscan;
+SELECT count(*) FROM ixb;
+ count 
+-------
+   800
+(1 row)
+
+-- amcheck-style cross-check: every row is found through each index
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) = (SELECT count(*) FROM ixb) AS all_via_index
+FROM ixb WHERE id > 0;
+ all_via_index 
+---------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE ix, ixd, ixb;

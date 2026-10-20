@@ -1,0 +1,179 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1b s1u s2u s1c s2sel
+step s1b: BEGIN;
+step s1u: UPDATE uc SET v = v + 1 WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|10|202|      1
+ 2|20|200|      1
+(2 rows)
+
+
+starting permutation: s1b s1u s2u s3u s1c s2sel
+step s1b: BEGIN;
+step s1u: UPDATE uc SET v = v + 1 WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s3u: UPDATE uc SET v = v + 1000 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+step s3u: <... completed>
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|   v|notelen
+--+--+----+-------
+ 1|10|1202|      1
+ 2|20| 200|      1
+(2 rows)
+
+
+starting permutation: s1b s1k s2u s3uk s1c s2sel
+step s1b: BEGIN;
+step s1k: UPDATE uc SET k = k + 1 WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s3uk: UPDATE uc SET v = v + 1000 WHERE k = 11;
+step s1c: COMMIT;
+step s2u: <... completed>
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|11|200|      1
+ 2|20|200|      1
+(2 rows)
+
+
+starting permutation: s1b s1u s2u s1a s2sel
+step s1b: BEGIN;
+step s1u: UPDATE uc SET v = v + 1 WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s1a: ROLLBACK;
+step s2u: <... completed>
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|10|200|      1
+ 2|20|200|      1
+(2 rows)
+
+
+starting permutation: s1b s1grow s2u s1c s2sel
+step s1b: BEGIN;
+step s1grow: UPDATE uc SET note = repeat('x', 500) WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|10|200|    500
+ 2|20|200|      1
+(2 rows)
+
+
+starting permutation: s1b s1k s2u s1c s2sel
+step s1b: BEGIN;
+step s1k: UPDATE uc SET k = k + 1 WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|11|200|      1
+ 2|20|200|      1
+(2 rows)
+
+
+starting permutation: s1b s1k s2uk s1c s2sel
+step s1b: BEGIN;
+step s1k: UPDATE uc SET k = k + 1 WHERE id = 1;
+step s2uk: UPDATE uc SET v = v * 2 WHERE k = 10; <waiting ...>
+step s1c: COMMIT;
+step s2uk: <... completed>
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|11|100|      1
+ 2|20|200|      1
+(2 rows)
+
+
+starting permutation: s1b s1d s2u s1c s2sel
+step s1b: BEGIN;
+step s1d: DELETE FROM uc WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 2|20|200|      1
+(1 row)
+
+
+starting permutation: s2rr s1b s1u s1c s2u s2c s2sel
+step s2rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM uc;
+count
+-----
+    2
+(1 row)
+
+step s1b: BEGIN;
+step s1u: UPDATE uc SET v = v + 1 WHERE id = 1;
+step s1c: COMMIT;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1;
+ERROR:  could not serialize access due to concurrent update
+step s2c: COMMIT;
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|10|101|      1
+ 2|20|200|      1
+(2 rows)
+
+
+starting permutation: s2rr s1b s1u s2u s1c s2c s2sel
+step s2rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM uc;
+count
+-----
+    2
+(1 row)
+
+step s1b: BEGIN;
+step s1u: UPDATE uc SET v = v + 1 WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2c: COMMIT;
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|10|101|      1
+ 2|20|200|      1
+(2 rows)
+
+
+starting permutation: s2rr s1b s1u s2u s1a s2c s2sel
+step s2rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM uc;
+count
+-----
+    2
+(1 row)
+
+step s1b: BEGIN;
+step s1u: UPDATE uc SET v = v + 1 WHERE id = 1;
+step s2u: UPDATE uc SET v = v * 2 WHERE id = 1; <waiting ...>
+step s1a: ROLLBACK;
+step s2u: <... completed>
+step s2c: COMMIT;
+step s2sel: SELECT id, k, v, length(note) AS notelen FROM uc ORDER BY id;
+id| k|  v|notelen
+--+--+---+-------
+ 1|10|200|      1
+ 2|20|200|      1
+(2 rows)
+

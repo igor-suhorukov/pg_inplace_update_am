@@ -1,0 +1,5 @@
+# pg_inplace_update_am extension
+comment = 'iheap: table access method with in-place updates and undo'
+default_version = '0.1'
+module_pathname = '$libdir/pg_inplace_update_am'
+relocatable = true

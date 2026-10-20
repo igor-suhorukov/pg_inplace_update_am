@@ -1,0 +1,78 @@
+# Core-suite tests whose output legitimately differs with
+# default_table_access_method = iheap (test/run.sh core, compare.sh).
+# One test per line: <suite>/<name>, then why.  Every entry was reviewed
+# against the diff; test/core/classify.py sorts diffs into order / plan /
+# other to help keep this list honest.
+#
+# Recurring reasons:
+#   order   queries without ORDER BY return rows in physical order, and an
+#           in-place update leaves the row where it was (heap appends the
+#           new version), so the order differs
+#   plan    other size and cost estimates: 16-byte tuple headers, relpages
+#           counting the metapage and undo pages, the all-visible fraction
+#   layout  block 0 is the metapage and undo pages live in the main fork,
+#           so TIDs, relation sizes and block ranges differ; in-place
+#           updates keep the TID
+
+# --- regress: row order only
+regress/alter_table        order
+regress/arrays             order
+regress/case               order
+regress/constraints        order
+regress/copy2              order
+regress/foreign_key        order
+regress/generated_stored   order
+regress/identity           order
+regress/inherit            order
+regress/jsonb              order
+regress/merge              order
+regress/plpgsql            order
+regress/rowtypes           order
+regress/rules              order
+regress/transactions       order
+regress/with               order
+
+# --- regress: plans only, or plans and order
+regress/box                plan
+regress/collate.icu.utf8   plan
+regress/insert_conflict    plan (seq scan instead of an index-only scan in a subplan), order
+regress/join               plan (incl. Memoize cache mode), order
+regress/partition_aggregate plan
+regress/partition_join     plan
+regress/partition_prune    plan
+regress/predicate          plan
+regress/select_views       plan, order
+regress/subselect          plan
+regress/updatable_views    plan, order
+
+# --- regress: other
+regress/brin               layout: brin_summarize_range over all ranges also finds the undo pages' ranges
+regress/brin_bloom         layout: as brin
+regress/brin_multi         layout: as brin
+regress/combocid           layout (TIDs); no combo command ids: cmin comes from undo records
+regress/create_am          pg_am lists iheap
+regress/create_index       pg_depend lists each table's dependency on access method iheap (it is not pinned); plan
+regress/insert             largest row is 7660 bytes (heap: 8160); relation sizes include the metapage and undo extent
+regress/namespace          CLUSTER copies in index order without a sort, so the index expression is evaluated fewer times
+regress/portals            order: cursors see rows in physical order, updated rows keep their place
+regress/psql               \dA lists iheap
+regress/reloptions         layout: VACUUM truncation leaves the metapage, the size never returns to 0
+regress/returning          layout (in-place updates keep ctid), plan, order
+regress/rowsecurity        layout: TABLESAMPLE picks other rows; order
+regress/stats              relpages counts metapage and undo pages but scans read data pages only; VACUUM FULL writes through shared buffers, so the next VACUUM reads nothing through its ring
+regress/tablesample        layout: sampling depends on the block layout
+regress/temp               scans copy pages and keep no buffer pins between rows, so local-buffer exhaustion does not happen; layout
+regress/tid                layout: there is no row at (0,1)
+regress/tidrangescan       layout
+regress/tidscan            layout
+regress/triggers           order: per-row trigger notices; the self-referencing DELETE meets the parent first and no longer fails with "already modified"
+regress/tuplesort          layout: ORDER BY ctid
+regress/update             order; RETURNING xmax after ON CONFLICT DO UPDATE is 0 (heap's own test calls its nonzero value "probably not good")
+regress/vacuum             no parallel index vacuum, so no warning for temp tables; layout: truncation leaves the metapage
+
+# --- isolation
+isolation/eval-plan-qual   layout: rows start at block 1, steps updating WHERE ctid = '(0,1)' find nothing
+isolation/inherit-temp     order
+isolation/multiple-row-versions  a SIREAD lock on a TID covers all in-place versions of the row, so SSI sees one more rw-dependency and aborts one more transaction (a safe false positive)
+isolation/multixact-stats  iheap keeps lockers in undo records and creates no MultiXacts
+isolation/vacuum-no-cleanup-lock  layout: relpages includes the metapage and undo extent

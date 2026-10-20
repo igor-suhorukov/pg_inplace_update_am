@@ -1,0 +1,133 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1b s1aux s2b s2ins s2c s1c s3sel
+step s1b: BEGIN;
+step s1aux: UPDATE parent SET aux = 'changed' WHERE id = 1;
+step s2b: BEGIN;
+step s2ins: INSERT INTO child VALUES (100, 1);
+step s2c: COMMIT;
+step s1c: COMMIT;
+step s3sel: SELECT p.id, p.aux, p.tag, (SELECT count(*) FROM child c WHERE c.pid = p.id) AS children FROM parent p ORDER BY p.id;
+id|aux    |tag|children
+--+-------+---+--------
+ 1|changed|  0|       1
+ 2|b      |  0|       0
+(2 rows)
+
+
+starting permutation: s1b s1aux s2b s2ins s1c s2c s3sel
+step s1b: BEGIN;
+step s1aux: UPDATE parent SET aux = 'changed' WHERE id = 1;
+step s2b: BEGIN;
+step s2ins: INSERT INTO child VALUES (100, 1);
+step s1c: COMMIT;
+step s2c: COMMIT;
+step s3sel: SELECT p.id, p.aux, p.tag, (SELECT count(*) FROM child c WHERE c.pid = p.id) AS children FROM parent p ORDER BY p.id;
+id|aux    |tag|children
+--+-------+---+--------
+ 1|changed|  0|       1
+ 2|b      |  0|       0
+(2 rows)
+
+
+starting permutation: s1b s1aux s2b s2ins s1a s3del s2c s3sel
+step s1b: BEGIN;
+step s1aux: UPDATE parent SET aux = 'changed' WHERE id = 1;
+step s2b: BEGIN;
+step s2ins: INSERT INTO child VALUES (100, 1);
+step s1a: ROLLBACK;
+step s3del: DELETE FROM parent WHERE id = 1; <waiting ...>
+step s2c: COMMIT;
+step s3del: <... completed>
+ERROR:  update or delete on table "parent" violates foreign key constraint "child_pid_fkey" on table "child"
+step s3sel: SELECT p.id, p.aux, p.tag, (SELECT count(*) FROM child c WHERE c.pid = p.id) AS children FROM parent p ORDER BY p.id;
+id|aux|tag|children
+--+---+---+--------
+ 1|a  |  0|       1
+ 2|b  |  0|       0
+(2 rows)
+
+
+starting permutation: s1b s1key s2b s2ins s1c s2c s3sel
+step s1b: BEGIN;
+step s1key: UPDATE parent SET id = 10 WHERE id = 1;
+step s2b: BEGIN;
+step s2ins: INSERT INTO child VALUES (100, 1); <waiting ...>
+step s1c: COMMIT;
+step s2ins: <... completed>
+ERROR:  insert or update on table "child" violates foreign key constraint "child_pid_fkey"
+step s2c: COMMIT;
+step s3sel: SELECT p.id, p.aux, p.tag, (SELECT count(*) FROM child c WHERE c.pid = p.id) AS children FROM parent p ORDER BY p.id;
+id|aux|tag|children
+--+---+---+--------
+ 2|b  |  0|       0
+10|a  |  0|       0
+(2 rows)
+
+
+starting permutation: s1b s1key s2b s2ins s1a s2c s3sel
+step s1b: BEGIN;
+step s1key: UPDATE parent SET id = 10 WHERE id = 1;
+step s2b: BEGIN;
+step s2ins: INSERT INTO child VALUES (100, 1); <waiting ...>
+step s1a: ROLLBACK;
+step s2ins: <... completed>
+step s2c: COMMIT;
+step s3sel: SELECT p.id, p.aux, p.tag, (SELECT count(*) FROM child c WHERE c.pid = p.id) AS children FROM parent p ORDER BY p.id;
+id|aux|tag|children
+--+---+---+--------
+ 1|a  |  0|       1
+ 2|b  |  0|       0
+(2 rows)
+
+
+starting permutation: s1b s1tag s2b s2ins s2c s1c s3sel
+step s1b: BEGIN;
+step s1tag: UPDATE parent SET tag = tag + 1 WHERE id = 1;
+step s2b: BEGIN;
+step s2ins: INSERT INTO child VALUES (100, 1);
+step s2c: COMMIT;
+step s1c: COMMIT;
+step s3sel: SELECT p.id, p.aux, p.tag, (SELECT count(*) FROM child c WHERE c.pid = p.id) AS children FROM parent p ORDER BY p.id;
+id|aux|tag|children
+--+---+---+--------
+ 1|a  |  1|       1
+ 2|b  |  0|       0
+(2 rows)
+
+
+starting permutation: s1b s1tag s2b s2ins s1c s3del s2c s3sel
+step s1b: BEGIN;
+step s1tag: UPDATE parent SET tag = tag + 1 WHERE id = 1;
+step s2b: BEGIN;
+step s2ins: INSERT INTO child VALUES (100, 1);
+step s1c: COMMIT;
+step s3del: DELETE FROM parent WHERE id = 1; <waiting ...>
+step s2c: COMMIT;
+step s3del: <... completed>
+ERROR:  update or delete on table "parent" violates foreign key constraint "child_pid_fkey" on table "child"
+step s3sel: SELECT p.id, p.aux, p.tag, (SELECT count(*) FROM child c WHERE c.pid = p.id) AS children FROM parent p ORDER BY p.id;
+id|aux|tag|children
+--+---+---+--------
+ 1|a  |  1|       1
+ 2|b  |  0|       0
+(2 rows)
+
+
+starting permutation: s1b s1tag s2b s2ins s1a s3del s2c s3sel
+step s1b: BEGIN;
+step s1tag: UPDATE parent SET tag = tag + 1 WHERE id = 1;
+step s2b: BEGIN;
+step s2ins: INSERT INTO child VALUES (100, 1);
+step s1a: ROLLBACK;
+step s3del: DELETE FROM parent WHERE id = 1; <waiting ...>
+step s2c: COMMIT;
+step s3del: <... completed>
+ERROR:  update or delete on table "parent" violates foreign key constraint "child_pid_fkey" on table "child"
+step s3sel: SELECT p.id, p.aux, p.tag, (SELECT count(*) FROM child c WHERE c.pid = p.id) AS children FROM parent p ORDER BY p.id;
+id|aux|tag|children
+--+---+---+--------
+ 1|a  |  0|       1
+ 2|b  |  0|       0
+(2 rows)
+

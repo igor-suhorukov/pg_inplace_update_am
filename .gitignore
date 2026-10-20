@@ -1,0 +1,14 @@
+# Builds and tests run in containers, outside the tree (scripts/docker.sh);
+# their results go to out/
+/out/
+# what a build in the tree would leave (PGXS), and an installcheck's outputs
+*.o
+*.so
+*.bc
+/results/
+/regression.diffs
+/regression.out
+/output_iso/
+/log/
+/tmp_check/
+/tmp_check_iso/
