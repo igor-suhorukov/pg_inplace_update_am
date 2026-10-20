@@ -8,6 +8,7 @@
 #   scripts/docker.sh test [regress|isolation|tap|core|all]...
 #   scripts/docker.sh shell
 #   scripts/docker.sh bench
+#   scripts/docker.sh olap [tpch|tpcds|clickbench]...
 #
 set -euo pipefail
 
@@ -15,7 +16,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=pg_inplace_update_am/dev
 
 usage() {
-	sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # run <debug|release> <docker-run-extra-args...> -- <command...>
@@ -29,8 +30,7 @@ run() {
 	done
 	shift
 	mkdir -p "$ROOT/out"
-	docker run --rm "${extra[@]}" \
-		--shm-size=1g \
+	docker run --rm --shm-size=1g "${extra[@]}" \
 		-v "$ROOT":/src:ro \
 		-v "$ROOT/out":/out \
 		"$IMAGE:19-$flavor" "$@"
@@ -59,6 +59,23 @@ case "$cmd" in
 		;;
 	bench)
 		run release -- bash /src/test/run.sh bench "$@"
+		;;
+	olap)
+		# bench/olap/run.sh: the generated data and the clusters in
+		# OLAP_CACHE; ClickBench's checkout and its hits table (a .tsv,
+		# CLICKBENCH_TSV inside the container) mounted read-only
+		cache=${OLAP_CACHE:-$HOME/.cache/pg_inplace_update_am}
+		cb=${CLICKBENCH_DIR:-$ROOT/../../ClickBench}
+		hits=${HITS_DIR:-$HOME/.cache/pg_accel/clickbench}
+		mkdir -p "$cache"
+		extra=(--shm-size=16g -v "$cache":/cache)
+		[ -d "$cb" ] && extra+=(-v "$(cd "$cb" && pwd)":/clickbench:ro)
+		[ -d "$hits" ] && extra+=(-v "$(cd "$hits" && pwd)":/hits:ro)
+		for v in TPCH_SF TPCDS_SF CLICKBENCH_TSV AMS TRIES TIMEOUT QUERIES WORKERS \
+			SHARED_BUFFERS WORK_MEM DUCKDB_THREADS; do
+			[ -n "${!v:-}" ] && extra+=(-e "$v=${!v}")
+		done
+		run release "${extra[@]}" -- bash /src/test/run.sh olap "$@"
 		;;
 	*)
 		usage

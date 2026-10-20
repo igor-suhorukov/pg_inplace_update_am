@@ -67,10 +67,20 @@ RUN set -eu; \
     apt-get install -y --no-install-recommends \
         build-essential perl libipc-run-perl libreadline-dev zlib1g-dev \
         libicu-dev liblz4-dev libzstd-dev locales procps gdb less git \
-        ca-certificates python3; \
+        ca-certificates python3 python3-venv; \
     sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen; \
     locale-gen; \
     rm -rf /var/lib/apt/lists/*
+
+# DuckDB, pinned, for the analytical benchmarks (bench/olap): its tpch and
+# tpcds extensions generate TPC-H's and TPC-DS's data and queries, so that
+# nothing of TPC's kits is copied into the tree.
+ARG DUCKDB_VERSION=1.5.5
+RUN set -eu; \
+    python3 -m venv /opt/duckdb; \
+    /opt/duckdb/bin/pip install --no-cache-dir "duckdb==${DUCKDB_VERSION}"; \
+    /opt/duckdb/bin/python -c "import duckdb; c = duckdb.connect(config={'extension_directory': '/opt/duckdb/extensions'}); c.install_extension('tpch'); c.install_extension('tpcds')"; \
+    chmod -R a+rX /opt/duckdb
 
 COPY --from=pgbuild /opt/pg19 /opt/pg19
 # The built source tree: core regression/isolation suites (run against

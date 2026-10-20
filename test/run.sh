@@ -7,6 +7,7 @@
 #                                   regress isolation tap core core-dm all
 #                                   core:isolation/<test>,regress/<test>
 #   run.sh bench [args]             benchmarks (release image)
+#   run.sh olap [bench...]          analytical benchmarks (release image)
 #
 # /src is the read-only source tree, /out the output directory; results of
 # suite S go to /out/S.
@@ -213,6 +214,11 @@ case "$cmd" in
 		do_build
 		do_install
 		bash "$BUILD/bench/run.sh" "$@"
+		;;
+	olap)
+		do_build
+		do_install
+		bash "$BUILD/bench/olap/run.sh" "$@"
 		;;
 	*)
 		sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
