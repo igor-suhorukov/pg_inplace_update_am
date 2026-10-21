@@ -44,6 +44,7 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
@@ -235,6 +236,11 @@ ih_unlock_pair(Buffer buffer, Buffer other)
 /*
  * A data page that is in shared buffers, pinned; InvalidBuffer if it would
  * have to be read (a prefetch is started then).
+ *
+ * A buffer still being read is skipped before ReadRecentBuffer(): when this
+ * backend pins it already (a scan's read stream reading ahead), PostgreSQL
+ * 19's ReadRecentBuffer() pins it once more and returns false, and that pin
+ * is never released.  A valid buffer stays valid while we pin it.
  */
 static Buffer
 ih_pin_if_cached(Relation rel, BlockNumber blk)
@@ -242,6 +248,9 @@ ih_pin_if_cached(Relation rel, BlockNumber blk)
 	PrefetchBufferResult pr = PrefetchBuffer(rel, MAIN_FORKNUM, blk);
 
 	if (BufferIsValid(pr.recent_buffer) &&
+		(BufferIsLocal(pr.recent_buffer) ||
+		 (pg_atomic_read_u64(&GetBufferDescriptor(pr.recent_buffer - 1)->state) &
+		  BM_VALID)) &&
 		ReadRecentBuffer(rel->rd_locator, MAIN_FORKNUM, blk, pr.recent_buffer))
 		return pr.recent_buffer;
 	return InvalidBuffer;
