@@ -1,6 +1,10 @@
 # Build the extension against PostgreSQL 19rc1 as packaged in the official
-# Docker image: the server headers come from the PGDG repository the image
-# is set up with, pinned to the image's own server version.
+# Docker image, and run its test suites there.  The server headers and the
+# test tools come from the PGDG repository the image is set up with, pinned
+# to the image's own server version.  test/run.sh builds and tests as the
+# postgres user, since initdb refuses to run as root; that user owns the
+# directories the extension installs into.  The suites that need injection
+# points skip themselves: the packaged server is built without them.
 name: build
 
 on:
@@ -11,17 +15,39 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: postgres:19rc1-trixie
+    timeout-minutes: 60
+    container:
+      image: postgres:19rc1-trixie
+      # dynamic shared memory for parallel workers, as scripts/docker.sh gives
+      options: --shm-size=1g
     env:
       DEBIAN_FRONTEND: noninteractive
+      IHEAP_IN_CONTAINER: 1
+      BUILD: /tmp/build
+      OUT: /tmp/out
     steps:
-      - name: Install build dependencies
+      - name: Install build and test dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential "postgresql-server-dev-$PG_MAJOR=$PG_VERSION"
+            build-essential "postgresql-server-dev-$PG_MAJOR=$PG_VERSION" \
+            libipc-run-perl python3
+          chown postgres "$(pg_config --pkglibdir)" \
+            "$(pg_config --pkglibdir)/bitcode" "$(pg_config --sharedir)/extension"
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Build
-        run: make -j"$(nproc)" COPT=-Werror
+        run: runuser -u postgres -- env SRC="$GITHUB_WORKSPACE" bash test/run.sh build
+
+      - name: Test
+        run: |
+          runuser -u postgres -- env SRC="$GITHUB_WORKSPACE" \
+            bash test/run.sh test regress isolation tap model
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: /tmp/out

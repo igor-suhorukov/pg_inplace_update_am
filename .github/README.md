@@ -80,8 +80,10 @@ The suites:
 Results go to `out/`.
 
 On every push and pull request, GitHub Actions builds the extension with
-`-Werror` against the official `postgres:19rc1-trixie` image
-(`.github/workflows/build.yml`).
+`-Werror` against the official `postgres:19rc1-trixie` image, then runs the
+regression, isolation and TAP suites and the model check there
+(`.github/workflows/build.yml`). The tests that need injection points skip
+themselves, because the packaged server is built without them.
 
 `scripts/docker.sh bench` and `scripts/docker.sh olap` run benchmarks that
 compare heap with iheap, using the release image
