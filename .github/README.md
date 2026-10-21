@@ -99,3 +99,9 @@ compare heap with iheap, using the release image
 | `test/` | regression, isolation and TAP tests, the rollback model, core-suite runs |
 | `bench/` | benchmarks: heap vs iheap |
 | `docker/`, `scripts/` | the development image and the host-side entry point |
+
+## License
+
+The PostgreSQL License (`LICENSE`), the license of PostgreSQL itself.
+dmbtree is derived from PostgreSQL's nbtree and amcheck, and parts of iheap
+from its heap access method; that code keeps PostgreSQL's copyright notices.
