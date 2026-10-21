@@ -1,14 +1,13 @@
 # syntax=docker/dockerfile:1.7
 #
-# pg_inplace_update_am development image (DESIGN.md §20).
+# pg_inplace_update_am development image.
 #
 # Everything is built and tested inside containers; nothing is compiled or
 # installed on the host.  This image builds PostgreSQL 19 from source at a
-# pinned REL_19_STABLE commit (the tree DESIGN.md's file:line references
-# point at) and carries the toolchain needed to build the extension through
-# PGXS and run its regression, isolation and TAP tests.
+# pinned REL_19_STABLE commit and carries the toolchain needed to build the
+# extension through PGXS and run its regression, isolation and TAP tests.
 #
-#   PG_COMMIT   REL_19_STABLE commit to build (default: the one DESIGN.md cites)
+#   PG_COMMIT   REL_19_STABLE commit to build (default: the pinned one)
 #   PG_BUILD    debug   --enable-cassert --enable-debug --enable-injection-points,
 #                       -O1; used by every test run
 #               release -O2, no assertions; used by benchmarks only

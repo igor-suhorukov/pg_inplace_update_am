@@ -75,6 +75,50 @@ SELECT * FROM imix ORDER BY b;
 UPDATE imix SET n = n * 2, arr = arr || 4 WHERE a = 7;
 SELECT * FROM imix ORDER BY b;
 
+-- a rollback puts a version that needs alignment back where it suits: shrunk
+-- below alignment, then relocated longer, rolled back
+CREATE TABLE ialign (id int PRIMARY KEY, s text, t text) USING iheap;
+INSERT INTO ialign SELECT g, repeat('p', g * 3), NULL FROM generate_series(1, 5) g;
+INSERT INTO ialign VALUES (100, repeat('a', 200), NULL);
+BEGIN;
+UPDATE ialign SET s = repeat('b', 100) WHERE id = 100;
+UPDATE ialign SET s = repeat('c', 120), t = repeat('d', 100) WHERE id = 100;
+ROLLBACK;
+SELECT count(*) AS problems FROM iheap_check('ialign');
+SELECT length(s), t IS NULL AS t_null FROM ialign WHERE id = 100;
+-- and when compaction moves the shrunk version before the rollback
+CREATE TABLE ialign2 (id int PRIMARY KEY, s text, t text) USING iheap;
+INSERT INTO ialign2 SELECT g, repeat('p', 30 + g), NULL FROM generate_series(1, 22) g;
+INSERT INTO ialign2 VALUES (100, repeat('a', 200), NULL);
+DELETE FROM ialign2 WHERE id % 2 = 0 AND id < 100;
+BEGIN;
+UPDATE ialign2 SET s = repeat('b', 100) WHERE id = 100;
+PREPARE TRANSACTION 'ialign2';
+VACUUM ialign2;
+ROLLBACK PREPARED 'ialign2';
+SELECT count(*) AS problems FROM iheap_check('ialign2');
+SELECT length(s) FROM ialign2 WHERE id = 100;
+DROP TABLE ialign, ialign2;
+
+-- a move that rolls back puts the versions under it back in their place:
+-- compaction keeps room for the one its in-place update shrank
+CREATE TABLE iroom (id int PRIMARY KEY, k int, s text) USING iheap WITH (fillfactor = 90);
+CREATE INDEX iroom_k ON iroom USING btree (k);
+INSERT INTO iroom SELECT g, g, repeat('r', 40) FROM generate_series(1, 100) g;
+DELETE FROM iroom WHERE id BETWEEN 10 AND 20;
+BEGIN;
+UPDATE iroom SET s = 'x' WHERE id = 2;
+UPDATE iroom SET k = -2 WHERE id = 2;
+PREPARE TRANSACTION 'iroom';
+VACUUM iroom;
+SELECT lp_off AS iroom_off FROM iheap_page_items('iroom', 1) WHERE lp = 2 \gset
+ROLLBACK PREPARED 'iroom';
+UPDATE iroom SET s = s WHERE id = 2;
+SELECT lp_off = :iroom_off AS in_place FROM iheap_page_items('iroom', 1) WHERE lp = 2;
+SELECT count(*) AS problems FROM iheap_check('iroom');
+SELECT k, length(s) FROM iroom WHERE id = 2;
+DROP TABLE iroom;
+
 -- many columns, wide null bitmap
 SELECT 'CREATE TABLE iwide (' ||
        string_agg('c' || g || ' int', ', ') || ') USING iheap'

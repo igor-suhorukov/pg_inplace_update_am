@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
-# heap vs iheap benchmarks (DESIGN.md §20, §22.3), run inside the release
-# image by "scripts/docker.sh bench".  Results: /out/bench/results.csv and
-# logs.
+# heap vs iheap benchmarks, run inside the release image by "scripts/docker.sh
+# bench".  Results: /out/bench/results.csv and logs.
 #
 #   bench/run.sh [duration_seconds] [scale] [clients] [variants] [workloads]
 #
@@ -28,8 +27,8 @@
 #                other half
 #   grow         each row of a table filled to fillfactor 100 made 8 bytes
 #                longer once, in a random order: a timestamp set where it
-#                was NULL, as the demo database's boardings (§22.3); the
-#                run is that many transactions, not a duration
+#                was NULL, as the demo database's boardings; the run is that
+#                many transactions, not a duration
 #   grow_hold    grow while a REPEATABLE READ snapshot is held
 #
 # Each run's log ends with the table's updates: how many, how many in place

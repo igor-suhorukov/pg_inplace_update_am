@@ -1,5 +1,5 @@
 --
--- Cumulative statistics of iheap relations (iheap_stat, DESIGN.md §15)
+-- Cumulative statistics of iheap relations (iheap_stat)
 --
 -- A backend flushes its counts when it goes idle, at most once a second;
 -- pg_stat_force_next_flush() makes the next flush happen at once, and the

@@ -1,6 +1,6 @@
 --
 -- dmbtree indexes with expressions, predicates and INCLUDE columns take
--- in-place updates of the columns they read (DESIGN.md §21 D39)
+-- in-place updates of the columns they read
 --
 CREATE TABLE dx (id int PRIMARY KEY, s text, n int, flag bool, inc text,
                  pad text)

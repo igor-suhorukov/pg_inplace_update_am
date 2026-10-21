@@ -4,20 +4,18 @@
  *	  Index support: build scans, CREATE INDEX CONCURRENTLY validation and
  *	  index tuple deletion checks.
  *
- * Under rule (b) (DESIGN.md §7.4) every version of a row has the same values
- * in the columns of every existing index, so index entries never need
- * per-version handling.  A *new* index is different: versions still kept in
- * undo for old snapshots may differ in the new index's columns.  A build
- * that sees in-place updates some snapshot may not see yet therefore sets
- * ii_BrokenHotChain, which makes core set indcheckxmin so older snapshots
- * don't use the new index (§11.2).
+ * Under rule (b) every version of a row has the same values in the columns of
+ * every existing index, so index entries never need per-version handling.  A
+ * *new* index is different: versions still kept in undo for old snapshots may
+ * differ in the new index's columns.  A build that sees in-place updates some
+ * snapshot may not see yet therefore sets ii_BrokenHotChain, which makes core
+ * set indcheckxmin so older snapshots don't use the new index.
  *
  * A build of a dmbtree index that takes in-place updates, new or rebuilt,
  * instead gives the index delete-marked entries for the keys of the older
- * versions some snapshot may still see (§21 D32 B): such an index serves
- * every snapshot at once.  Only when an older version holds a value stored
- * out of line does it fall back to indcheckxmin (dmbtbuild() sets it for a
- * rebuild).
+ * versions some snapshot may still see: such an index serves every snapshot
+ * at once.  Only when an older version holds a value stored out of line does
+ * it fall back to indcheckxmin (dmbtbuild() sets it for a rebuild).
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -53,7 +51,7 @@ typedef struct BuildEntry
 	bool		alive;
 	TransactionId xmin;
 	int			nolder;			/* older versions some snapshot may see */
-	char	  **older;			/* (§21 D32 B), newest first */
+	char	  **older;			/* newest first */
 	uint32	   *olderlen;
 } BuildEntry;
 
@@ -130,15 +128,14 @@ build_version(Relation rel, Buffer buf, Page page, OffsetNumber off,
 }
 
 /*
- * For a build that indexes the keys of older versions (§21 D32 B): the
- * versions of the row at off before the one build_version() returns that
- * some snapshot may still see, newest first, copied into the current memory
- * context.  The walk stops at a version every snapshot sees (frozen, or
- * committed and visible to all): nobody sees the ones before it.  Versions
- * of aborted transactions are seen by nobody, deletions have no key.
- * Returns false when one of them holds a value stored out of line: its key
- * cannot be computed safely (the TOAST data of a version on its way out may
- * be removed meanwhile).
+ * For a build that indexes the keys of older versions: the versions of the
+ * row at off before the one build_version() returns that some snapshot may
+ * still see, newest first, copied into the current memory context.  The walk
+ * stops at a version every snapshot sees (frozen, or committed and visible to
+ * all): nobody sees the ones before it.  Versions of aborted transactions are
+ * seen by nobody, deletions have no key.  Returns false when one of them
+ * holds a value stored out of line: its key cannot be computed safely (the
+ * TOAST data of a version on its way out may be removed meanwhile).
  */
 static bool
 older_versions(Relation rel, Page page, OffsetNumber off,
@@ -264,13 +261,13 @@ build_values_equal(TupleDesc idesc, int from, int to, const Datum *a,
 
 /*
  * The entries of a row with older versions some snapshot may still see, in
- * a build that indexes their keys (§21 D32 B): the newest version's (in
- * slot) as any other, and a delete-marked one for each other key an older
- * version has, which cleanup removes once nobody sees that version.  An
- * older version with the newest one's key but other INCLUDE values makes
- * the newest entry marked too (a marked copy, which marks the entry after
- * the load): an unmarked entry's INCLUDE values are returned by index-only
- * scans for every version with its key.
+ * a build that indexes their keys: the newest version's (in slot) as any
+ * other, and a delete-marked one for each other key an older version has,
+ * which cleanup removes once nobody sees that version.  An older version with
+ * the newest one's key but other INCLUDE values makes the newest entry marked
+ * too (a marked copy, which marks the entry after the load): an unmarked
+ * entry's INCLUDE values are returned by index-only scans for every version
+ * with its key.
  */
 static void
 build_older_keys(Relation indexRel, IndexInfo *indexInfo, EState *estate,
@@ -408,8 +405,8 @@ iheap_index_build_range_scan(Relation heapRel, Relation indexRel,
 
 	/*
 	 * A dmbtree index that takes in-place updates gets the keys of older
-	 * versions too (§21 D32 B).  Not in a concurrent build, which waits for
-	 * older snapshots before the index is used.
+	 * versions too.  Not in a concurrent build, which waits for older
+	 * snapshots before the index is used.
 	 */
 	olderkeys = !use_mvcc && !indexInfo->ii_Concurrent &&
 		dmbtree_build_older_keys(indexRel, heapRel);

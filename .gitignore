@@ -12,3 +12,7 @@
 /log/
 /tmp_check/
 /tmp_check_iso/
+
+# private documents, kept out of the published repository
+/DESIGN.md
+/README.md

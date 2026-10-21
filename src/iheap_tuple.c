@@ -3,9 +3,8 @@
  * iheap_tuple.c
  *	  Forming and deforming iheap tuples.
  *
- * Layout (DESIGN.md §21 D2, D11): a 16-byte header (12 bytes for a compact
- * one, §21 D43), an optional null bitmap, then the data area.  Compared to
- * heap tuples:
+ * Layout: a 16-byte header (12 bytes for a compact one), an optional null
+ * bitmap, then the data area.  Compared to heap tuples:
  *
  *	- pass-by-value attributes are stored without alignment padding and are
  *	  read with memcpy;
@@ -493,12 +492,11 @@ ih_tuple_len_on_page(Page page, OffsetNumber off)
 }
 
 /*
- * Can the version "tuple" (len bytes, frozen) take a compact header
- * (§21 D43)?  Not with a value that needs alignment: the data area would
- * start at another place relative to the tuple, and a later version with a
- * full header could not go where this one is.  And only when the body
- * leaves room for the 16-byte header of a deletion, which then takes the
- * tuple's storage.
+ * Can the version "tuple" (len bytes, frozen) take a compact header?  Not
+ * with a value that needs alignment: the data area would start at another
+ * place relative to the tuple, and a later version with a full header could
+ * not go where this one is.  And only when the body leaves room for the
+ * 16-byte header of a deletion, which then takes the tuple's storage.
  */
 bool
 ih_tuple_can_compact(const char *tuple, uint32 len)

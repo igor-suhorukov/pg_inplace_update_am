@@ -6,7 +6,7 @@
  *
  * dmbtree adds the insertions of in-place updates: the entry for a row's
  * new key, which may already exist (the row had that key before), and the
- * delete-marking of the entry for its old key (DESIGN.md §11.6).
+ * delete-marking of the entry for its old key.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
@@ -122,13 +122,12 @@ _dmbt_doinsert(Relation rel, IndexTuple itup,
 
 /*
  * dmbtree: insert the entry for the new key of a row that an iheap UPDATE
- * changed in place (DESIGN.md §11.6).  itup's heap TID carries the
- * delete-mark: the updating transaction may still abort, and rollback never
- * touches indexes (§21 D23), so the entry must not claim to match the
- * row's newest committed version.  If the index already has an entry with
- * this key and TID (the row had this key before), it is marked instead of
- * inserting a duplicate.  checkunique: a uniqueness check is made (with
- * the row itself not counting as a duplicate).
+ * changed in place.  itup's heap TID carries the delete-mark: the updating
+ * transaction may still abort, and rollback never touches indexes, so the
+ * entry must not claim to match the row's newest committed version.  If the
+ * index already has an entry with this key and TID (the row had this key
+ * before), it is marked instead of inserting a duplicate.  checkunique: a
+ * uniqueness check is made (with the row itself not counting as a duplicate).
  */
 void
 _dmbt_doinsert_inplace(Relation rel, IndexTuple itup, bool checkunique,
@@ -651,7 +650,6 @@ _dmbt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 	/*
 	 * dmbtree: on an iheap table, an index that can carry delete-marks has
 	 * entries whose row may now have another key; iheap checks the key
-	 * (DESIGN.md §11.5.4)
 	 */
 	dmprobe = iheap_relation_is_iheap(heapRel) && dmbtree_dm_capable(rel);
 
@@ -3052,8 +3050,8 @@ _dmbt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 	 * more, and clear the marks of entries that match their rows again.  An
 	 * in-place update of a key column leaves such an entry behind for each
 	 * index whose key it changed; they are found without guessing, by their
-	 * mark (DESIGN.md §11.5.6).  Done for unique indexes without duplicates
-	 * too, which would otherwise split right away.
+	 * mark.  Done for unique indexes without duplicates too, which would
+	 * otherwise split right away.
 	 */
 	if (!simpleonly && heapRel != NULL &&
 		iheap_relation_is_iheap(heapRel) && _dmbt_page_has_marks(page))

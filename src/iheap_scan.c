@@ -4,12 +4,12 @@
  *	  Sequential, parallel, TID-range, bitmap, sample and ANALYZE scans, and
  *	  single-tuple fetches (index scans, row refetches).
  *
- * Scans work a page at a time (DESIGN.md §21 D12): while holding the share
- * lock, the page is copied into scan-private memory and the version each
- * item shows to the snapshot is resolved; the lock is then released and
- * tuples are returned from the copy (or from memory holding versions
- * rebuilt from undo).  Two copies alternate so that a slot filled from the
- * previous page stays valid while the next one is read.
+ * Scans work a page at a time: while holding the share lock, the page is
+ * copied into scan-private memory and the version each item shows to the
+ * snapshot is resolved; the lock is then released and tuples are returned
+ * from the copy (or from memory holding versions rebuilt from undo).  Two
+ * copies alternate so that a slot filled from the previous page stays valid
+ * while the next one is read.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -718,7 +718,7 @@ item_dead_to_all(Relation rel, Buffer buf, Page page, OffsetNumber off)
  * ON CONFLICT probe), with the version found.  The executor goes on to
  * fetch the conflicting row by TID with SnapshotAny and means the version
  * the probe saw: the newest.  ON CONFLICT DO UPDATE then locks the row,
- * which must start over if its key changed since the probe (D20).
+ * which must start over if its key changed since the probe.
  */
 typedef struct DirtyFound
 {
@@ -904,10 +904,10 @@ retry:
 		 * dmbtree: a delete-marked entry may not match the row, and an
 		 * unmarked one matches its newest committed version only, so the
 		 * version found is checked against the entry's key when the entry
-		 * is marked or the version came from undo (DESIGN.md §11.5.4).
-		 * The scan copied the entry from its page earlier: an MVCC snapshot
-		 * that sees a change of the key sees its mark too, but a SnapshotDirty
-		 * probe sees changes made since, so other snapshots always check.
+		 * is marked or the version came from undo.  The scan copied the entry
+		 * from its page earlier: an MVCC snapshot that sees a change of the
+		 * key sees its mark too, but a SnapshotDirty probe sees changes made
+		 * since, so other snapshots always check.
 		 */
 		if (visible && dm != NULL &&
 			(dm->marked || v.from_undo ||
@@ -1233,7 +1233,7 @@ iheap_scan_bitmap_next_tuple(TableScanDesc sscan, TupleTableSlot *slot,
 	/*
 	 * An older version of a row may have other values in the columns of a
 	 * dmbtree index than its newest one, which index entries without a
-	 * delete-mark match (DESIGN.md §11.5.4): the quals are rechecked.
+	 * delete-mark match: the quals are rechecked.
 	 */
 	*recheck = scan->rs_bm_recheck || scan->rs_vis[scan->rs_cindex].from_undo;
 	return_current(scan, slot);

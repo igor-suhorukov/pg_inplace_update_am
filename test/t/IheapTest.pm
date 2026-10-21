@@ -7,28 +7,49 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Exporter 'import';
 
-our @EXPORT = qw(iheap_node iheap_workload iheap_snapshot iheap_verify);
+our @EXPORT = qw(iheap_node iheap_conf iheap_setup_db iheap_workload
+  iheap_snapshot iheap_digest iheap_verify);
 
 # A node with the module preloaded and the extension created in "postgres",
 # with amcheck and iheap_verify() for structure checks.
 sub iheap_node
 {
 	my ($name, %params) = @_;
-	my $extra_conf = $params{extra_conf} // '';
 	my $node = PostgreSQL::Test::Cluster->new($name);
 	$node->init(
 		allows_streaming => $params{allows_streaming} // 0,
+		has_archiving => $params{has_archiving} // 0,
 		no_data_checksums => $params{no_data_checksums} // 0);
+	# xids of a later epoch, as in a cluster that has wrapped around
+	PostgreSQL::Test::Utils::system_or_bail('pg_resetwal',
+		'--epoch' => $params{epoch}, $node->data_dir)
+	  if $params{epoch};
+	iheap_conf($node, $params{extra_conf});
+	$node->start;
+	iheap_setup_db($node, 'postgres');
+	return $node;
+}
+
+# The settings of every node: the module preloaded, no autovacuum.
+sub iheap_conf
+{
+	my ($node, $extra_conf) = @_;
+	$extra_conf //= '';
 	$node->append_conf('postgresql.conf', qq{
 shared_preload_libraries = 'pg_inplace_update_am'
 max_prepared_transactions = 10
 autovacuum = off
 $extra_conf
 });
-	$node->start;
-	$node->safe_psql('postgres', 'CREATE EXTENSION pg_inplace_update_am');
-	$node->safe_psql('postgres', 'CREATE EXTENSION amcheck');
-	$node->safe_psql('postgres', q{
+}
+
+# The extension in a database, with amcheck and iheap_verify().
+sub iheap_setup_db
+{
+	my ($node, $db) = @_;
+	$node->safe_psql($db, 'CREATE EXTENSION pg_inplace_update_am');
+	$node->safe_psql($db, 'CREATE EXTENSION amcheck');
+	$node->safe_psql($db, q{
 -- every problem iheap_check() and the index checkers find in a table: its
 -- dmbtree indexes with every option, its btree ones with amcheck
 CREATE FUNCTION iheap_verify(rel regclass) RETURNS SETOF text
@@ -67,7 +88,6 @@ BEGIN
   END LOOP;
 END $$;
 });
-	return $node;
 }
 
 # Problems the structure checks find in a table, one per line ('' if none).
@@ -110,6 +130,20 @@ sub iheap_snapshot
 		"SELECT count(*), sum(v), sum(k), md5(string_agg(id || ':' || k || ':' || v || ':' || s || ':' || coalesce(md5(big), '-'), ',' ORDER BY id)) FROM $table WHERE $where");
 }
 
+# Contents of any table as one string: its rows' text, in order.  With
+# index => 1 and a "where" an index can take, the rows come through that
+# index (no sequential or bitmap scans).
+sub iheap_digest
+{
+	my ($node, $table, %opts) = @_;
+	my $where = $opts{where} // 'true';
+	my $set = $opts{index}
+	  ? 'SET enable_seqscan = off; SET enable_bitmapscan = off; '
+	  : '';
+	return $node->safe_psql($opts{db} // 'postgres',
+		"${set}SELECT count(*), md5(coalesce(string_agg(x::text, E'\\n' ORDER BY x::text), '')) FROM $table x WHERE $where");
+}
+
 sub setup_tables
 {
 	my ($node) = @_;
@@ -129,5 +163,44 @@ INSERT INTO th SELECT g, g, g, 's' || g, NULL FROM generate_series(1, 1000) g;
 }
 
 push @EXPORT, 'setup_tables';
+
+# tm and its heap twin tmh: a btree index, so that updates of k move rows;
+# rows with compact headers.
+sub setup_move_tables
+{
+	my ($node, %opts) = @_;
+	$node->safe_psql($opts{db} // 'postgres', q{
+CREATE TABLE tm (id int PRIMARY KEY, k int, v int, s text) USING iheap;
+CREATE INDEX tm_k ON tm USING btree (k);
+CREATE TABLE tmh (id int PRIMARY KEY, k int, v int, s text) USING heap;
+CREATE INDEX tmh_k ON tmh USING btree (k);
+INSERT INTO tm SELECT g, g, g, repeat('m', g % 40) FROM generate_series(1, 3000) g;
+INSERT INTO tmh SELECT g, g, g, repeat('m', g % 40) FROM generate_series(1, 3000) g;
+SET iheap.compact_headers = always;
+VACUUM FULL tm;
+});
+}
+
+# Moves, growth, deletions, inserts and rolled-back changes, applied
+# identically to tm and tmh.
+sub iheap_moves
+{
+	my ($node, $round, %opts) = @_;
+	my $sql = '';
+	for my $t ('tm', 'tmh')
+	{
+		$sql .= qq{
+UPDATE $t SET k = k + 10000 WHERE id % 7 = $round % 7;
+UPDATE $t SET v = v + 1, s = s || 'x' WHERE id % 5 = $round % 5;
+DELETE FROM $t WHERE id % 31 = $round % 31 AND id > 100;
+INSERT INTO $t SELECT g, g, g, 'i' || g
+  FROM generate_series(5000 + $round * 40 + 1, 5000 + $round * 40 + 40) g;
+BEGIN; UPDATE $t SET k = -k WHERE id % 3 = 0; DELETE FROM $t WHERE id % 4 = 0; ROLLBACK;
+};
+	}
+	$node->safe_psql($opts{db} // 'postgres', $sql);
+}
+
+push @EXPORT, qw(setup_move_tables iheap_moves);
 
 1;

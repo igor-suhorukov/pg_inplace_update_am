@@ -1,0 +1,3 @@
+# Specs that need a build with injection points (test/run.sh runs them
+# when pg_config says so).
+iheap_rollback_races

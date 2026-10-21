@@ -308,9 +308,14 @@ _dmbt_killitems(IndexScanDesc scan)
 					/*
 					 * kitem must have matching offnum when heap TIDs match,
 					 * though only in the common case where the page can't
-					 * have been concurrently modified
+					 * have been concurrently modified.  dmbtree: not even
+					 * then.  A TID has an entry under each key an in-place
+					 * update gave its row, so a later kitem may be another
+					 * entry of a TID of this posting list.  It is dead all
+					 * the same: kill_prior_tuple means the row is dead to
+					 * everybody (iheap's all_dead), so is every entry of its
+					 * TID.
 					 */
-					Assert(kitem->indexOffset == offnum || !so->dropPin);
 
 					/*
 					 * Read-ahead to later kitems here.

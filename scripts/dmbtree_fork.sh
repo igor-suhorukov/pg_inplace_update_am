@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Mechanical part of the dmbtree fork (DESIGN.md §21 D30): copy PostgreSQL's
-# nbtree sources, and amcheck's B-tree verification (§21 D34), and rename what
-# would clash with the server's own nbtree and with amcheck.
+# Mechanical part of the dmbtree fork: copy PostgreSQL's nbtree sources, and
+# amcheck's B-tree verification, and rename what would clash with the server's
+# own nbtree and with amcheck.
 #
 #   scripts/dmbtree_fork.sh <postgres-source-root> <output-dir>
 #

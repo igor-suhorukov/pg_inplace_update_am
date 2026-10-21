@@ -3,12 +3,12 @@
  * iheap_undo.c
  *	  Undo storage: page allocation, record writing and fetching.
  *
- * Each backend appends to its own undo page per relation (DESIGN.md §21
- * D4).  A new logical page is taken from the metapage under its exclusive
- * lock; the WAL record that does so also initializes the page.  When the
- * logical page lies beyond the live extents, a new extent is allocated:
- * a free extent is reused, otherwise the relation is extended by a
- * contiguous run of pages while holding the relation extension lock.
+ * Each backend appends to its own undo page per relation.  A new logical page
+ * is taken from the metapage under its exclusive lock; the WAL record that
+ * does so also initializes the page.  When the logical page lies beyond the
+ * live extents, a new extent is allocated: a free extent is reused, otherwise
+ * the relation is extended by a contiguous run of pages while holding the
+ * relation extension lock.
  *
  * Lock order: data page(s) -> undo page -> metapage -> extension lock.
  *
@@ -121,7 +121,7 @@ iheap_undo_init_page(Page page, uint64 lpage)
 }
 
 /* ------------------------------------------------------------------------
- * Compact record headers (§21 D37)
+ * Compact record headers
  *
  * A record on a page of format IHEAP_UNDO_FORMAT_COMPACT starts with
  *
@@ -660,8 +660,19 @@ undo_alloc_page(Relation rel, uint64 *lpage)
 	}
 
 	pblk = ext->ie_pstart + (BlockNumber) (L - ext->ie_lstart);
-	undobuf = ReadBufferExtended(rel, MAIN_FORKNUM, pblk, RBM_ZERO_AND_LOCK,
-								 NULL);
+	if (pblk < RelationGetNumberOfBlocks(rel))
+		undobuf = ReadBufferExtended(rel, MAIN_FORKNUM, pblk,
+									 RBM_ZERO_AND_LOCK, NULL);
+	else
+	{
+		/*
+		 * An extent whose last pages are missing, from an older iheap's redo,
+		 * which did not extend the relation to it: a buffer beyond the end
+		 * would hide its records from fetches and discard until written.
+		 */
+		undobuf = ExtendBufferedRelTo(BMR_REL(rel), MAIN_FORKNUM, NULL, 0,
+									  pblk + 1, RBM_ZERO_AND_LOCK);
+	}
 	undopage = BufferGetPage(undobuf);
 
 	START_CRIT_SECTION();

@@ -4,22 +4,22 @@
  *	  MVCC-safe rewrite for VACUUM FULL, CLUSTER and REPACK.
  *
  * For each row the latest committed version is copied, together with the
- * older versions that snapshots older than OldestXmin may still need
- * (DESIGN.md §21 D17).  The older versions are written as undo records of
- * the new relation that keep their original creators' xids, so old
- * snapshots keep seeing what they saw before.  Out-of-line values of every
- * copied version are re-toasted into the new relation's TOAST table.
+ * older versions that snapshots older than OldestXmin may still need.  The
+ * older versions are written as undo records of the new relation that keep
+ * their original creators' xids, so old snapshots keep seeing what they saw
+ * before.  Out-of-line values of every copied version are re-toasted into the
+ * new relation's TOAST table.
  *
  * Rows deleted by transactions not yet visible to everybody are kept as
  * deleted rows (with their content in undo); rows whose deletion every
  * snapshot sees are dropped.
  *
  * The new relation is built in memory a page at a time and written with
- * the bulk writer (bulk_write.h), as heap's rewrite is (§21 D41): no shared
- * buffers, no per-row WAL records, the pages WAL-logged whole.  Its undo
- * pages, in extents placed among the data pages, and its metapage, last,
- * go the same way.  A row whose only version every snapshot sees may get a
- * compact header (§21 D43).
+ * the bulk writer (bulk_write.h), as heap's rewrite is: no shared buffers, no
+ * per-row WAL records, the pages WAL-logged whole.  Its undo pages, in
+ * extents placed among the data pages, and its metapage, last, go the same
+ * way.  A row whose only version every snapshot sees may get a compact
+ * header.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -479,7 +479,7 @@ write_row(RewriteWriter *w, Relation OldHeap, Chain *chain)
 		}
 	}
 
-	/* a row whose only version everybody sees may be compact (§21 D43) */
+	/* a row whose only version everybody sees may be compact */
 	page = rw_data_page(w, clen[0],
 						n == 1 && !TransactionIdIsNormal(v[0].creator) &&
 						w->quota != 0 && ih_tuple_can_compact(content[0], clen[0]),

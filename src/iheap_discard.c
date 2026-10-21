@@ -5,12 +5,12 @@
  *
  * Discard walks the relation's undo stream from the discard pointer, one
  * logical page at a time, while every record on the page was written by a
- * transaction older than GetOldestNonRemovableTransactionId() (DESIGN.md
- * §21 D8, D9).  Before a page is passed, each record of an aborted (or
- * crashed) transaction is applied if its target item still shows that
- * transaction's version.  Hence nothing below the discard pointer can
- * describe an unapplied abort, and "undo pointer below the discard pointer"
- * means "frozen": committed and visible to everybody.
+ * transaction older than GetOldestNonRemovableTransactionId().  Before a page
+ * is passed, each record of an aborted (or crashed) transaction is applied if
+ * its target item still shows that transaction's version.  Hence nothing
+ * below the discard pointer can describe an unapplied abort, and "undo
+ * pointer below the discard pointer" means "frozen": committed and visible to
+ * everybody.
  *
  * One discarder at a time per relation (a heavyweight lock on the metapage
  * block); others skip.  Discard runs in backends that just allocated a new
@@ -31,6 +31,7 @@
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -223,7 +224,12 @@ iheap_discard(Relation rel, bool force)
 		}
 		UnlockReleaseBuffer(buf);
 
-		/* apply them (lock order: data page, then undo pages) */
+		/*
+		 * Apply them (lock order: data page, then undo pages).  Others may
+		 * roll back and change those rows meanwhile.
+		 */
+		if (nverify > 0)
+			INJECTION_POINT("iheap-discard-apply", NULL);
 		for (int i = 0; i < nverify; i++)
 		{
 			Buffer		dbuf;
@@ -245,6 +251,9 @@ iheap_discard(Relation rel, bool force)
 	{
 		IHeapExtent released[IHEAP_MAX_EXTENTS];
 		int			nreleased;
+
+		/* everything below lp applied, nothing passed yet */
+		INJECTION_POINT("iheap-discard-advance", NULL);
 
 		metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, IHEAP_METAPAGE_BLKNO,
 									 RBM_NORMAL, NULL);

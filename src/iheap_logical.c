@@ -1,23 +1,23 @@
 /*-------------------------------------------------------------------------
  *
  * iheap_logical.c
- *	  Logical decoding of iheap's WAL records (DESIGN.md §9.5, §21 D38).
+ *	  Logical decoding of iheap's WAL records.
  *
  * Output plugins read the rows of a change as heap tuples, deformed with
  * the relation's descriptor, which only the replay of a transaction looks
  * up (under its historic snapshot).  rm_decode runs before that, with
  * neither a descriptor nor catalog access, and iheap's tuples are not laid
- * out as heap's (§5.4, §21 D11).  So a record written while logical
- * decoding needs it (RelationIsLogicallyLogged) carries, in its main data
- * after the record's own struct, the *layout* of the relation's attributes
- * (length, alignment, by-value; one byte each, usually), from which the
- * decoder rebuilds a heap tuple out of the iheap tuple the record carries
- * anyway; the old row's replica identity, which iheap's records do not
- * otherwise carry (undo holds a delta), is formed in heap's layout already
- * by the writer, as heap logs it (ExtractReplicaIdentity()).  Records
- * written with the layout keep their tuple data in WAL even when the page
- * gets a full-page image (REGBUF_KEEP_DATA), and in-place updates log the
- * whole new tuple instead of the changed middle part.
+ * out as heap's.  So a record written while logical decoding needs it
+ * (RelationIsLogicallyLogged) carries, in its main data after the record's
+ * own struct, the *layout* of the relation's attributes (length, alignment,
+ * by-value; one byte each, usually), from which the decoder rebuilds a heap
+ * tuple out of the iheap tuple the record carries anyway; the old row's
+ * replica identity, which iheap's records do not otherwise carry (undo holds
+ * a delta), is formed in heap's layout already by the writer, as heap logs it
+ * (ExtractReplicaIdentity()).  Records written with the layout keep their
+ * tuple data in WAL even when the page gets a full-page image
+ * (REGBUF_KEEP_DATA), and in-place updates log the whole new tuple instead of
+ * the changed middle part.
  *
  * Main data of a decodable record, after the record's struct:
  *
@@ -435,8 +435,8 @@ reorder_tuple(ReorderBuffer *rb, HeapTuple src)
 /*
  * The iheap tuple with header h and body (null bitmap and data, bodylen
  * bytes, unaligned, as in the record) as a heap tuple of the reorder buffer,
- * by the layout desc.  Records carry tuple headers in their WAL form
- * (§21 D42): their xid and undo pointer do not matter here.
+ * by the layout desc.  Records carry tuple headers in their WAL form: their
+ * xid and undo pointer do not matter here.
  */
 static HeapTuple
 decode_iheap_tuple(ReorderBuffer *rb, TupleDesc desc, const IHeapHdr *h,

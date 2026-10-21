@@ -4,10 +4,9 @@
  *	  TupleTableSlot implementation for iheap tuples.
  *
  * The slot never points into a shared buffer: tuples are copied out while
- * the page's content lock is held (DESIGN.md §21 D11), either into a
- * scan's private page copy (the slot then references that copy and the
- * scan keeps it valid until the next tuple is fetched) or into memory the
- * slot owns.
+ * the page's content lock is held, either into a scan's private page copy
+ * (the slot then references that copy and the scan keeps it valid until the
+ * next tuple is fetched) or into memory the slot owns.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *

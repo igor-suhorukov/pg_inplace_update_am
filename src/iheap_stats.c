@@ -1,13 +1,12 @@
 /*-------------------------------------------------------------------------
  *
  * iheap_stats.c
- *	  Cumulative statistics of iheap relations: a custom pgstat kind
- *	  (DESIGN.md §15, §21 D33).
+ *	  Cumulative statistics of iheap relations: a custom pgstat kind.
  *
  * One entry per iheap relation, keyed by database and relation OID, counts
  *	- updates kept in place, and updates that moved the row, by the reason
- *	  (§7.4: a changed column of an index that cannot take it, a trigger
- *	  that needs the old row by TID, no room on the page, the setting);
+ *	  (a changed column of an index that cannot take it, a trigger that needs
+ *	  the old row by TID, no room on the page, the setting);
  *	- undo written, rolled back (by the aborting backend, lazily by later
  *	  writers and pruning, or by discard's verification) and discarded;
  *	- the walks readers make through undo to older versions.
@@ -39,7 +38,7 @@
 
 /*
  * The kind ID for development, until one is reserved on the wiki's list of
- * custom cumulative statistics (DESIGN.md §21 D33).
+ * custom cumulative statistics.
  */
 #define IHEAP_STAT_KIND		PGSTAT_KIND_EXPERIMENTAL
 

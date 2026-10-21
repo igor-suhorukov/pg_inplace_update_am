@@ -3,11 +3,10 @@
  * iheap_toast.c
  *	  Out-of-line storage of large values for iheap.
  *
- * Large values go to a regular heap TOAST table through toast_helper.c
- * (DESIGN.md A6, §21 D14), following heap_toast_insert_or_update() but with
- * iheap's tuple size computation.  The toast table's own MVCC keeps old
- * values visible to old snapshots; undo restores pointers to them on
- * rollback.
+ * Large values go to a regular heap TOAST table through toast_helper.c,
+ * following heap_toast_insert_or_update() but with iheap's tuple size
+ * computation.  The toast table's own MVCC keeps old values visible to old
+ * snapshots; undo restores pointers to them on rollback.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *

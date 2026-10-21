@@ -6,7 +6,7 @@
  *
  * dmbtree adds the delete-mark operations at the end of this file: setting
  * and clearing marks, the metapage's "marks pending" flag, and the cleanup
- * of marked entries on a leaf page (DESIGN.md §11.5.5, §11.5.6).
+ * of marked entries on a leaf page.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
@@ -3218,15 +3218,14 @@ _dmbt_apply_marks(Page page, const DmbtMarkItem *items, int nitems,
 
 /*
  * Note in leaf page "page" that the current transaction delete-marked an
- * entry on it (DESIGN.md §21 D36): pd_prune_xid, which index pages do not
- * use otherwise, keeps the oldest such xid.  An entry marked by a
- * transaction some snapshot may not see yet cannot be removed (only its
- * mark cleared, which frees no room), so a cleanup pass is futile until
- * the horizon passes that xid, and _dmbt_dm_cleanup_page() skips it.  A
- * hint, like LP_DEAD bits: not WAL-logged (redo leaves the field alone),
- * masked by wal_consistency_checking, kept through deduplication and
- * splits.  Called with the page exclusively locked, in the critical section
- * of the change.
+ * entry on it: pd_prune_xid, which index pages do not use otherwise, keeps
+ * the oldest such xid.  An entry marked by a transaction some snapshot may
+ * not see yet cannot be removed (only its mark cleared, which frees no room),
+ * so a cleanup pass is futile until the horizon passes that xid, and
+ * _dmbt_dm_cleanup_page() skips it.  A hint, like LP_DEAD bits: not
+ * WAL-logged (redo leaves the field alone), masked by
+ * wal_consistency_checking, kept through deduplication and splits.  Called
+ * with the page exclusively locked, in the critical section of the change.
  */
 void
 _dmbt_note_marking(Page page)
@@ -3288,7 +3287,7 @@ _dmbt_mark_items(Relation rel, Buffer buf, DmbtMarkItem *items, int nitems,
  * buf, which the caller holds exclusively locked and has checked them to
  * fit in (_dmbt_dm_cleanup_page): an entry of an index with INCLUDE
  * columns takes its row's values, keeping its key and heap TID, so its
- * place in the order (§21 D39).  The new tuples are unmarked.
+ * place in the order.  The new tuples are unmarked.
  */
 static void
 _dmbt_replace_items(Relation rel, Buffer buf, DmbtMarkItem *items,
@@ -3502,11 +3501,11 @@ _dmbt_page_has_marks(Page page)
 /*
  * Clean up the delete-marked entries of leaf page buf, which the caller
  * holds exclusively locked (or cleanup-locked, in VACUUM).  iheap decides
- * the fate of each (DESIGN.md §11.5.6): an entry no snapshot can need is
- * removed, with the snapshot conflict horizon iheap reports for standbys;
- * an entry whose row's newest committed version has its key again loses
- * its mark; any other stays as it is.  Unmarking comes first, while the
- * positions recorded for it are still valid.
+ * the fate of each: an entry no snapshot can need is removed, with the
+ * snapshot conflict horizon iheap reports for standbys; an entry whose row's
+ * newest committed version has its key again loses its mark; any other stays
+ * as it is.  Unmarking comes first, while the positions recorded for it are
+ * still valid.
  *
  * Returns the number of heap TIDs removed; *nkept (if not NULL) is set to
  * the number of marked TIDs left as they were (1 for a pass skipped as
@@ -3628,11 +3627,11 @@ _dmbt_dm_cleanup_page(Relation rel, Relation heapRel, Buffer buf, int *nkept)
 	}
 
 	/*
-	 * Entries of an index with INCLUDE columns that take their row's values
-	 * (§21 D39), where they fit: in the page's free space, and under the
-	 * size limit of an entry (the row's values were checked against it when
-	 * the update changed them, but not those of an older version).  Others
-	 * are kept, marked.
+	 * Entries of an index with INCLUDE columns that take their row's values,
+	 * where they fit: in the page's free space, and under the size limit of
+	 * an entry (the row's values were checked against it when the update
+	 * changed them, but not those of an older version).  Others are kept,
+	 * marked.
 	 */
 	rewrite = palloc(nchecks * sizeof(DmbtMarkItem));
 	rewritetups = palloc(nchecks * sizeof(IndexTuple));

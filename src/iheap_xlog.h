@@ -10,8 +10,8 @@
  * what redo can derive left out).
  *
  * Tuple headers travel without their xid and with their undo pointer as an
- * offset on the record's undo page (§21 D42): redo replays the undo page
- * first and takes its logical page number from it.
+ * offset on the record's undo page: redo replays the undo page first and
+ * takes its logical page number from it.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -55,6 +55,9 @@
 #define XLIH_MOVE_DELTA			0x20	/* MOVE on the same page: the new body
 										 * logged as the middle that differs
 										 * from the old one (below) */
+#define XLIH_KEEP_ALIGN			0x80	/* UPDATE, relocated: at an offset with
+										 * the old one's residue modulo
+										 * MAXIMUM_ALIGNOF */
 
 /*
  * With XLIH_LOGICAL, the record's struct is followed in main data by a flags
@@ -82,10 +85,10 @@
  *		uint16 infomask2, uint16 infomask, uint8 hoff, uint16 urec_off
  *
  * unaligned.  The tuple's header on the page takes the form its infomask
- * gives (IHT_COMPACT, §21 D43).  Its undo pointer is urec_off on the
- * record's undo page, or 0 when urec_off is 0 (a frozen insert).  Its xid
- * is not logged: a compact header has none; otherwise it is the record's
- * xid, or FrozenTransactionId for a frozen insert.
+ * gives (IHT_COMPACT).  Its undo pointer is urec_off on the record's undo
+ * page, or 0 when urec_off is 0 (a frozen insert).  Its xid is not logged: a
+ * compact header has none; otherwise it is the record's xid, or
+ * FrozenTransactionId for a frozen insert.
  */
 #define SizeOfIHeapWalHdr	7
 
@@ -163,7 +166,7 @@ typedef struct xl_iheap_update
  * XLOG_IHEAP_MOVE: block DATA data = header change of the old item;
  * block NEWDATA (or DATA when XLIH_SAME_PAGE, appended) data = the new
  * tuple: header (SizeOfIHeapWalHdr), body.  With XLIH_MOVE_DELTA (a move on
- * the same page, the old body still there: §21 D40), main data goes on with
+ * the same page, the old body still there), main data goes on with
  * xl_iheap_move_delta, and only the new body's bytes between prefix and
  * suffix are logged, as heap does for an update on the same page.
  */

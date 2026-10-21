@@ -10,7 +10,7 @@
  * Backends cache the live part of it in rel->rd_amcache, like nbtree caches
  * its metapage.  A stale cache is safe: a lower discard pointer only makes
  * fewer tuples look frozen, and undo page headers carry their logical page
- * number, so a page reused for something else is recognized (§21 D18).
+ * number, so a page reused for something else is recognized.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *

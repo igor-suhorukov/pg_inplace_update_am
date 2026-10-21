@@ -1,8 +1,7 @@
 --
--- Parallel index vacuum (DESIGN.md §10.2, §21 D44): through core's parallel
--- vacuum, parallel workers share the indexes' bulk deletion and cleanup
--- with the backend running VACUUM, which scans the table.  VERBOSE reports
--- the workers launched.
+-- Parallel index vacuum: through core's parallel vacuum, parallel workers
+-- share the indexes' bulk deletion and cleanup with the backend running
+-- VACUUM, which scans the table.  VERBOSE reports the workers launched.
 --
 CREATE EXTENSION amcheck;
 -- every problem found in a table: iheap_check(), and its btree and dmbtree

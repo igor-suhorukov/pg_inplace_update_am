@@ -25,7 +25,7 @@
 /*
  * Custom resource manager ID.  iheap uses RM_EXPERIMENTAL_ID; this one is
  * not assigned to any project on the wiki's list of custom resource
- * managers.  Both must be registered there before a release (DESIGN.md §4).
+ * managers.  Both must be registered there before a release.
  */
 #define RM_DMBTREE_ID		200
 
@@ -78,8 +78,8 @@ typedef struct xl_btree_metadata
  * list index (or DMBT_PLAIN_TUPLE for the t_tid of a plain tuple).
  *
  * DMBT_MARK_REPLACE puts new tuples in the place of plain tuples, unmarked:
- * entries of an index with INCLUDE columns that take their row's values
- * (§21 D39).  Key and heap TID stay, and so does the order.
+ * entries of an index with INCLUDE columns that take their row's values.  Key
+ * and heap TID stay, and so does the order.
  *
  * Backup Blk 0: leaf page; its data is the array of DmbtMarkItem, then for
  * DMBT_MARK_REPLACE the new tuples, one after the other (unaligned)

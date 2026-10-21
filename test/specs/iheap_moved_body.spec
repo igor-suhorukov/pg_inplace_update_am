@@ -1,8 +1,8 @@
 # Deleted and moved rows keep their bodies on the page while an older
-# snapshot may read them (DESIGN.md §21 D40): VACUUM leaves them until the
-# snapshot is gone.  Rows with compact headers (§21 D43) put their bodies in
-# undo when deleted or moved, where old snapshots find them, and so do rows
-# that move off a page whose bodies a snapshot holds (§21 D45).
+# snapshot may read them: VACUUM leaves them until the snapshot is gone.  Rows
+# with compact headers put their bodies in undo when deleted or moved, where
+# old snapshots find them, and so do rows that move off a page whose bodies a
+# snapshot holds.
 
 setup
 {

@@ -7,16 +7,16 @@
  * (t_xid) and the undo record describing the previous version (t_urec).
  * Deciding what a snapshot sees means checking t_xid and, when the current
  * version is not visible, rebuilding the previous version from undo and
- * checking again (DESIGN.md §6.3).
+ * checking again.
  *
  * A version is "frozen" -- visible to everybody, no transaction lookups --
  * when its undo pointer is below the relation's discard pointer: discard
  * only passes records whose writers are committed and visible to all, after
- * applying any aborted ones (§21 D2, D8).
+ * applying any aborted ones.
  *
  * Hint bits record a transaction's fate in the tuple header, but only on
  * pages that are already dirty, so that reading never creates a new dirty
- * page (and, with checksums, a full-page image) by itself (§21 D7).
+ * page (and, with checksums, a full-page image) by itself.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -323,8 +323,8 @@ ih_assemble(const char *hdr, const char *p1, uint32 l1, const char *p2,
  * to a new palloc'd tuple and *h holds its header.  Returns false for
  * records without a previous version (inserts), and for a deletion or move
  * whose previous version is gone: its record does not carry the body, which
- * stayed on the page until no snapshot could see it (§21 D40), and the item
- * is a stub now.
+ * stayed on the page until no snapshot could see it, and the item is a stub
+ * now.
  */
 bool
 iheap_rebuild_prior(Relation rel, char **tuple, uint32 *len, IHeapHdr *h,
@@ -354,7 +354,7 @@ iheap_rebuild_prior(Relation rel, char **tuple, uint32 *len, IHeapHdr *h,
 						 rec->urp);
 				if (core > skip)
 				{
-					/* the body went to undo (a compact header, or before D40) */
+					/* body in undo: a compact header's, or an older iheap's */
 					*tuple = ih_assemble(prevhdr, rec->payload + skip, core - skip,
 										 NULL, 0, NULL, 0, len, mem);
 				}

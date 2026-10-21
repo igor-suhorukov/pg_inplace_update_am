@@ -1,8 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * iheap_dm.c
- *	  iheap's side of dmbtree: in-place updates of indexed columns
- *	  (DESIGN.md §7.4, §11.5, §11.6, §21 D22-D27, D39).
+ *	  iheap's side of dmbtree: in-place updates of indexed columns.
  *
  * An UPDATE that changes a column a dmbtree index reads keeps the row at
  * its TID.  iheap then maintains such indexes itself: it inserts an entry
@@ -197,10 +196,9 @@ dm_index_computed(Relation index)
  * the columns it reads when it is a dmbtree index that can carry
  * delete-marks (dmbtree_dm_capable), is valid and ready, and its uniqueness
  * is checked immediately: a deferred check or an exclusion constraint is
- * the executor's business, which needs entries for a new TID (rule 2 of
- * §7.4).  Every column of any other index (summarizing ones aside, which
- * TU_Summarizing handles), and every column its expressions and predicate
- * read, forces a move.
+ * the executor's business, which needs entries for a new TID.  Every column
+ * of any other index (summarizing ones aside, which TU_Summarizing handles),
+ * and every column its expressions and predicate read, forces a move.
  *
  * The result stays valid until the next call for the same relation.
  */
@@ -338,7 +336,7 @@ restart:
 }
 
 /* ------------------------------------------------------------------------
- * Evaluating index expressions and predicates (§21 D39)
+ * Evaluating index expressions and predicates
  *
  * Computing the entry of a row version for an index with expressions or a
  * predicate takes executor state: built once per transaction and index,
@@ -539,20 +537,20 @@ dm_values_equal(Relation index, int from, int to, const Datum *a,
 /*
  * The in-place update of row tid changed the columns "modified": for every
  * index whose entry it changed, insert the entry for the new key and
- * delete-mark the entry for the old one (§11.6).  The table change is done
- * and its page lock released: index pages are never locked while a table
- * page is (nbtree's uniqueness checks lock them the other way round), and
- * expressions are evaluated.  Other writers wait on our row until we
- * finish; readers of our transaction see the row only after this command,
- * when both entries are there.
+ * delete-mark the entry for the old one.  The table change is done and its
+ * page lock released: index pages are never locked while a table page is
+ * (nbtree's uniqueness checks lock them the other way round), and expressions
+ * are evaluated.  Other writers wait on our row until we finish; readers of
+ * our transaction see the row only after this command, when both entries are
+ * there.
  *
  * The new entry goes first: if it violates uniqueness, the transaction
  * aborts before the old one is marked (either order is safe).  With a
  * predicate, a version that enters the index gets an entry and one that
  * leaves it has its entry marked.  A change of INCLUDE values only marks
- * the entry, which keeps its values (§21 D39): an entry stands for every
- * version of its row with its key, and (key, TID) has room for one.
- * Returns whether any entry was added or marked.
+ * the entry, which keeps its values: an entry stands for every version of its
+ * row with its key, and (key, TID) has room for one.  Returns whether any
+ * entry was added or marked.
  */
 bool
 iheap_dm_update_indexes(Relation rel, ItemPointer tid,
@@ -737,9 +735,9 @@ iheap_index_fetch_set_entry(IndexFetchTableData *fetch, Relation index,
  * passes over the entry if not, without the executor visiting the row, so
  * a serializable scan records here the rw-conflicts with the writers of
  * versions it does not see, as the fetch of the row would.  If the version
- * has other INCLUDE values than the entry (an in-place update changed them,
- * §21 D39), *subst gets an entry with the version's values, which the scan
- * returns instead.
+ * has other INCLUDE values than the entry (an in-place update changed them),
+ * *subst gets an entry with the version's values, which the scan returns
+ * instead.
  */
 bool
 iheap_dm_entry_visible(Relation heaprel, ItemPointer tid, Snapshot snapshot,
@@ -1005,7 +1003,7 @@ dm_walk(Relation rel, Buffer buf, OffsetNumber off, GlobalVisState *vistest,
  *
  * A KEEP answer sets *wait to the writer of the newest version that is not
  * aborted: once every snapshot sees that version, the walk stops there and
- * decides (dmbtree skips cleanup passes on the page until then, §21 D36).
+ * decides (dmbtree skips cleanup passes on the page until then).
  */
 static DmbtEntryStatus
 dm_entry_status(Relation rel, Buffer *buf, OffsetNumber off,
@@ -1103,7 +1101,7 @@ iheap_dm_horizon(Relation heaprel)
 }
 
 /*
- * dmbtree's cleanup (DESIGN.md §11.5.6): for each delete-marked entry,
+ * dmbtree's cleanup: for each delete-marked entry,
  *
  *	DEAD	 no snapshot can see a version of its row with its key: the row
  *			 is gone, or every version some snapshot may see has another key;
@@ -1284,12 +1282,12 @@ dm_verify_unmarked(Relation rel, Buffer buf, OffsetNumber off,
  * dmbtree_check(checkmarks): check entries of a leaf page against their
  * rows.  Every entry must point to a used line pointer of a data page:
  * line pointers become unused only after index vacuum removed the entries
- * pointing at them (§10.5), and index vacuum needs the leaf page, which the
- * caller holds share-locked.  An unmarked entry must match the newest
- * committed version of its row (§11.5.4), INCLUDE values too.  With the
- * leaf page locked, no entry of the rows can be added or marked meanwhile:
- * a writer changes a row first, a version not committed yet that this check
- * passes over, and the index after.
+ * pointing at them, and index vacuum needs the leaf page, which the caller
+ * holds share-locked.  An unmarked entry must match the newest committed
+ * version of its row, INCLUDE values too.  With the leaf page locked, no
+ * entry of the rows can be added or marked meanwhile: a writer changes a row
+ * first, a version not committed yet that this check passes over, and the
+ * index after.
  *
  * A key stored out of line, or computed by an index expression, is compared
  * after the table page is unlocked (TOAST access takes locks and may read;

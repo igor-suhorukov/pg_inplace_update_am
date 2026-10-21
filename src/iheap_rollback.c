@@ -3,7 +3,7 @@
  * iheap_rollback.c
  *	  Applying undo of aborted transactions.
  *
- * Rollback has three layers (DESIGN.md §8, §21 D8):
+ * Rollback has three layers:
  *
  *	1. Readers skip versions of aborted transactions by walking undo.
  *	2. Writers (and pruning, and discard) roll back an item whose current
@@ -42,6 +42,7 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
@@ -212,19 +213,28 @@ iheap_rollback_tuple(Relation rel, Buffer buffer, OffsetNumber off)
 					cap = item_capacity(page, off);
 					if (oldlen > cap)
 					{
-						/* reservation was lost: use free space */
+						/*
+						 * Reservation was lost: use free space, at an offset
+						 * with the place's alignment, which suits this version
+						 * and the older ones.
+						 */
 						PageHeader	ph = (PageHeader) page;
 
 						if ((int) ph->pd_upper - (int) ph->pd_lower < (int) oldlen + MAXIMUM_ALIGNOF)
-							elog(ERROR, "iheap: no room to roll back an update in relation \"%s\"",
-								 RelationGetRelationName(rel));
+							elog(ERROR, "iheap: no room to roll back an update of (%u,%u) in relation \"%s\": %u bytes, %u at its place, %d free",
+								 BufferGetBlockNumber(buffer), off,
+								 RelationGetRelationName(rel), oldlen, cap,
+								 (int) ph->pd_upper - (int) ph->pd_lower);
 						START_CRIT_SECTION();
-						if (!iheap_page_place_item(page, off, old, oldlen))
+						if (!iheap_page_place_item_ext(page, off, old, oldlen, oldlen,
+													   lp_off % MAXIMUM_ALIGNOF))
 							elog(PANIC, "iheap: rollback placement failed");
 						lp_off = ItemIdGetOffset(lp);
 					}
 					else
 					{
+						/* the place suits it */
+						Assert(iheap_tuple_aligned_at(old, lp_off));
 						START_CRIT_SECTION();
 						memcpy(tup, old, oldlen);
 						ItemIdSetNormal(lp, lp_off, oldlen);
@@ -415,6 +425,12 @@ rollback_relation(XactRelEnt *ent, bool subxact)
 		return;
 
 	rel = iheap_fake_relation_open(ent->key, ent->persistence);
+
+	/*
+	 * Everybody sees the abort and nothing of it is applied yet: other
+	 * writers may roll back the rows and change them first.
+	 */
+	INJECTION_POINT("iheap-eager-rollback", NULL);
 
 	oldcxt = MemoryContextSwitchTo(rollback_cxt);
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # Host-side entry point.  Every build and every test runs in a throwaway
-# container (DESIGN.md §20); this script only invokes docker.
+# container; this script only invokes docker.
 #
 #   scripts/docker.sh image [debug|release]
 #   scripts/docker.sh build
-#   scripts/docker.sh test [regress|isolation|tap|core|all]...
+#   scripts/docker.sh test [regress|isolation|tap|model|core|all]...
 #   scripts/docker.sh shell
 #   scripts/docker.sh bench
 #   scripts/docker.sh olap [tpch|tpcds|clickbench]...
@@ -52,7 +52,12 @@ case "$cmd" in
 		run debug -- bash /src/test/run.sh build
 		;;
 	test)
-		run debug -- bash /src/test/run.sh test "${@:-all}"
+		# the random workload's seed and length (test/t/010_random.pl)
+		extra=()
+		for v in IHEAP_RANDOM_SEED IHEAP_RANDOM_STEPS PROVE_FLAGS; do
+			[ -n "${!v:-}" ] && extra+=(-e "$v=${!v}")
+		done
+		run debug "${extra[@]}" -- bash /src/test/run.sh test "${@:-all}"
 		;;
 	shell)
 		run debug -it -- bash

@@ -1,10 +1,10 @@
 # A dmbtree index built while an old snapshot sees older keys of rows that
 # in-place updates changed -- rebuilt by REINDEX, VACUUM FULL or CLUSTER, or
-# created anew -- gets entries for those keys too, delete-marked (DESIGN.md
-# §21 D32 B): the old snapshot uses it at once (no indcheckxmin) and finds
-# the rows by the keys it sees, also through expressions and predicates, and
-# index-only scans return the INCLUDE values its versions have (§21 D39).
-# VACUUM removes the older keys' entries once the snapshot is gone.
+# created anew -- gets entries for those keys too, delete-marked: the old
+# snapshot uses it at once (no indcheckxmin) and finds the rows by the keys it
+# sees, also through expressions and predicates, and index-only scans return
+# the INCLUDE values its versions have.  VACUUM removes the older keys'
+# entries once the snapshot is gone.
 
 setup
 {

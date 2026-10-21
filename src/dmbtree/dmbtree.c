@@ -228,8 +228,7 @@ dmbtinsert(Relation rel, Datum *values, bool *isnull,
  * visits the table unless the page is all-visible); a marked one is
  * checked against the version the scan's snapshot sees.  That version's
  * INCLUDE values may be other than the marked entry's (an in-place update
- * changed them, §21 D39): the scan then returns an entry with the
- * version's values.
+ * changed them): the scan then returns an entry with the version's values.
  */
 static bool
 _dmbt_ios_entry_ok(IndexScanDesc scan, BTScanOpaque so)
@@ -328,7 +327,7 @@ dmbtgettuple(IndexScanDesc scan, ScanDirection dir)
 		 * dmbtree: an index-only scan returns the entry's values without
 		 * visiting the table when the page is all-visible, so a marked entry
 		 * is checked against the row here; it is passed over when the row's
-		 * version visible to the scan has another key (DESIGN.md §11.5.4).
+		 * version visible to the scan has another key.
 		 */
 		while (res && so->dmVerify && scan->xs_want_itup &&
 			   !_dmbt_ios_entry_ok(scan, so))
@@ -483,9 +482,9 @@ dmbtrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 
 	/*
 	 * dmbtree: on an iheap table, rows reached through an index that can
-	 * carry delete-marks are checked against the entry that led to them
-	 * (DESIGN.md §11.5.4).  heapRelation is only known from here on (it is
-	 * NULL for bitmap scans, which recheck the quals instead).
+	 * carry delete-marks are checked against the entry that led to them.
+	 * heapRelation is only known from here on (it is NULL for bitmap scans,
+	 * which recheck the quals instead).
 	 */
 	so->dmVerify = (scan->heapRelation != NULL &&
 					iheap_relation_is_iheap(scan->heapRelation) &&
@@ -1378,8 +1377,8 @@ dmbtvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	/*
 	 * dmbtree: look for delete-marked entries to clean up if any were marked
-	 * since the last VACUUM did (DESIGN.md §11.5.6).  Taking the flag clears
-	 * it; entries marked from now on set it again.
+	 * since the last VACUUM did.  Taking the flag clears it; entries marked
+	 * from now on set it again.
 	 */
 	vstate.dmclean = (info->heaprel != NULL &&
 					  iheap_relation_is_iheap(info->heaprel) &&

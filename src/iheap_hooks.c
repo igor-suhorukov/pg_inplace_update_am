@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * iheap_hooks.c
- *	  Making dmbtree the index of iheap tables (DESIGN.md §11.5.7, §21 D27).
+ *	  Making dmbtree the index of iheap tables.
  *
  *	- A utility hook gives CREATE INDEX without USING on an iheap table a
  *	  dmbtree index (iheap.default_index_am), and optionally unique indexes

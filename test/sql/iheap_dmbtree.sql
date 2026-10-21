@@ -1,5 +1,5 @@
 --
--- dmbtree: in-place updates of indexed columns (DESIGN.md §11.5, §11.6)
+-- dmbtree: in-place updates of indexed columns
 --
 
 -- the access method, with copies of btree's operator classes
@@ -34,10 +34,10 @@ CREATE INDEX dm_ks ON dm (k, s);
 CREATE INDEX dm_s ON dm (s);
 CREATE INDEX dm_b ON dm (b);
 CREATE INDEX dm_n ON dm (n);                    -- numeric: not "equalimage"
-CREATE INDEX dm_kinc ON dm (k) INCLUDE (inc);   -- INCLUDE columns (§21 D39)
+CREATE INDEX dm_kinc ON dm (k) INCLUDE (inc);   -- INCLUDE columns
 CREATE INDEX dm_pad ON dm USING btree (pad);    -- explicitly btree
-CREATE INDEX dm_e ON dm ((e + 1));              -- expression (§21 D39)
-CREATE INDEX dm_p ON dm (p) WHERE p > 0;        -- partial (§21 D39)
+CREATE INDEX dm_e ON dm ((e + 1));              -- expression
+CREATE INDEX dm_p ON dm (p) WHERE p > 0;        -- partial
 SELECT c.relname, a.amname
 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
      JOIN pg_am a ON a.oid = c.relam
@@ -75,7 +75,7 @@ GROUP BY 1 ORDER BY min(id);
 -- an index on the whole row (through a function that is not inlined, so
 -- that the expression keeps the whole-row reference): a change of any
 -- column changes its key; the row stays, and iheap computes the old and
--- the new key (§21 D39)
+-- the new key
 CREATE TABLE dwr (id int, b text) USING iheap;
 CREATE FUNCTION dm_rowkey(r dwr) RETURNS text IMMUTABLE LANGUAGE plpgsql
   AS $$ BEGIN RETURN r.id || ':' || r.b; END $$;
@@ -469,8 +469,8 @@ DROP COLLATION dm_ci;
 
 -- ------------------------------------------------------------------------
 -- A leaf page notes the oldest xid that delete-marked an entry on it, in
--- pd_prune_xid (§21 D27): until every snapshot sees that transaction no
--- marked entry can go, and cleanup passes skip the page
+-- pd_prune_xid: until every snapshot sees that transaction no marked entry
+-- can go, and cleanup passes skip the page
 -- ------------------------------------------------------------------------
 CREATE TABLE dpx (id int, k int) USING iheap WITH (autovacuum_enabled = off);
 CREATE INDEX dpx_k ON dpx (k);

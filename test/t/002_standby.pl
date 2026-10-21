@@ -27,7 +27,7 @@ for my $round (1 .. 6)
 }
 
 # maintenance: prune, vacuum (visibility map; the indexes by parallel
-# workers, §21 D44), discard, rewrite, truncate
+# workers), discard, rewrite, truncate
 $primary->safe_psql('postgres', q{
 SET min_parallel_index_scan_size = 0;
 VACUUM (PARALLEL 3) ti;
@@ -63,9 +63,9 @@ $primary->safe_psql('postgres', 'VACUUM');
 
 # moves (a btree index's column changes) and deletions while a prepared
 # transaction holds the horizon: the old rows' bodies stay on their pages,
-# and the pruning that frees them later carries a conflict horizon (§21
-# D40).  Rows with compact headers (§21 D43), from a rewrite: locked,
-# updated in place, moved, deleted, and rolled back.
+# and the pruning that frees them later carries a conflict horizon.  Rows with
+# compact headers, from a rewrite: locked, updated in place, moved, deleted,
+# and rolled back.
 $primary->safe_psql('postgres', q{
 CREATE TABLE tc (id int PRIMARY KEY, k int, v int, s text) USING iheap;
 CREATE INDEX tc_k ON tc USING btree (k);
@@ -94,11 +94,11 @@ UPDATE tc SET v = v + 1 WHERE id % 19 = 0;
 DELETE FROM tc WHERE id % 23 = 0;
 });
 
-# rows moving off full pages while a prepared transaction holds the horizon
-# (§21 D45): once a page's bodies wait for a committed mover, the next rows
-# to leave it take their bodies to undo and leave stubs at once, whose room
-# the page gets back by compaction when the moves commit; moves to other
-# pages write no LOCK record.  Some of them roll back.
+# rows moving off full pages while a prepared transaction holds the horizon:
+# once a page's bodies wait for a committed mover, the next rows to leave it
+# take their bodies to undo and leave stubs at once, whose room the page gets
+# back by compaction when the moves commit; moves to other pages write no LOCK
+# record.  Some of them roll back.
 $primary->safe_psql('postgres', q{
 CREATE TABLE tv (id int PRIMARY KEY, k int, s text) USING iheap;
 CREATE INDEX tv_k ON tv USING btree (k);

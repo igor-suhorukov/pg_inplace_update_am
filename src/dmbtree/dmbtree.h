@@ -1,8 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * dmbtree.h
- *	  dmbtree: PostgreSQL's nbtree with delete-marking (DESIGN.md §11.5,
- *	  §21 D21-D27).
+ *	  dmbtree: PostgreSQL's nbtree with delete-marking.
  *
  * This is a fork of src/include/access/nbtree.h at the commit named in
  * src/dmbtree/README.  Identifiers were renamed by scripts/dmbtree_fork.sh;
@@ -718,11 +717,10 @@ BTreeTupleGetMaxHeapTID(IndexTuple itup)
  * never carry it.
  *
  * A marked entry (key K, TID X) may not match the newest committed version
- * of row X; an unmarked one always does (DESIGN.md §11.5.4).  Inside dmbtree
- * every comparison of heap TIDs ignores the bit (DmbtTidCompare), so marking
- * or unmarking never moves an entry; every TID handed out of dmbtree (to the
- * executor, the table AM, VACUUM's callback, TID bitmaps) is an unmarked
- * copy.
+ * of row X; an unmarked one always does.  Inside dmbtree every comparison of
+ * heap TIDs ignores the bit (DmbtTidCompare), so marking or unmarking never
+ * moves an entry; every TID handed out of dmbtree (to the executor, the table
+ * AM, VACUUM's callback, TID bitmaps) is an unmarked copy.
  */
 #define DMBT_DM_FLAG		((OffsetNumber) 0x8000)
 
@@ -1199,8 +1197,8 @@ typedef struct BTScanOpaqueData
 
 	/*
 	 * dmbtree: holds the entry an index-only scan returns in place of a
-	 * marked one whose row has other INCLUDE values (§21 D39); created when
-	 * first needed.
+	 * marked one whose row has other INCLUDE values; created when first
+	 * needed.
 	 */
 	MemoryContext dmSubstCxt;
 

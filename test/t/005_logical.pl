@@ -1,9 +1,9 @@
-# Logical replication of iheap tables (DESIGN.md §9.5, §21 D38): changes of
-# every kind made on a publisher -- in place, moving rows, through dmbtree
-# keys, deletions, values stored out of line, COPY, upserts, transactions
-# and subtransactions that roll back -- arrive at a subscriber whose tables
-# are iheap too, where they agree with the publisher's tables and with heap
-# twins.  A large transaction is streamed while in progress.
+# Logical replication of iheap tables: changes of every kind made on a
+# publisher -- in place, moving rows, through dmbtree keys, deletions, values
+# stored out of line, COPY, upserts, transactions and subtransactions that
+# roll back -- arrive at a subscriber whose tables are iheap too, where they
+# agree with the publisher's tables and with heap twins.  A large transaction
+# is streamed while in progress.
 use strict;
 use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Analytical benchmarks, heap vs iheap (DESIGN.md §22.3): TPC-H, TPC-DS and
-# ClickBench, run inside the release image by "scripts/docker.sh olap".
+# Analytical benchmarks, heap vs iheap: TPC-H, TPC-DS and ClickBench, run
+# inside the release image by "scripts/docker.sh olap".
 #
 #   bench/olap/run.sh [tpch|tpcds|clickbench]...     (default: all three)
 #

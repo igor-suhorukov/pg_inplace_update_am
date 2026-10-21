@@ -89,7 +89,7 @@ SELECT sum(counter) FROM ib;
 
 -- one VACUUM discards all the undo the horizon allows, however much: a
 -- writer passes at most 1024 undo pages at a time, VACUUM and
--- iheap_discard() go on (§21 D9)
+-- iheap_discard() go on
 CREATE TABLE iu (id int, pad text) USING iheap WITH (autovacuum_enabled = off);
 INSERT INTO iu SELECT g, repeat('u', 200) FROM generate_series(1, 50000) g;
 VACUUM iu;

@@ -72,7 +72,7 @@ RETURNS int8
 AS 'MODULE_PATHNAME', 'iheap_discard_undo'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
--- Verification (DESIGN.md §15): one row per problem found.
+-- Verification: one row per problem found.
 CREATE FUNCTION iheap_check(rel regclass, check_indexes boolean DEFAULT true,
     OUT blkno int8,
     OUT offnum int4,
@@ -88,8 +88,8 @@ REVOKE ALL ON FUNCTION iheap_relation_stats(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION iheap_discard(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION iheap_check(regclass, boolean) FROM PUBLIC;
 
--- Cumulative statistics (DESIGN.md §15), readable by everybody as core's
--- are; resetting them takes a superuser.
+-- Cumulative statistics, readable by everybody as core's are; resetting them
+-- takes a superuser.
 CREATE FUNCTION iheap_stat(rel regclass,
     OUT inplace_updates int8,
     OUT inplace_key_updates int8,
@@ -137,7 +137,7 @@ WHERE a.amname = 'iheap' AND c.relkind IN ('r', 'm');
 GRANT SELECT ON iheap_stat_tables TO PUBLIC;
 
 -- dmbtree: B-tree with delete-marking, for in-place updates of the key
--- columns of iheap tables (DESIGN.md §11.5).
+-- columns of iheap tables.
 
 CREATE FUNCTION dmbtree_handler(internal)
 RETURNS index_am_handler
@@ -258,9 +258,9 @@ LANGUAGE C STRICT PARALLEL SAFE;
 REVOKE ALL ON FUNCTION dmbtree_index_stats(regclass) FROM PUBLIC;
 
 -- Verification: a port of amcheck's bt_index_check() and
--- bt_index_parent_check() (DESIGN.md §11.5.8, §21 D34).  checkmarks also
--- checks the entries against the rows: each points to a used line pointer,
--- and an unmarked entry matches the newest committed version of its row.
+-- bt_index_parent_check().  checkmarks also checks the entries against the
+-- rows: each points to a used line pointer, and an unmarked entry matches the
+-- newest committed version of its row.
 CREATE FUNCTION dmbtree_check(index regclass,
     heapallindexed boolean DEFAULT false,
     checkunique boolean DEFAULT false,

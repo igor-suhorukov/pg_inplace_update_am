@@ -1,8 +1,7 @@
 --
--- Logical decoding of iheap tables (DESIGN.md §9.5, §21 D38).  Every
--- change is made to a heap table and to its iheap twin, in the same
--- transaction; the changes decoded for the two must be the same but for
--- the table's name.
+-- Logical decoding of iheap tables.  Every change is made to a heap table and
+-- to its iheap twin, in the same transaction; the changes decoded for the two
+-- must be the same but for the table's name.
 --
 SELECT 'init' FROM pg_create_logical_replication_slot('ihl', 'test_decoding');
 

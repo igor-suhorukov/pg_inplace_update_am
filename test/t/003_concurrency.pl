@@ -131,9 +131,9 @@ cmp_ok($pages, '<=', 20, 'data pages stay bounded');
 is($node->safe_psql('postgres', 'SELECT live_undo_pages FROM iheap_metapage_info(\'acct\')'),
 	'0', 'undo discarded after the workload');
 
-# parallel VACUUM (§21 D44) concurrently with key changes in place, whose
-# marked entries of acct_branch the workers clean up, and with rows that
-# grow and move: the checks run alongside
+# parallel VACUUM concurrently with key changes in place, whose marked entries
+# of acct_branch the workers clean up, and with rows that grow and move: the
+# checks run alongside
 $node->pgbench(
 	'--no-vacuum --client=6 --jobs=3 --transactions=150 --max-tries=100',
 	0,
@@ -224,13 +224,13 @@ $node->safe_psql('postgres', 'VACUUM codes');
 is($node->safe_psql('postgres', 'SELECT tids, marked FROM dmbtree_index_stats(\'codes_code\')'),
 	'100|0', 'marked entries cleaned up');
 
-# rows moving to other pages while a snapshot is held (§21 D45): a writer
-# keeps the old page locked while it locks the new one, a later page as the
-# block order allows, an earlier one only if its lock is free at once.  The
-# free space VACUUM leaves all over the table sends rows to pages before and
-# after their own; rows leaving pages whose bodies the snapshot holds take
-# their bodies to undo.  A deadlock among buffer locks would hang the run:
-# the alarm fails the test instead.
+# rows moving to other pages while a snapshot is held: a writer keeps the old
+# page locked while it locks the new one, a later page as the block order
+# allows, an earlier one only if its lock is free at once.  The free space
+# VACUUM leaves all over the table sends rows to pages before and after their
+# own; rows leaving pages whose bodies the snapshot holds take their bodies to
+# undo.  A deadlock among buffer locks would hang the run: the alarm fails the
+# test instead.
 $node->safe_psql('postgres', q{
 CREATE TABLE mvt (id int PRIMARY KEY, k int, v int, pad text) USING iheap;
 CREATE INDEX mvt_k ON mvt USING btree (k);

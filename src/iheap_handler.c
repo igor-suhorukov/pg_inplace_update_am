@@ -6,7 +6,7 @@
  *
  * The module must be loaded through shared_preload_libraries: its WAL
  * resource managers (iheap's and dmbtree's) have to be registered before
- * recovery starts (DESIGN.md §21 D15).
+ * recovery starts.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *

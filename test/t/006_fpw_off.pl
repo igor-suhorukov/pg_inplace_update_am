@@ -2,9 +2,8 @@
 # out at any point of the workload, so redo meets pages that are newer than
 # the record it replays (BLK_DONE), undo pages among them, some of them
 # reused since; redo must still give the tuple headers it rebuilds the right
-# undo pages (§21 D42).  Bodies of moved and deleted rows stay on their pages
-# (§21 D40), and rows have compact headers (§21 D43).  The tables are
-# compared with heap twins and checked.
+# undo pages.  Bodies of moved and deleted rows stay on their pages, and rows
+# have compact headers.  The tables are compared with heap twins and checked.
 #
 # No wal_consistency_checking here: where an undo page has been reused since
 # the record, redo gives the header undo pointer 0, which means what the

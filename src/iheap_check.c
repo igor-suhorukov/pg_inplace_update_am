@@ -1,8 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * iheap_check.c
- *	  iheap_check(): verifying the structure of an iheap relation
- *	  (DESIGN.md §15, §21 D35).
+ *	  iheap_check(): verifying the structure of an iheap relation.
  *
  * Each problem found is returned as a row (block, offset, message), as
  * amcheck's verify_heapam() does, instead of an error at the first one:
@@ -839,9 +838,9 @@ attributes_problem(IHCheckState *cs, const char *tup, uint32 len,
  * discarded down to the version a creating record ends: each record exists,
  * is about this item, and was written by the version's creator (a LOCK
  * record by a locker, keeping the creator).  A chain need not go back in the
- * stream: each backend appends to undo pages of its own (§21 D4), so an
- * older change of a row may sit on a newer page.  Only the length of a
- * chain bounds the walk.
+ * stream: each backend appends to undo pages of its own, so an older change
+ * of a row may sit on a newer page.  Only the length of a chain bounds the
+ * walk.
  */
 static void
 check_undo_chain(IHCheckState *cs, BlockNumber blk, OffsetNumber off,
@@ -972,9 +971,9 @@ check_undo_chain(IHCheckState *cs, BlockNumber blk, OffsetNumber off,
 				{
 					/*
 					 * The body of the version before: in the record (a
-					 * compact header's, or one written before §21 D40), or
-					 * on the page after the deletion's header, until the
-					 * item is a stub.
+					 * compact header's, or one written by an older iheap), or
+					 * on the page after the deletion's header, until the item
+					 * is a stub.
 					 */
 					uint32		skip = (rh.ur_type == IHU_MOVE) ?
 						sizeof(ItemPointerData) : 0;
@@ -1120,7 +1119,7 @@ check_tuple(IHCheckState *cs, BlockNumber blk, OffsetNumber off, Page page,
 	if (h.urec >= cs->discard)
 		check_undo_chain(cs, blk, off, h, len, stub);
 
-	/* an all-visible page holds frozen rows only (§10.4) */
+	/* an all-visible page holds frozen rows only */
 	if (allvisible)
 	{
 		if (deleted || stub || (h.infomask & IHT_SPECULATIVE))

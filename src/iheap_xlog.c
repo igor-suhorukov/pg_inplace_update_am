@@ -117,7 +117,7 @@ redo_finish(XLogReaderState *record, Buffer buf, XLogRedoAction action)
 }
 
 /* ------------------------------------------------------------------------
- * Tuple headers in WAL (§21 D42)
+ * Tuple headers in WAL
  * ------------------------------------------------------------------------
  */
 
@@ -362,7 +362,7 @@ redo_apply_change(Page page, OffsetNumber off, const char *change,
 	{
 		/*
 		 * A row deleted or moved with its body in undo (a compact header, or
-		 * a move off a page whose bodies a snapshot holds, §21 D45): a stub
+		 * a move off a page whose bodies a snapshot holds): a stub
 		 */
 		if (ItemIdGetLength(lp) < IHEAP_TUPHDR_SIZE)
 			elog(PANIC, "iheap redo: stub longer than its item");
@@ -461,7 +461,9 @@ redo_update(XLogReaderState *record)
 		if (xlrec->flags & XLIH_RELOCATED)
 		{
 			if (!iheap_page_place_item_ext(page, xlrec->offnum, t, xlrec->new_len,
-										   Max(xlrec->capacity, xlrec->new_len)))
+										   Max(xlrec->capacity, xlrec->new_len),
+										   (xlrec->flags & XLIH_KEEP_ALIGN) ?
+										   ItemIdGetOffset(lp) % MAXIMUM_ALIGNOF : -1))
 				elog(PANIC, "iheap redo: relocation failed");
 			if (ItemIdGetOffset(lp) != xlrec->lp_off)
 				elog(PANIC, "iheap redo: relocation diverged (%u vs %u)",
@@ -674,7 +676,7 @@ redo_prune(XLogReaderState *record)
 
 	/*
 	 * Bodies of deleted and moved rows go: standby queries that may still
-	 * see them are cancelled first (§21 D40).
+	 * see them are cancelled first.
 	 */
 	if (xlrec->flags & XLIH_PRUNE_CONFLICT)
 	{
@@ -776,7 +778,10 @@ static void
 redo_undo_alloc(XLogReaderState *record)
 {
 	xl_iheap_undo_alloc *xlrec = (xl_iheap_undo_alloc *) XLogRecGetData(record);
+	RelFileLocator rlocator;
+	SMgrRelation smgr;
 	Buffer		buf;
+	BlockNumber end = 0;
 
 	redo_meta_block(record, IH_BLK_META);
 
@@ -785,6 +790,39 @@ redo_undo_alloc(XLogReaderState *record)
 	PageSetLSN(BufferGetPage(buf), record->EndRecPtr);
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
+
+	/*
+	 * A new extent was made by extending the relation, which is not logged
+	 * (iheap_undo.c): extend it here as well, so that the pages of every
+	 * extent the metapage lists exist after redo, as they do where the
+	 * record was written.  Otherwise the next undo page would lie beyond
+	 * the relation's end, and a data page added at the end would land in
+	 * the extent.
+	 */
+	XLogRecGetBlockTag(record, IH_BLK_META, &rlocator, NULL, NULL);
+	buf = XLogReadBufferExtended(rlocator, MAIN_FORKNUM, IHEAP_METAPAGE_BLKNO,
+								 RBM_NORMAL, InvalidBuffer);
+	if (!BufferIsValid(buf))
+		return;
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	{
+		IHeapMetaPageData *meta = IHeapPageGetMeta(BufferGetPage(buf));
+
+		for (uint32 i = 0; i < meta->im_nextents; i++)
+			end = Max(end, meta->im_extents[i].ie_pstart +
+					  meta->im_extents[i].ie_npages);
+	}
+	UnlockReleaseBuffer(buf);
+
+	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (smgrnblocks(smgr, MAIN_FORKNUM) < end)
+	{
+		buf = ExtendBufferedRelTo(BMR_SMGR(smgr, RELPERSISTENCE_PERMANENT),
+								  MAIN_FORKNUM, NULL,
+								  EB_PERFORMING_RECOVERY | EB_SKIP_EXTENSION_LOCK,
+								  end, RBM_ZERO_AND_LOCK);
+		UnlockReleaseBuffer(buf);
+	}
 }
 
 static void

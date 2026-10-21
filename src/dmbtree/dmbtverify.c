@@ -2,8 +2,7 @@
  *
  * dmbtverify.c
  *		Verifies the integrity of dmbtree indexes based on invariants
- *		(fork of amcheck's verify_nbtree.c; see dmbtree.h, and DESIGN.md
- *		§21 D34 for what dmbtree adds).
+ *		(fork of amcheck's verify_nbtree.c; see dmbtree.h).
  *
  * For B-Tree indexes, verification includes checking that each page in the
  * target index has items in logical order as reported by an insertion scankey
@@ -879,7 +878,7 @@ nextpage:
  *
  * dmbtree: tid may carry the delete-mark.  In an iheap table, the row's
  * version the snapshot sees must also have the entry's (itup's) key: the
- * row may have had another key (DESIGN.md §11.5.4).
+ * row may have had another key.
  */
 static bool
 heap_entry_is_visible(BtreeCheckState *state, ItemPointer tid, IndexTuple itup)
@@ -1902,7 +1901,7 @@ bt_target_page_check(BtreeCheckState *state)
 
 /*
  * dmbtree: a pivot tuple's heap TID, a tiebreaker copied from a leaf tuple,
- * never carries the delete-mark (DESIGN.md §11.5.3).
+ * never carries the delete-mark.
  */
 static void
 bt_pivot_tid_check(BtreeCheckState *state, IndexTuple itup,
@@ -1926,7 +1925,7 @@ bt_pivot_tid_check(BtreeCheckState *state, IndexTuple itup,
 /*
  * dmbtree: the heap TIDs of a leaf tuple, its own or its posting list's,
  * have offsets of heap line pointers once the delete-mark bit is taken
- * away (DESIGN.md §11.5.3).
+ * away.
  */
 static void
 bt_heap_tids_check(BtreeCheckState *state, IndexTuple itup,
@@ -1974,14 +1973,14 @@ bt_heap_tids_check(BtreeCheckState *state, IndexTuple itup,
  * dmbtree: check the target leaf page's entries against the table
  * (checkmarks): every entry points to a line pointer in use of a page that
  * holds rows, and an unmarked entry (K, X) matches the newest committed
- * version of row X, which index-only scans rely on (DESIGN.md §11.5.4).
+ * version of row X, which index-only scans rely on.
  *
  * The page is read again and stays share-locked while iheap looks at the
  * rows (iheap_dm_verify_entries), so that no entry can be added or marked
  * meanwhile: a writer that changes a key changes the row first, which makes
  * a version that is not committed yet, and the index after.  Line pointers
  * become unused only after index vacuum, which needs this page, removed
- * the entries pointing at them (§10.5).
+ * the entries pointing at them.
  */
 static void
 bt_target_marks_check(BtreeCheckState *state)
@@ -3111,9 +3110,9 @@ bt_normalize_tuple(BtreeCheckState *state, IndexTuple itup)
 
 	/*
 	 * dmbtree: a marked entry keeps the INCLUDE values it was made with when
-	 * an in-place update changes them (§21 D39), so entries are fingerprinted
-	 * without them, on both sides; checkmarks compares the unmarked ones'
-	 * with their rows.
+	 * an in-place update changes them, so entries are fingerprinted without
+	 * them, on both sides; checkmarks compares the unmarked ones' with their
+	 * rows.
 	 */
 	if (IndexRelationGetNumberOfKeyAttributes(state->rel) < tupleDescriptor->natts)
 	{

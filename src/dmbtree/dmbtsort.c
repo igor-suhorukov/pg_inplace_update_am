@@ -227,8 +227,8 @@ typedef struct BTBuildState
 
 	/*
 	 * dmbtree: spool3 takes the delete-marked entries of older row versions
-	 * that some snapshot may still see (§21 D32 B), which the table AM hands
-	 * to the callback with marked TIDs.  They are inserted after the load.
+	 * that some snapshot may still see, which the table AM hands to the
+	 * callback with marked TIDs.  They are inserted after the load.
 	 */
 	BTSpool    *spool3;
 	bool		havemarked;
@@ -368,9 +368,9 @@ dmbtbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	/*
 	 * dmbtree: a rebuild that found rows updated in place whose older
-	 * versions it could not index (§21 D32): older snapshots must not use
-	 * the index.  Without such rows the index has an entry for every
-	 * version some snapshot may see, marked for the older ones.
+	 * versions it could not index: older snapshots must not use the index.
+	 * Without such rows the index has an entry for every version some
+	 * snapshot may see, marked for the older ones.
 	 */
 	if (indexInfo->ii_BrokenHotChain && !indexInfo->ii_Concurrent &&
 		ReindexIsProcessingIndex(RelationGetRelid(index)) &&
@@ -517,8 +517,8 @@ _dmbt_spools_heapscan(Relation heap, Relation index, BTBuildState *buildstate,
 
 	/*
 	 * dmbtree: the marked entries of older row versions go to a third
-	 * spool, to be inserted after the load (§21 D32 B); like spool2, no
-	 * uniqueness check, and work_mem.
+	 * spool, to be inserted after the load; like spool2, no uniqueness check,
+	 * and work_mem.
 	 */
 	if (!indexInfo->ii_Concurrent && dmbtree_build_older_keys(index, heap))
 	{
@@ -2125,10 +2125,10 @@ _dmbt_parallel_scan_and_sort(BTSpool *btspool, BTSpool *btspool2,
 
 /*
  * dmbtree: insert the delete-marked entries of older row versions spooled
- * by the build scan (§21 D32 B), now that the sorted load is done, through
- * the insertion path: core's tuplesort orders marked TIDs by their raw
- * offset numbers, which is no index order.  An entry the load put there
- * already (a marked copy of a row's newest entry) is marked instead.
+ * by the build scan, now that the sorted load is done, through the insertion
+ * path: core's tuplesort orders marked TIDs by their raw offset numbers,
+ * which is no index order.  An entry the load put there already (a marked
+ * copy of a row's newest entry) is marked instead.
  */
 static void
 _dmbt_insert_marked(BTSpool *btspool3)

@@ -4,8 +4,7 @@
  *	  Internal definitions of the iheap table access method: an in-place
  *	  update storage engine that keeps prior row versions in undo.
  *
- * See DESIGN.md (sections 5, 6 and 21) for the on-disk format and the
- * reasoning behind it.  In short:
+ * The on-disk format, in short:
  *
  *	- Block 0 of the main fork is a metapage.  The other blocks are data
  *	  pages and undo pages; their type is recorded in the page special area.
@@ -52,8 +51,8 @@ typedef struct IHeapPageOpaqueData
 	/*
 	 * Data pages, a hint like pd_prune_xid: the newest writer whose stub
 	 * keeps its storage reserved until that writer ends (a deletion or a
-	 * move whose body went to undo, §21 D43, D45).  Pruning gives the room
-	 * back once it has, without waiting for the horizon.
+	 * move whose body went to undo).  Pruning gives the room back once it
+	 * has, without waiting for the horizon.
 	 */
 	TransactionId ihp_room_xid;
 } IHeapPageOpaqueData;
@@ -98,7 +97,7 @@ IHeapPageIsData(Page page)
 
 /*
  * TID bitmaps reject offsets above MaxHeapTuplesPerPage, so a data page
- * never holds more line pointers than heap would (DESIGN.md A8).
+ * never holds more line pointers than heap would.
  */
 #define IHEAP_MAX_ITEMS		MaxHeapTuplesPerPage
 
@@ -138,14 +137,14 @@ typedef uint64 UndoRecPtr;
  * a tuple contains such a value, IHT_ALIGNDATA is set and the tuple is
  * placed so that its data area is MAXALIGNed in memory.
  *
- * A compact header (IHT_COMPACT, §21 D43) ends before the xid: 12 bytes.
- * Its version was created by a transaction every snapshot sees, so the
- * xid would never be looked up; it reads as FrozenTransactionId.  Locks
- * set its undo pointer as for any other header.  Only versions written
- * frozen get one (table rewrites, frozen loads), and only those without
- * aligned values (IHT_ALIGNDATA) whose body takes at least
- * IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ bytes, so that the 16-byte
- * header of a deletion fits in their storage.
+ * A compact header (IHT_COMPACT) ends before the xid: 12 bytes.  Its version
+ * was created by a transaction every snapshot sees, so the xid would never be
+ * looked up; it reads as FrozenTransactionId.  Locks set its undo pointer as
+ * for any other header.  Only versions written frozen get one (table
+ * rewrites, frozen loads), and only those without aligned values
+ * (IHT_ALIGNDATA) whose body takes at least IHEAP_TUPHDR_SIZE -
+ * IHEAP_COMPACT_HDRSZ bytes, so that the 16-byte header of a deletion fits in
+ * their storage.
  *
  * Undo records carry the header of the previous version as an "image": the
  * 16-byte layout above whatever the version's own form, with xid
@@ -357,9 +356,9 @@ typedef struct IHeapUndoPageHeaderData
 
 /*
  * Record formats of undo pages.  Pages initialized before compact headers
- * (§21 D37) have format 0: each record starts with IHeapUndoRecHeader as it
- * is laid out in memory (IHEAP_UNDOREC_V1_HDRSZ bytes).  Records are only
- * appended in the format of their page.
+ * have format 0: each record starts with IHeapUndoRecHeader as it is laid out
+ * in memory (IHEAP_UNDOREC_V1_HDRSZ bytes).  Records are only appended in the
+ * format of their page.
  */
 #define IHEAP_UNDO_FORMAT_V1		0
 #define IHEAP_UNDO_FORMAT_COMPACT	1
@@ -398,9 +397,9 @@ IHeapUndoPageGetHeader(Page page)
  * and 0 is below every discard pointer.
  *
  * On an undo page of format IHEAP_UNDO_FORMAT_COMPACT a record starts with
- * the compact form of its header (iheap_undo.c, §21 D37), between 12 and
- * IHEAP_UNDOREC_MAXHDRSZ bytes; format IHEAP_UNDO_FORMAT_V1 has the struct
- * as it is, unaligned.
+ * the compact form of its header (iheap_undo.c), between 12 and
+ * IHEAP_UNDOREC_MAXHDRSZ bytes; format IHEAP_UNDO_FORMAT_V1 has the struct as
+ * it is, unaligned.
  */
 typedef struct IHeapUndoRecHeader
 {
@@ -566,10 +565,10 @@ typedef struct IHeapScanDescData
 typedef IHeapScanDescData *IHeapScanDesc;
 
 /*
- * The dmbtree entry an index fetch comes from (DESIGN.md §11.5.4): the row
- * version found is checked against its key when the entry is delete-marked
- * or the version was rebuilt from undo, or when the snapshot is not an MVCC
- * one and the entry may have been marked since it was read.
+ * The dmbtree entry an index fetch comes from: the row version found is
+ * checked against its key when the entry is delete-marked or the version was
+ * rebuilt from undo, or when the snapshot is not an MVCC one and the entry
+ * may have been marked since it was read.
  */
 typedef struct IHeapDmEntry
 {
@@ -589,8 +588,8 @@ typedef struct IHeapIndexFetchData
 /*
  * Indexes whose entries an in-place update may change (dmbtree indexes
  * that can carry delete-marks), and the columns whose change makes an
- * update move the row instead (§7.4).  Cached per relation, rebuilt after
- * a relcache invalidation of the table or of one of its indexes.
+ * update move the row instead.  Cached per relation, rebuilt after a relcache
+ * invalidation of the table or of one of its indexes.
  */
 typedef struct IHeapDmIndex
 {
@@ -642,7 +641,7 @@ extern int	iheap_foreground_undo_limit;
 extern int	iheap_logical_decoding;
 extern int	iheap_compact_headers;
 
-/* iheap.compact_headers (§21 D43) */
+/* iheap.compact_headers */
 #define IHEAP_COMPACT_OFF		0
 #define IHEAP_COMPACT_AUTO		1	/* where fillfactor leaves room to grow back */
 #define IHEAP_COMPACT_ALWAYS	2
@@ -702,13 +701,12 @@ typedef struct IHeapUndoWalEnt
 
 /*
  * Undo records travel in WAL as buffer data of their undo page, each as a
- * flags byte and the record as its page encodes it (§21 D37), less what
- * redo can derive (§21 D15, D42): the writer's xid when it is the WAL
- * record's, the target block when it is the record's data block
- * (IH_BLK_DATA), and the delta header of an in-place update (old length,
- * prefix, suffix, middle length), which the update record's prefix and
- * suffix and the record's own lengths give.  The placement is derived too:
- * records are appended at pd_lower.
+ * flags byte and the record as its page encodes it, less what redo can
+ * derive: the writer's xid when it is the WAL record's, the target block when
+ * it is the record's data block (IH_BLK_DATA), and the delta header of an
+ * in-place update (old length, prefix, suffix, middle length), which the
+ * update record's prefix and suffix and the record's own lengths give.  The
+ * placement is derived too: records are appended at pd_lower.
  */
 #define IHUW_XID			0x01	/* the writer's xid is there */
 #define IHUW_BLKNO			0x02	/* the target block is there */
@@ -851,8 +849,6 @@ extern int	iheap_compact_quota(Relation rel);
 extern int	iheap_page_compact_count(Page page);
 extern OffsetNumber iheap_page_add_item(Page page, const char *tuple,
 										uint32 len, OffsetNumber want);
-extern bool iheap_page_place_item(Page page, OffsetNumber off,
-								  const char *tuple, uint32 len);
 
 /* iheap_rollback.c */
 extern void iheap_xact_register_write(Relation rel, UndoRecPtr urp, Size len);
@@ -883,10 +879,10 @@ extern void iheap_compute_reservations(Relation rel, Page page,
 extern OffsetNumber iheap_page_choose_offnum(Page page);
 extern bool iheap_page_place_item_ext(Page page, OffsetNumber off,
 									  const char *tuple, uint32 len,
-									  uint32 capacity);
-extern uint32 iheap_item_reservation(Relation rel, Page page, OffsetNumber off);
+									  uint32 capacity, int residue);
+extern uint32 iheap_item_reservation(Relation rel, Page page, OffsetNumber off,
+									  bool *align);
 extern bool iheap_tuple_aligned_at(const char *tuple, uint32 start);
-extern bool iheap_tuple_alignment_covers(const char *tuple, const char *other);
 
 /* iheap_xlog.c */
 #define RM_IHEAP_ID		RM_EXPERIMENTAL_ID

@@ -1,8 +1,8 @@
 # pg_inplace_update_am: the iheap table access method (PGXS build)
 #
-# Build and test only inside the Docker images (DESIGN.md §20):
+# Build and test only inside the Docker images:
 #   scripts/docker.sh build
-#   scripts/docker.sh test [regress|isolation|tap|core|all]
+#   scripts/docker.sh test [regress|isolation|tap|model|core|all]
 
 MODULE_big = pg_inplace_update_am
 OBJS = \

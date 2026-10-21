@@ -3,7 +3,7 @@
  * iheap_prune.c
  *	  Data page space management: item placement, compaction, pruning.
  *
- * Space rules (DESIGN.md §21 D6, D40):
+ * Space rules:
  *	- Storage freed by a shrinking in-place UPDATE stays reserved until the
  *	  writer commits, because rollback restores the old version in place.
  *	- A deleted or moved row keeps its body on the page until every
@@ -14,13 +14,13 @@
  *	  Until the horizon passes, pd_prune_xid holds what a prune waits for,
  *	  and writers looking for room do not prune before (as heap).
  *	- A row with a compact header that is deleted or moved, and a row that
- *	  moves off a page whose bodies a snapshot holds (§21 D45), becomes
- *	  a stub at once, its body in undo.  Its storage stays reserved until
- *	  the writer ends; ihp_room_xid names the newest such writer, and once
- *	  it has ended, writers looking for room compact the page without
- *	  waiting for the horizon.
+ *	  moves off a page whose bodies a snapshot holds, becomes a stub at once,
+ *	  its body in undo.  Its storage stays reserved until the writer ends;
+ *	  ihp_room_xid names the newest such writer, and once it has ended,
+ *	  writers looking for room compact the page without waiting for the
+ *	  horizon.
  *	- Compaction needs only an exclusive content lock: readers never touch
- *	  page memory without holding the content lock (§21 D11).
+ *	  page memory without holding the content lock.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -72,13 +72,20 @@ iheap_page_choose_offnum(Page page)
 	return maxoff + 1;
 }
 
-/* start offset for a tuple of "len" bytes ending at or below "upper" */
+/*
+ * Start offset for a tuple of "len" bytes ending at or below "upper".  With a
+ * residue (-1: none) the offset keeps it modulo MAXIMUM_ALIGNOF: an item
+ * whose older versions a rollback may put back keeps the alignment they have
+ * at its place, which suits the tuple too.
+ */
 static inline int
-ih_place_start(int upper, const char *tuple, uint32 len)
+ih_place_start(int upper, const char *tuple, uint32 len, int residue)
 {
 	int			start = upper - (int) len;
 
-	if (ih_tuple_needs_align(tuple))
+	if (residue >= 0)
+		start -= (start - residue) & (MAXIMUM_ALIGNOF - 1);
+	else if (ih_tuple_needs_align(tuple))
 	{
 		int			hoff = ih_hdr_hoff(tuple);
 
@@ -86,6 +93,7 @@ ih_place_start(int upper, const char *tuple, uint32 len)
 	}
 	else
 		start &= ~1;
+	Assert(iheap_tuple_aligned_at(tuple, start));
 	return start;
 }
 
@@ -99,20 +107,6 @@ iheap_tuple_aligned_at(const char *tuple, uint32 start)
 {
 	return !ih_tuple_needs_align(tuple) ||
 		(start + ih_hdr_hoff(tuple)) % MAXIMUM_ALIGNOF == 0;
-}
-
-/*
- * Does every place aligned for "tuple" suit "other" too?  A rollback puts
- * the version an in-place update replaced (other) back where the new one
- * (tuple) went.
- */
-bool
-iheap_tuple_alignment_covers(const char *tuple, const char *other)
-{
-	if (!ih_tuple_needs_align(other))
-		return true;
-	return ih_tuple_needs_align(tuple) &&
-		ih_hdr_hoff(tuple) % MAXIMUM_ALIGNOF == ih_hdr_hoff(other) % MAXIMUM_ALIGNOF;
 }
 
 /*
@@ -163,7 +157,7 @@ iheap_page_add_item(Page page, const char *tuple, uint32 len, OffsetNumber want)
 
 	newlp = (off > maxoff);
 	lower = ph->pd_lower + (newlp ? sizeof(ItemIdData) : 0);
-	start = ih_place_start(ph->pd_upper, tuple, len);
+	start = ih_place_start(ph->pd_upper, tuple, len, -1);
 	if (start < lower)
 		return InvalidOffsetNumber;
 
@@ -197,25 +191,20 @@ iheap_page_add_item(Page page, const char *tuple, uint32 len, OffsetNumber want)
 /*
  * Give an existing item new storage of "len" bytes (plus "capacity - len"
  * reserved bytes after it) taken from the page's free space, and copy the
- * tuple there.  Returns false if there is not enough free space.
+ * tuple there, at an offset that keeps "residue" (-1: none) modulo
+ * MAXIMUM_ALIGNOF.  Returns false if there is not enough free space.
  */
 bool
-iheap_page_place_item(Page page, OffsetNumber off, const char *tuple,
-					  uint32 len)
-{
-	return iheap_page_place_item_ext(page, off, tuple, len, len);
-}
-
-bool
 iheap_page_place_item_ext(Page page, OffsetNumber off, const char *tuple,
-						  uint32 len, uint32 capacity)
+						  uint32 len, uint32 capacity, int residue)
 {
 	PageHeader	ph = (PageHeader) page;
 	ItemId		lp = PageGetItemId(page, off);
 	int			start;
 
 	Assert(capacity >= len);
-	start = ih_place_start(ph->pd_upper - (int) (capacity - len), tuple, len);
+	start = ih_place_start(ph->pd_upper - (int) (capacity - len), tuple, len,
+						   residue);
 	if (start < ph->pd_lower)
 		return false;
 
@@ -234,9 +223,13 @@ iheap_page_place_item_ext(Page page, OffsetNumber off, const char *tuple,
  * that moved off a page whose bodies a snapshot holds, whose item became a
  * stub at once), 0 if none.  Rollback of those changes restores the old,
  * longer tuple at the item's location.
+ *
+ * Where one of those versions needs alignment, *align (if given) is set,
+ * and the reservation is at least the item's length: the item keeps the
+ * alignment of its place when compaction moves it.
  */
 uint32
-iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
+iheap_item_reservation(Relation rel, Page page, OffsetNumber off, bool *align)
 {
 	ItemId		lp = PageGetItemId(page, off);
 	char	   *tup;
@@ -244,8 +237,11 @@ iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
 	UndoRecPtr	urp;
 	UndoRecPtr	discard;
 	uint32		reserve = 0;
+	bool		aligned = false;
 	int			steps = 0;
 
+	if (align)
+		*align = false;
 	if (!ItemIdIsNormal(lp))
 		return 0;
 
@@ -258,7 +254,7 @@ iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
 	/*
 	 * The tuple's hint first: while a snapshot holds discard back, every
 	 * prune asks this of each item changed since, mostly by writers long
-	 * committed (§21 D45).
+	 * committed.
 	 */
 	if (iheap_xid_status(h.xid, InvalidBuffer, tup) == IHX_COMMITTED)
 		return 0;
@@ -284,6 +280,8 @@ iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
 			pfree(rec);
 			break;
 		}
+		if (ph.infomask & IHT_ALIGNDATA)
+			aligned = true;
 		if (rec->hdr.ur_type == IHU_UPDATE)
 		{
 			IHeapUpdateDelta d;
@@ -310,6 +308,10 @@ iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
 		pfree(rec);
 	}
 
+	if (align)
+		*align = aligned;
+	if (aligned)
+		return Max(reserve, ItemIdGetLength(lp));
 	return reserve > ItemIdGetLength(lp) ? reserve : 0;
 }
 
@@ -319,7 +321,7 @@ iheap_compute_reservations(Relation rel, Page page, uint32 *reserve)
 	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
 
 	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
-		reserve[off] = iheap_item_reservation(rel, page, off);
+		reserve[off] = iheap_item_reservation(rel, page, off, NULL);
 }
 
 typedef struct CompactItem
@@ -328,6 +330,7 @@ typedef struct CompactItem
 	uint16		lp_off;
 	uint16		len;
 	uint16		need;
+	int			residue;		/* of lp_off for reserved items, else -1 */
 } CompactItem;
 
 static int
@@ -344,8 +347,10 @@ compact_item_cmp(const void *a, const void *b)
 
 /*
  * Rewrite the page's tuple area compactly, keeping "reserve[off]" bytes of
- * storage for items that need it.  Deterministic, so redo produces the
- * same layout.  "rel" is unused (kept for symmetry); may be NULL in redo.
+ * storage for items that need it.  A reserved item keeps the residue of its
+ * offset modulo MAXIMUM_ALIGNOF, the alignment its versions that a rollback
+ * may put back have there.  Deterministic, so redo produces the same layout.
+ * "rel" is unused (kept for symmetry); may be NULL in redo.
  */
 void
 iheap_page_compact(Relation rel, Page page, const uint32 *reserve)
@@ -374,6 +379,8 @@ iheap_page_compact(Relation rel, Page page, const uint32 *reserve)
 		items[nitems].len = ItemIdGetLength(lp);
 		items[nitems].need = Max(ItemIdGetLength(lp),
 								 reserve ? reserve[off] : 0);
+		items[nitems].residue = (reserve && reserve[off] > 0) ?
+			items[nitems].lp_off % MAXIMUM_ALIGNOF : -1;
 		nitems++;
 	}
 
@@ -385,7 +392,7 @@ iheap_page_compact(Relation rel, Page page, const uint32 *reserve)
 	{
 		const char *src = scratch.data + items[i].lp_off;
 		int			start = ih_place_start(upper - (items[i].need - items[i].len),
-										   src, items[i].len);
+										   src, items[i].len, items[i].residue);
 
 		if (start < ph->pd_lower)
 			elog(PANIC, "iheap: page compaction overflow");
@@ -433,6 +440,8 @@ compaction_fits(Page page, const bool *gone, const bool *stubbed,
 		items[nitems].lp_off = ItemIdGetOffset(lp);
 		items[nitems].len = stubbed[off] ? IHEAP_TUPHDR_SIZE : ItemIdGetLength(lp);
 		items[nitems].need = Max(items[nitems].len, reserve[off]);
+		items[nitems].residue = reserve[off] > 0 ?
+			items[nitems].lp_off % MAXIMUM_ALIGNOF : -1;
 		nitems++;
 	}
 	qsort(items, nitems, sizeof(CompactItem), compact_item_cmp);
@@ -440,7 +449,7 @@ compaction_fits(Page page, const bool *gone, const bool *stubbed,
 	{
 		int			start = ih_place_start(upper - (items[i].need - items[i].len),
 										   (char *) page + items[i].lp_off,
-										   items[i].len);
+										   items[i].len, items[i].residue);
 
 		if (start < ph->pd_lower)
 			return false;
@@ -450,9 +459,9 @@ compaction_fits(Page page, const bool *gone, const bool *stubbed,
 }
 
 /*
- * Has the writer that the page's room hint names ended (§21 D45)?  Then
- * the storage it kept reserved for its stubs can be given back.  A value
- * that is not a recent xid, left long ago, counts as ended.
+ * Has the writer that the page's room hint names ended?  Then the storage it
+ * kept reserved for its stubs can be given back.  A value that is not a
+ * recent xid, left long ago, counts as ended.
  */
 static bool
 room_writer_ended(Page page)
@@ -509,7 +518,7 @@ prune_page(Relation rel, Buffer buffer, bool force, OffsetNumber *deadoffs,
 
 	/*
 	 * Stubs whose writer has ended give back the storage kept for them:
-	 * compact, even if nothing else changes (§21 D45).
+	 * compact, even if nothing else changes.
 	 */
 	if (room_writer_ended(page))
 		force = true;
@@ -561,11 +570,11 @@ prune_page(Relation rel, Buffer buffer, bool force, OffsetNumber *deadoffs,
 			{
 				/*
 				 * The body in undo (a compact row's, or one that moved off a
-				 * page whose bodies a snapshot holds, §21 D45): its room
-				 * stays reserved until the writer ends, which the room hint
-				 * then names.
+				 * page whose bodies a snapshot holds): its room stays
+				 * reserved until the writer ends, which the room hint then
+				 * names.
 				 */
-				reserve[off] = iheap_item_reservation(rel, page, off);
+				reserve[off] = iheap_item_reservation(rel, page, off, NULL);
 				if (reserve[off] > 0)
 				{
 					nreserve++;
@@ -575,17 +584,30 @@ prune_page(Relation rel, Buffer buffer, bool force, OffsetNumber *deadoffs,
 				}
 				stubs_wait = true;
 			}
-			else if (!TransactionIdIsValid(wait_xid) ||
-					 TransactionIdPrecedes(h.xid, wait_xid))
+			else
 			{
 				/* the body stays until the horizon passes its deleter */
-				wait_xid = h.xid;
+				if (!TransactionIdIsValid(wait_xid) ||
+					TransactionIdPrecedes(h.xid, wait_xid))
+					wait_xid = h.xid;
+
+				/*
+				 * A deletion or move that may still roll back puts back the
+				 * version it replaced, and those its in-place updates
+				 * replaced before: their room stays reserved.
+				 */
+				if (st != IHX_COMMITTED)
+				{
+					reserve[off] = iheap_item_reservation(rel, page, off, NULL);
+					if (reserve[off] > 0)
+						nreserve++;
+				}
 			}
 			pending = true;
 		}
 		else if (h.urec >= discard)
 		{
-			reserve[off] = iheap_item_reservation(rel, page, off);
+			reserve[off] = iheap_item_reservation(rel, page, off, NULL);
 			if (reserve[off] > 0)
 			{
 				nreserve++;
@@ -714,10 +736,10 @@ iheap_page_prune(Relation rel, Buffer buffer, bool force,
 /*
  * Does the last prune of the page wait for the horizon to pass one of its
  * deleters (pd_prune_xid)?  Until then pruning frees no body of a deleted
- * or moved row there (§21 D40).  As with heap's hint, the changes of a
- * writer that aborted wait too (writers roll back what they touch, readers
- * pass over it, VACUUM prunes regardless), and a value that is not a recent
- * xid, left long ago, is not trusted.
+ * or moved row there.  As with heap's hint, the changes of a writer that
+ * aborted wait too (writers roll back what they touch, readers pass over it,
+ * VACUUM prunes regardless), and a value that is not a recent xid, left long
+ * ago, is not trusted.
  */
 bool
 iheap_page_prune_waits(Relation rel, Page page)
@@ -732,9 +754,9 @@ iheap_page_prune_waits(Relation rel, Page page)
 /*
  * Does the prune wait for the horizon to pass a writer that has committed?
  * Then a snapshot older than that commit holds the page's bodies, and it
- * would hold the body of a row that moves off the page now as well (§21
- * D45).  Waiting only for running writers, such as the current transaction
- * moving row after row, says nothing of the snapshots.
+ * would hold the body of a row that moves off the page now as well.  Waiting
+ * only for running writers, such as the current transaction moving row after
+ * row, says nothing of the snapshots.
  */
 bool
 iheap_page_bodies_held(Relation rel, Page page)
@@ -746,9 +768,9 @@ iheap_page_bodies_held(Relation rel, Page page)
 /*
  * Prune for a writer that wants room on the page, unless the prune waits
  * for the horizon: pruning would free nothing, and while a long snapshot
- * holds the horizon every write to a full page would walk its items again
- * (§21 D40).  Stubs whose writer has ended since do not wait: compaction
- * gives back the storage kept for them (§21 D45).
+ * holds the horizon every write to a full page would walk its items again.
+ * Stubs whose writer has ended since do not wait: compaction gives back the
+ * storage kept for them.
  */
 bool
 iheap_page_prune_opt(Relation rel, Buffer buffer)
@@ -780,8 +802,8 @@ iheap_page_note_room(Page page, TransactionId xid)
 /*
  * Prune the page and give the item at "off" storage for "len" bytes where
  * it is, if the page has the room: a version that grows in an in-place
- * update and finds no free space for its new length elsewhere on the page
- * (§21 D43).  Returns whether it did.
+ * update and finds no free space for its new length elsewhere on the page.
+ * Returns whether it did.
  */
 bool
 iheap_page_prune_grow(Relation rel, Buffer buffer, OffsetNumber off, uint32 len)

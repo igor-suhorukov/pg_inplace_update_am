@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * dmbtree_api.h
- *	  What iheap and dmbtree call of each other (DESIGN.md §11.5, §11.6).
+ *	  What iheap and dmbtree call of each other.
  *
  * Both access methods live in one library.  iheap keeps dmbtree indexes
  * up to date when it updates a key column in place, and dmbtree hands the
@@ -33,8 +33,7 @@ extern bool dmbtree_is_dmbtree(Relation index);
  * Can "index" take in-place updates of the columns it reads?  A dmbtree
  * index whose key columns' opclasses all have "equality implies image
  * equality" (computed at build time for the key columns, as for
- * deduplication); expressions, a predicate and INCLUDE columns are fine
- * (§21 D24, D39).
+ * deduplication); expressions, a predicate and INCLUDE columns are fine.
  */
 extern bool dmbtree_dm_capable(Relation index);
 
@@ -52,8 +51,8 @@ extern void dmbtree_inplace_mark(Relation index, Relation heaprel,
 
 /*
  * An in-place update changed only the INCLUDE values of row "tid"'s entry,
- * which is marked and keeps its values (§21 D39): raise the error an
- * insertion of the new entry would raise if it is too large.
+ * which is marked and keeps its values: raise the error an insertion of the
+ * new entry would raise if it is too large.
  */
 extern void dmbtree_check_entry_size(Relation index, Relation heaprel,
 									 Datum *values, bool *isnull,
@@ -62,11 +61,11 @@ extern void dmbtree_check_entry_size(Relation index, Relation heaprel,
 /*
  * Does a build of "index" (not a concurrent one) on "heaprel" take the keys
  * of older row versions that some snapshot may still see, as delete-marked
- * entries (§21 D32 B)?  A dmbtree index that can take in-place updates of
- * the columns it reads, on an iheap table.  The table AM's build scan hands
- * such entries to the build callback with DMBTREE_TID_MARK set in the TID's
- * offset number; dmbtree inserts them after the sorted load (an entry the
- * load put there already is marked instead).
+ * entries?  A dmbtree index that can take in-place updates of the columns it
+ * reads, on an iheap table.  The table AM's build scan hands such entries to
+ * the build callback with DMBTREE_TID_MARK set in the TID's offset number;
+ * dmbtree inserts them after the sorted load (an entry the load put there
+ * already is marked instead).
  */
 extern bool dmbtree_build_older_keys(Relation index, Relation heaprel);
 
@@ -140,9 +139,9 @@ typedef struct DmbtEntryCheck
 } DmbtEntryCheck;
 
 /*
- * Decide the fate of delete-marked entries of "index" (DESIGN.md §11.5.6).
- * Returns the newest xid whose changes made a dead entry unneeded, the
- * conflict horizon for standbys (InvalidTransactionId if none).
+ * Decide the fate of delete-marked entries of "index".  Returns the newest
+ * xid whose changes made a dead entry unneeded, the conflict horizon for
+ * standbys (InvalidTransactionId if none).
  */
 extern TransactionId iheap_dm_check_entries(Relation heaprel, Relation index,
 											DmbtEntryCheck *entries,
@@ -176,8 +175,8 @@ typedef struct DmbtEntryVerify
 
 /*
  * dmbtree_check(checkmarks): check the entries of a leaf page, which the
- * caller holds share-locked, against their rows (DESIGN.md §11.5.4, §21
- * D34).  entries[] is sorted by TID here.
+ * caller holds share-locked, against their rows.  entries[] is sorted by TID
+ * here.
  */
 extern void iheap_dm_verify_entries(Relation heaprel, Relation index,
 									DmbtEntryVerify *entries, int nentries);

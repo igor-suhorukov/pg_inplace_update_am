@@ -4,7 +4,7 @@
  *	  VACUUM for iheap.
  *
  * In-place updates create no dead tuples, so VACUUM has less to do than
- * for heap (DESIGN.md §10.2):
+ * for heap:
  *	1. discard undo (verifying aborted transactions);
  *	2. prune data pages: frozen deletions become LP_DEAD, committed ones
  *	   shrink to stubs, pages are compacted;
@@ -12,11 +12,11 @@
  *	4. set visibility-map bits on pages whose items are all frozen;
  *	5. truncate empty trailing pages;
  *	6. advance relfrozenxid to the oldest xid referenced by live undo --
- *	   no freezing pass is ever needed (§10.6).
+ *	   no freezing pass is ever needed.
  *
  * Steps 3 and 4 run the index AMs' bulk deletion and cleanup, in parallel
  * workers when VACUUM's PARALLEL option and the indexes allow it, through
- * core's parallel vacuum as for heap (§21 D44).
+ * core's parallel vacuum as for heap.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -50,10 +50,10 @@
 #include "dmbtree_api.h"
 
 /*
- * The indexes VACUUM works on.  With a parallel vacuum (pvs, §21 D44) their
- * bulk deletion and cleanup are shared between parallel workers and this
- * backend, the dead items are in shared memory, and the indexes' statistics
- * stay there until parallel_vacuum_end() copies them to istats.
+ * The indexes VACUUM works on.  With a parallel vacuum (pvs) their bulk
+ * deletion and cleanup are shared between parallel workers and this backend,
+ * the dead items are in shared memory, and the indexes' statistics stay there
+ * until parallel_vacuum_end() copies them to istats.
  */
 typedef struct VacIndexes
 {
@@ -244,13 +244,12 @@ truncate_tail(Relation rel, BlockNumber nblocks)
 }
 
 /*
- * Start a parallel vacuum of the indexes if one can be had (§21 D44), else
- * return NULL.  The conditions are heap's (dead_items_alloc() in
- * vacuumlazy.c), and one of iheap's own: dmbtree's cleanup of marked
- * entries evaluates an index's expressions and predicate on table rows
- * (§11.5.6), in parallel workers and in this backend, which is in parallel
- * mode until parallel_vacuum_end().  They must be parallel safe then, as
- * for a parallel build of the index.
+ * Start a parallel vacuum of the indexes if one can be had, else return NULL.
+ * The conditions are heap's (dead_items_alloc() in vacuumlazy.c), and one of
+ * iheap's own: dmbtree's cleanup of marked entries evaluates an index's
+ * expressions and predicate on table rows, in parallel workers and in this
+ * backend, which is in parallel mode until parallel_vacuum_end().  They must
+ * be parallel safe then, as for a parallel build of the index.
  */
 static ParallelVacuumState *
 begin_parallel_vacuum(Relation rel, VacIndexes *vi, int nworkers,
@@ -429,11 +428,11 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	vi.nscans = 0;
 
 	/*
-	 * A parallel vacuum (§21 D44) when PARALLEL does not turn it off and two
-	 * indexes at least can share the work (one process vacuums an index),
-	 * as for heap.  From here to parallel_vacuum_end() this backend is in
-	 * parallel mode: the scan below writes pages and WAL only, which
-	 * parallel mode allows; catalog updates and truncation come after.
+	 * A parallel vacuum when PARALLEL does not turn it off and two indexes at
+	 * least can share the work (one process vacuums an index), as for heap.
+	 * From here to parallel_vacuum_end() this backend is in parallel mode:
+	 * the scan below writes pages and WAL only, which parallel mode allows;
+	 * catalog updates and truncation come after.
 	 */
 	vi.pvs = NULL;
 	if (params->nworkers >= 0 && vi.nindexes > 1 && index_cleanup)

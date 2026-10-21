@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# In-container driver (DESIGN.md §20).  Never run on the host.
+# In-container driver.  Never run on the host.
 #
 #   run.sh build                    copy /src to /build, compile with -Werror
 #   run.sh test [suite...]          build, install, run suites:
-#                                   regress isolation tap core core-dm all
+#                                   regress isolation tap model core core-dm all
+#                                   tap:<script>,<script> (test/t/*.pl)
 #                                   core:isolation/<test>,regress/<test>
 #   run.sh bench [args]             benchmarks (release image)
 #   run.sh olap [bench...]          analytical benchmarks (release image)
@@ -67,7 +68,8 @@ run_pgregress() {
 		--load-extension=pg_inplace_update_am \
 		--max-connections=20 \
 		"$@" \
-		$(grep -v '^#' "$BUILD/test/$schedule")
+		$(grep -v '^#' "$BUILD/test/$schedule") \
+		${EXTRA_TESTS:-}
 }
 
 suite_regress() {
@@ -78,12 +80,27 @@ suite_regress() {
 
 suite_isolation() {
 	log "isolation"
+	# and the specs that need injection points, where the build has them
+	local EXTRA_TESTS=
+	if "$PG_CONFIG" --configure | grep -q -- '--enable-injection-points'; then
+		EXTRA_TESTS=$(grep -v '^#' "$BUILD/test/isolation_schedule_ip")
+	fi
 	run_pgregress "$PG_ISOLATION_REGRESS" isolation isolation_schedule \
 		--dbname=isolation_regression
 }
 
+# "tap:<script>,..." runs only the named scripts (test/t/<script>.pl)
 suite_tap() {
-	log "tap"
+	local sel=${1:-} scripts=() t items
+	if [ -n "$sel" ]; then
+		IFS=, read -ra items <<<"$sel"
+		for t in "${items[@]}"; do
+			scripts+=("$BUILD/test/t/${t%.pl}.pl")
+		done
+	else
+		scripts=("$BUILD"/test/t/*.pl)
+	fi
+	log "tap${sel:+ ($sel)}"
 	local out=$OUT/tap
 	rm -rf "$out" "$BUILD/tmp_tap"
 	mkdir -p "$out" "$BUILD/tmp_tap"
@@ -94,8 +111,19 @@ suite_tap() {
 		PATH="$BINDIR:$PATH" \
 		PG_REGRESS="$PG_REGRESS" \
 		prove -I "$PGXS_DIR/src/test/perl" -I "$BUILD/test/t" \
-			${PROVE_FLAGS:-} test/t/*.pl
+			${PROVE_FLAGS:-} "${scripts[@]}"
 	)
+}
+
+# The model of rollback and discard, checked over every interleaving of its
+# steps (test/model/rollback.py)
+suite_model() {
+	log "model"
+	local out=$OUT/model
+	rm -rf "$out"
+	mkdir -p "$out"
+	python3 "$BUILD/test/model/rollback.py" | tee "$out/rollback.out"
+	return "${PIPESTATUS[0]}"
 }
 
 # PostgreSQL's own suites with iheap as the default table AM.  The
@@ -184,13 +212,14 @@ do_test() {
 	local suites=("$@") rc=0
 	[ ${#suites[@]} -eq 0 ] && suites=(all)
 	if [ "${suites[0]}" = all ]; then
-		suites=(regress isolation tap)
+		suites=(regress isolation tap model)
 	fi
 	do_build
 	do_install
 	for s in "${suites[@]}"; do
 		case "$s" in
-			regress|isolation|tap|core) "suite_$s" || rc=1 ;;
+			regress|isolation|tap|model|core) "suite_$s" || rc=1 ;;
+			tap:*) suite_tap "${s#tap:}" || rc=1 ;;
 			core:*) suite_core "${s#core:}" || rc=1 ;;
 			core-dm) CORE_FLAVOR=dm suite_core || rc=1 ;;
 			core-dm:*) CORE_FLAVOR=dm suite_core "${s#core-dm:}" || rc=1 ;;
@@ -221,7 +250,7 @@ case "$cmd" in
 		bash "$BUILD/bench/olap/run.sh" "$@"
 		;;
 	*)
-		sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
 		exit 2
 		;;
 esac

@@ -1,7 +1,7 @@
 --
 -- Deleted and moved rows keep their bodies on the page until every snapshot
--- sees the change (DESIGN.md §21 D40); the size of iheap's WAL records
--- (§21 D42); table rewrites write through the bulk writer (§21 D41).
+-- sees the change; the size of iheap's WAL records; table rewrites write
+-- through the bulk writer.
 --
 CREATE EXTENSION IF NOT EXISTS pg_walinspect;
 
@@ -182,7 +182,7 @@ SELECT count(*), sum(k), sum(v) FROM wi;
 SELECT * FROM iheap_check('wi');
 
 -- ------------------------------------------------------------------------
--- D. Moves while a snapshot is held (§21 D45).  A move to another page
+-- D. Moves while a snapshot is held.  A move to another page
 --    keeps the old page locked while it locks the new one: no LOCK record.
 --    A row that leaves a page whose bodies a snapshot holds takes its body
 --    to undo, and the room it leaves comes back when the move commits.

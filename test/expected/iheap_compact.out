@@ -1,7 +1,7 @@
 --
--- Compact tuple headers (DESIGN.md §21 D43): rows written frozen by table
--- rewrites and frozen loads may carry a 12-byte header without xid;
--- iheap.compact_headers decides where.
+-- Compact tuple headers: rows written frozen by table rewrites and frozen
+-- loads may carry a 12-byte header without xid; iheap.compact_headers decides
+-- where.
 --
 CREATE TABLE ct (id int PRIMARY KEY, a int, s text)
   USING iheap WITH (autovacuum_enabled = off);

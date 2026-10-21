@@ -4,20 +4,19 @@
  *	  INSERT, DELETE, UPDATE and row locking for iheap.
  *
  * Every change is one WAL record covering the data page, the undo page and,
- * when visibility-map bits are cleared, the VM page (DESIGN.md §6.1).
+ * when visibility-map bits are cleared, the VM page.
  *
- * UPDATE (§7.4) is done in place when no index-covered column changed
- * (rule (b): core indexes cannot cope with two keys for one TID), no AFTER
- * trigger needs OLD by TID (rule 3), and the new tuple fits on the page.
- * Otherwise the row moves to a new TID; the old item keeps its body until
- * every snapshot sees the move (§21 D40), unless the row leaves a page
- * whose bodies a snapshot holds (§21 D45).  A move to another page
- * keeps the old page locked while it locks the new one when the block
- * order allows, so that it needs no LOCK record (§21 D45).
+ * UPDATE is done in place when no index-covered column changed (rule (b):
+ * core indexes cannot cope with two keys for one TID), no AFTER trigger needs
+ * OLD by TID (rule 3), and the new tuple fits on the page.  Otherwise the row
+ * moves to a new TID; the old item keeps its body until every snapshot sees
+ * the move, unless the row leaves a page whose bodies a snapshot holds.  A
+ * move to another page keeps the old page locked while it locks the new one
+ * when the block order allows, so that it needs no LOCK record.
  *
  * Row locks are LOCK undo records listing the lockers that are still
- * running (§21 D10).  A modification carries non-conflicting lockers (KEY
- * SHARE versus a non-key update) into its own record.
+ * running.  A modification carries non-conflicting lockers (KEY SHARE versus
+ * a non-key update) into its own record.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -252,13 +251,12 @@ ih_pin_if_cached(Relation rel, BlockNumber blk)
  * Return a pinned, exclusively locked data page with room for a tuple of
  * "len" bytes.  If "otherbuf" is given (pinned, different page), it is
  * locked too: in block order if it comes unlocked.  If it comes locked
- * ("other_locked"), it stays locked throughout (§21 D45): a page after it
- * is locked as the block order allows, one before it only if its lock is
- * free at once, and a page is not read from disk with otherbuf locked;
- * when that leaves no page, InvalidBuffer is returned, and the caller lets
- * go of otherbuf and asks again.  *page_init is set when the page was
- * freshly initialized in memory (the caller's WAL record must use
- * REGBUF_WILL_INIT).
+ * ("other_locked"), it stays locked throughout: a page after it is locked as
+ * the block order allows, one before it only if its lock is free at once, and
+ * a page is not read from disk with otherbuf locked; when that leaves no
+ * page, InvalidBuffer is returned, and the caller lets go of otherbuf and
+ * asks again.  *page_init is set when the page was freshly initialized in
+ * memory (the caller's WAL record must use REGBUF_WILL_INIT).
  */
 static Buffer
 ih_get_buffer(Relation rel, Size len, BulkInsertStateData *bistate,
@@ -387,10 +385,10 @@ iheap_get_buffer_for_tuple(Relation rel, Size len,
 }
 
 /*
- * How many rows written frozen may have a compact header on one page
- * (§21 D43), -1 for any number.  A later in-place update gives such a row a
- * full header again, 4 bytes more: "auto" lets as many be compact as the
- * space the table's fillfactor keeps free on a page covers.
+ * How many rows written frozen may have a compact header on one page, -1 for
+ * any number.  A later in-place update gives such a row a full header again,
+ * 4 bytes more: "auto" lets as many be compact as the space the table's
+ * fillfactor keeps free on a page covers.
  */
 int
 iheap_compact_quota(Relation rel)
@@ -505,7 +503,7 @@ ih_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint32 options,
 										&page_init);
 	page = BufferGetPage(buffer);
 
-	/* a row written frozen may take a compact header (§21 D43) */
+	/* a row written frozen may take a compact header */
 	if (frozen && iheap_compact_headers != IHEAP_COMPACT_OFF &&
 		ih_tuple_can_compact(tup, len) && ih_compact_budget(rel, page) > 0)
 		len = ih_tuple_compact(tup, len);
@@ -739,7 +737,7 @@ iheap_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
  * multi_insert (COPY): one MULTI_INSERT undo record and one WAL record per
  * page filled.  As heap's, it keeps the free space fillfactor asks for on
  * each page, but always puts one row on the page it got for it.  Rows of a
- * frozen load may take compact headers (§21 D43).
+ * frozen load may take compact headers.
  */
 void
 iheap_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
@@ -1801,10 +1799,10 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 
 	/*
 	 * The deleted row's body stays on the page until no snapshot can see it
-	 * any more, as heap's does (§21 D40): the undo record needs only the
-	 * header.  A compact header has no room for the deleter's xid (§21
-	 * D43): then the body goes to undo and the item becomes a stub, its
-	 * storage kept until the deletion commits.
+	 * any more, as heap's does: the undo record needs only the header.  A
+	 * compact header has no room for the deleter's xid: then the body goes to
+	 * undo and the item becomes a stub, its storage kept until the deletion
+	 * commits.
 	 */
 	compact = (c.h.infomask & IHT_COMPACT) != 0;
 	hs = ih_hdr_size(tup);
@@ -2021,8 +2019,8 @@ ih_ancestors_capture_old(Relation rel)
 }
 
 /*
- * Rule 3 (§7.4): AFTER ROW UPDATE triggers refetch OLD and NEW by TID
- * (trigger.c), which cannot work when both share a TID.
+ * Rule 3: AFTER ROW UPDATE triggers refetch OLD and NEW by TID (trigger.c),
+ * which cannot work when both share a TID.
  */
 static bool
 ih_triggers_block_inplace(Relation rel, TupleDesc desc, const char *oldtup,
@@ -2120,8 +2118,7 @@ typedef struct IHUpdatePlan
 	bool		inplace;
 	IHeapMoveReason move_reason;	/* why not in place, if not */
 	bool		summarized;
-	bool		dm_changed;		/* a column a dmbtree index reads changes
-								 * (§11.6) */
+	bool		dm_changed;		/* a column a dmbtree index reads changes */
 	bool		valid;
 } IHUpdatePlan;
 
@@ -2177,7 +2174,7 @@ ih_plan_update(Relation rel, Buffer buf, OffsetNumber off,
 	/*
 	 * A change of a column some index covers moves the row, unless the
 	 * column is a key column of dmbtree indexes only, which take in-place
-	 * updates of their keys (§7.4, §11.6).
+	 * updates of their keys.
 	 */
 	dm = iheap_dm_info(rel);
 	sum_attrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_SUMMARIZED);
@@ -2236,6 +2233,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 	IHeapLogicalPart logpart = {0};
 	bool		dm_entries = false;
 	bool		grown = false;	/* the item's storage takes the new version */
+	bool		keep_align = false; /* relocated, keeping the old alignment */
 
 	*update_indexes = TU_None;
 	*lockmode = LockTupleExclusive;
@@ -2369,18 +2367,25 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 	 * its data area would not be aligned there (gaining or losing its null
 	 * bitmap changes its header length): then it goes to the page's free
 	 * space, with room for the old version, which a rollback puts back in
-	 * its place.  That place must suit the old version's alignment too; when
-	 * no place can suit both, the row moves.
+	 * its place.  That place must suit every version a rollback may put
+	 * back: the old one, and older ones whose changes have not committed.
+	 * Their alignment suits the old version's place, so the new place keeps
+	 * the old one's offset modulo MAXIMUM_ALIGNOF when one of them needs
+	 * alignment; where the new version cannot be aligned at such a place, the
+	 * row moves.
 	 */
 	if (inplace &&
 		(newlen > curlen ||
 		 !iheap_tuple_aligned_at(newtup, ItemIdGetOffset(lp))))
 	{
+		bool		older_align;
 		uint32		cap = Max(Max(newlen, curlen),
-							  iheap_item_reservation(rel, page, off));
+							  iheap_item_reservation(rel, page, off, &older_align));
 		PageHeader	ph = (PageHeader) page;
 
-		if (!iheap_tuple_alignment_covers(newtup, (char *) page + ItemIdGetOffset(lp)))
+		keep_align = older_align ||
+			ih_tuple_needs_align((char *) page + ItemIdGetOffset(lp));
+		if (keep_align && !iheap_tuple_aligned_at(newtup, ItemIdGetOffset(lp)))
 			inplace = false;
 		else if ((int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
 		{
@@ -2388,7 +2393,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			 * Too little room to put the new version elsewhere on the page.
 			 * A version without aligned values can still grow where it is:
 			 * compaction moves the tuples after it (a row whose compact
-			 * header becomes a full one grows by 4 bytes, §21 D43).
+			 * header becomes a full one grows by 4 bytes).
 			 */
 			if (newlen > curlen && !ih_tuple_needs_align(newtup))
 				grown = iheap_page_prune_grow(rel, buf, off, newlen);
@@ -2396,9 +2401,11 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 				(void) iheap_page_prune(rel, buf, true, NULL, NULL);
 			lp = PageGetItemId(page, off);
 			curlen = ItemIdGetLength(lp);
-			cap = Max(Max(newlen, curlen), iheap_item_reservation(rel, page, off));
+			cap = Max(Max(newlen, curlen),
+					  iheap_item_reservation(rel, page, off, NULL));
 			if (!grown &&
-				(int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF))
+				((int) ph->pd_upper - (int) ph->pd_lower < (int) (cap + MAXIMUM_ALIGNOF) ||
+				 (keep_align && !iheap_tuple_aligned_at(newtup, ItemIdGetOffset(lp)))))
 				inplace = false;
 		}
 	}
@@ -2423,7 +2430,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		IHeapLocker carried[IHEAP_MAX_LOCKERS];
 		int			ncarried = c.nlockers;
 
-		/* the delta of the bodies: a compact header grows (§21 D43) */
+		/* the delta of the bodies: a compact header grows */
 		tup = (char *) page + ItemIdGetOffset(lp);
 		curhs = ih_hdr_size(tup);
 		oldbody = curlen - curhs;
@@ -2459,7 +2466,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			 !iheap_tuple_aligned_at(newtup, ItemIdGetOffset(lp)));
 		if (relocated)
 			capacity = Max(Max(newlen, curlen),
-						   iheap_item_reservation(rel, page, off));
+						   iheap_item_reservation(rel, page, off, NULL));
 
 		memset(&res, 0, sizeof(res));
 		iheap_undo_reserve(rel, IHEAP_UNDOREC_HDRSZ + payload_len, &res);
@@ -2491,7 +2498,9 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		}
 		else
 		{
-			if (!iheap_page_place_item_ext(page, off, newtup, newlen, capacity))
+			if (!iheap_page_place_item_ext(page, off, newtup, newlen, capacity,
+										   keep_align ?
+										   ItemIdGetOffset(lp) % MAXIMUM_ALIGNOF : -1))
 				elog(PANIC, "iheap: in-place update relocation failed");
 			lp_off = ItemIdGetOffset(lp);
 			IHeapPageGetOpaque(page)->ihp_flags |= IHP_PRUNABLE;
@@ -2514,6 +2523,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			xlrec.prefix = d.prefix;
 			xlrec.suffix = d.suffix;
 			xlrec.flags = (relocated ? XLIH_RELOCATED : 0) |
+				(relocated && keep_align ? XLIH_KEEP_ALIGN : 0) |
 				(vm.cleared ? XLIH_VM_CLEARED : 0);
 			if (logical)
 			{
@@ -2591,11 +2601,11 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		if (!same_page)
 		{
 			/*
-			 * Look for the new page with the old one still locked (§21 D45):
-			 * nobody can change the row meanwhile, so it needs no LOCK
-			 * record.  A new page whose VM page would have to be pinned is
-			 * given up, since pinning may read, unless the old page's VM
-			 * page, pinned already, covers it.
+			 * Look for the new page with the old one still locked: nobody can
+			 * change the row meanwhile, so it needs no LOCK record.  A new
+			 * page whose VM page would have to be pinned is given up, since
+			 * pinning may read, unless the old page's VM page, pinned
+			 * already, covers it.
 			 */
 			newbuf = ih_get_buffer(rel, newlen, NULL, buf, true, &new_init);
 			if (BufferIsValid(newbuf) &&
@@ -2658,12 +2668,11 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 
 		/*
 		 * The old version's body stays on the page until no snapshot can see
-		 * it any more (§21 D40): the MOVE record carries the new TID only.
-		 * The body goes along to undo, and the old item becomes a stub, when
-		 * the old row has a compact header, which has no room for the
-		 * mover's xid (§21 D43), and when the row leaves a page whose bodies
-		 * a snapshot holds: then its room comes back when the move ends,
-		 * not when the snapshot does (§21 D45).
+		 * it any more: the MOVE record carries the new TID only.  The body
+		 * goes along to undo, and the old item becomes a stub, when the old
+		 * row has a compact header, which has no room for the mover's xid,
+		 * and when the row leaves a page whose bodies a snapshot holds: then
+		 * its room comes back when the move ends, not when the snapshot does.
 		 */
 		curhs = ih_hdr_size(tup);
 		compact = (c.h.infomask & IHT_COMPACT) != 0;
@@ -2768,12 +2777,12 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			iheap_walhdr_put(walhdr, &nh);
 
 			/*
-			 * On the same page, the old body stays where it was (§21 D40):
-			 * the new one goes as the bytes that differ, as heap logs an
-			 * update on the same page.  Not with a full-page image (the
-			 * block's data does not go then), nor for logical decoding (it
-			 * reads the new tuple from the record alone), nor when the old
-			 * body went to undo (a compact header).
+			 * On the same page, the old body stays where it was: the new one
+			 * goes as the bytes that differ, as heap logs an update on the
+			 * same page.  Not with a full-page image (the block's data does
+			 * not go then), nor for logical decoding (it reads the new tuple
+			 * from the record alone), nor when the old body went to undo (a
+			 * compact header).
 			 */
 			if (same_page && !logical && !tobody &&
 				!XLogCheckBufferNeedsBackup(buf))
@@ -2853,8 +2862,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 
 	/*
 	 * dmbtree indexes whose entry changed get their new and marked entries
-	 * now that no table page is locked (§11.6).  The row stays ours
-	 * meanwhile.
+	 * now that no table page is locked.  The row stays ours meanwhile.
 	 */
 	if (inplace && plan.dm_changed)
 		dm_entries = iheap_dm_update_indexes(rel, otid, plan.modified,
@@ -3000,7 +3008,7 @@ ih_store_settled(Relation rel, Buffer buf, OffsetNumber off,
  *   CONFLICT starts over with the same snapshot, so comparing with the
  *   snapshot would never end; apply locks under a snapshot taken after its
  *   search, which may see the newer version already.)
- * - Otherwise iheap hands the caller the newest version (D20), unless the
+ * - Otherwise iheap hands the caller the newest version, unless the
  *   row's key changed since the caller's snapshot (an in-place update of a
  *   dmbtree key): the newest version may not have the key searched for.
  *   Walks the row's versions from c->h, the one to be locked.

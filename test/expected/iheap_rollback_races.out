@@ -1,0 +1,320 @@
+Parsed test spec with 4 sessions
+
+starting permutation: a_begin a_change a_rollback c_sel b_change c_sel c_wake c_sel c_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step a_begin: BEGIN;
+step a_change: UPDATE rr SET v = v + 100, s = repeat('a', 100) WHERE id <= 3; DELETE FROM rr WHERE id = 4; INSERT INTO rr VALUES (11, 11, 'a');
+step a_rollback: ROLLBACK; <waiting ...>
+step c_sel: SELECT id, v, length(s) AS len FROM rr ORDER BY id;
+id| v|len
+--+--+---
+ 1| 1|  2
+ 2| 2|  2
+ 3| 3|  2
+ 4| 4|  2
+ 5| 5|  2
+ 6| 6|  2
+ 7| 7|  2
+ 8| 8|  2
+ 9| 9|  2
+10|10|  3
+(10 rows)
+
+step b_change: UPDATE rr SET v = v + 1 WHERE id <= 4; INSERT INTO rr VALUES (11, 1100, 'b');
+step c_sel: SELECT id, v, length(s) AS len FROM rr ORDER BY id;
+id|   v|len
+--+----+---
+ 1|   2|  2
+ 2|   3|  2
+ 3|   4|  2
+ 4|   5|  2
+ 5|   5|  2
+ 6|   6|  2
+ 7|   7|  2
+ 8|   8|  2
+ 9|   9|  2
+10|  10|  3
+11|1100|  1
+(11 rows)
+
+step c_wake: SELECT injection_points_wakeup('iheap-eager-rollback');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step a_rollback: <... completed>
+step c_sel: SELECT id, v, length(s) AS len FROM rr ORDER BY id;
+id|   v|len
+--+----+---
+ 1|   2|  2
+ 2|   3|  2
+ 3|   4|  2
+ 4|   5|  2
+ 5|   5|  2
+ 6|   6|  2
+ 7|   7|  2
+ 8|   8|  2
+ 9|   9|  2
+10|  10|  3
+11|1100|  1
+(11 rows)
+
+step c_check: SELECT count(*) AS problems FROM iheap_check('rr');
+problems
+--------
+       0
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: a_begin a_change a_rollback b_begin b_change2 b_rollback c_wake c_sel c_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step a_begin: BEGIN;
+step a_change: UPDATE rr SET v = v + 100, s = repeat('a', 100) WHERE id <= 3; DELETE FROM rr WHERE id = 4; INSERT INTO rr VALUES (11, 11, 'a');
+step a_rollback: ROLLBACK; <waiting ...>
+step b_begin: BEGIN;
+step b_change2: UPDATE rr SET v = v * 2, s = 'b' WHERE id = 1;
+step b_rollback: ROLLBACK;
+step c_wake: SELECT injection_points_wakeup('iheap-eager-rollback');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step a_rollback: <... completed>
+step c_sel: SELECT id, v, length(s) AS len FROM rr ORDER BY id;
+id| v|len
+--+--+---
+ 1| 1|  2
+ 2| 2|  2
+ 3| 3|  2
+ 4| 4|  2
+ 5| 5|  2
+ 6| 6|  2
+ 7| 7|  2
+ 8| 8|  2
+ 9| 9|  2
+10|10|  3
+(10 rows)
+
+step c_check: SELECT count(*) AS problems FROM iheap_check('rr');
+problems
+--------
+       0
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: a_begin a_change a_rollback c_vacuum c_wake c_sel c_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step a_begin: BEGIN;
+step a_change: UPDATE rr SET v = v + 100, s = repeat('a', 100) WHERE id <= 3; DELETE FROM rr WHERE id = 4; INSERT INTO rr VALUES (11, 11, 'a');
+step a_rollback: ROLLBACK; <waiting ...>
+step c_vacuum: VACUUM rr;
+step c_wake: SELECT injection_points_wakeup('iheap-eager-rollback');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step a_rollback: <... completed>
+step c_sel: SELECT id, v, length(s) AS len FROM rr ORDER BY id;
+id| v|len
+--+--+---
+ 1| 1|  2
+ 2| 2|  2
+ 3| 3|  2
+ 4| 4|  2
+ 5| 5|  2
+ 6| 6|  2
+ 7| 7|  2
+ 8| 8|  2
+ 9| 9|  2
+10|10|  3
+(10 rows)
+
+step c_check: SELECT count(*) AS problems FROM iheap_check('rr');
+problems
+--------
+       0
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: a_sub a_rollback_sub b_upd5 c_sel c_wake a_commit c_sel c_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step a_sub: BEGIN; UPDATE rr SET v = v + 1 WHERE id = 5; SAVEPOINT s; UPDATE rr SET v = v + 1000, s = repeat('a', 200) WHERE id = 5;
+step a_rollback_sub: ROLLBACK TO SAVEPOINT s; <waiting ...>
+step b_upd5: UPDATE rr SET v = v + 10 WHERE id = 5; <waiting ...>
+step c_sel: SELECT id, v, length(s) AS len FROM rr ORDER BY id;
+id| v|len
+--+--+---
+ 1| 1|  2
+ 2| 2|  2
+ 3| 3|  2
+ 4| 4|  2
+ 5| 5|  2
+ 6| 6|  2
+ 7| 7|  2
+ 8| 8|  2
+ 9| 9|  2
+10|10|  3
+(10 rows)
+
+step c_wake: SELECT injection_points_wakeup('iheap-eager-rollback');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step a_rollback_sub: <... completed>
+step a_commit: COMMIT;
+step b_upd5: <... completed>
+step c_sel: SELECT id, v, length(s) AS len FROM rr ORDER BY id;
+id| v|len
+--+--+---
+ 1| 1|  2
+ 2| 2|  2
+ 3| 3|  2
+ 4| 4|  2
+ 5|16|  2
+ 6| 6|  2
+ 7| 7|  2
+ 8| 8|  2
+ 9| 9|  2
+10|10|  3
+(10 rows)
+
+step c_check: SELECT count(*) AS problems FROM iheap_check('rr');
+problems
+--------
+       0
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: b_lazy d_vacuum b_upd6 b_wake_discard c_sel c_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step b_lazy: SET iheap.foreground_undo_limit = 0; BEGIN; UPDATE rr SET v = -v WHERE id = 6; ROLLBACK; RESET iheap.foreground_undo_limit;
+step d_vacuum: VACUUM rr; <waiting ...>
+step b_upd6: UPDATE rr SET v = v + 1 WHERE id = 6;
+step b_wake_discard: SELECT injection_points_wakeup('iheap-discard-apply');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step d_vacuum: <... completed>
+step c_sel: SELECT id, v, length(s) AS len FROM rr ORDER BY id;
+id| v|len
+--+--+---
+ 1| 1|  2
+ 2| 2|  2
+ 3| 3|  2
+ 4| 4|  2
+ 5| 5|  2
+ 6| 7|  2
+ 7| 7|  2
+ 8| 8|  2
+ 9| 9|  2
+10|10|  3
+(10 rows)
+
+step c_check: SELECT count(*) AS problems FROM iheap_check('rr');
+problems
+--------
+       0
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

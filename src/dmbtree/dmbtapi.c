@@ -2,8 +2,8 @@
  *
  * dmbtapi.c
  *	  dmbtree's side of dmbtree_api.h: what iheap calls when it updates a
- *	  key column in place (DESIGN.md §11.6), the index property it decides
- *	  that by (§7.4), and the reading of leaf pages iheap_check() does.
+ *	  key column in place, the index property it decides that by, and the
+ *	  reading of leaf pages iheap_check() does.
  *
  * Portions Copyright (c) 2026, pg_inplace_update_am authors
  *
@@ -37,8 +37,8 @@ dmbtree_is_dmbtree(Relation index)
  * (otherwise two versions could have keys that compare equal but differ in
  * what an index-only scan returns).  Unlike deduplication, INCLUDE columns
  * do not prevent it.  Expressions and a predicate are evaluated by iheap
- * wherever a row version's entry is computed (§21 D24, D39); an INCLUDE
- * column that changes in place leaves the entry marked, with its values.
+ * wherever a row version's entry is computed; an INCLUDE column that changes
+ * in place leaves the entry marked, with its values.
  */
 bool
 dmbtree_dm_capable(Relation index)
@@ -87,8 +87,8 @@ dmbtree_build_older_keys(Relation index, Relation heaprel)
 /*
  * An in-place update changed only INCLUDE values of the entry of row "tid",
  * which keeps its values (marked): raise the error an insertion of the new
- * entry would raise if it were too large (§21 D39), so that a row whose
- * entry cannot exist is refused as by an update that moves it.
+ * entry would raise if it were too large, so that a row whose entry cannot
+ * exist is refused as by an update that moves it.
  */
 void
 dmbtree_check_entry_size(Relation index, Relation heaprel, Datum *values,
