@@ -79,6 +79,10 @@ The suites:
 
 Results go to `out/`.
 
+On every push and pull request, GitHub Actions builds the extension with
+`-Werror` against the official `postgres:19rc1-trixie` image
+(`.github/workflows/build.yml`).
+
 `scripts/docker.sh bench` and `scripts/docker.sh olap` run benchmarks that
 compare heap with iheap, using the release image
 (`scripts/docker.sh image release`).

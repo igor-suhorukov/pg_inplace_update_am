@@ -1,0 +1,27 @@
+# Build the extension against PostgreSQL 19rc1 as packaged in the official
+# Docker image: the server headers come from the PGDG repository the image
+# is set up with, pinned to the image's own server version.
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: postgres:19rc1-trixie
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential "postgresql-server-dev-$PG_MAJOR=$PG_VERSION"
+
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: make -j"$(nproc)" COPT=-Werror
