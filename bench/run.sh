@@ -26,6 +26,14 @@
 #   idxupd_hold  idxupd while a REPEATABLE READ snapshot is held
 #   idxmix       idxupd half the time, range reads through that index the
 #                other half
+#   grow         each row of a table filled to fillfactor 100 made 8 bytes
+#                longer once, in a random order: a timestamp set where it
+#                was NULL, as the demo database's boardings (§22.3); the
+#                run is that many transactions, not a duration
+#   grow_hold    grow while a REPEATABLE READ snapshot is held
+#
+# Each run's log ends with the table's updates: how many, how many in place
+# (heap: HOT), how many to another page.
 #
 set -euo pipefail
 
@@ -33,8 +41,9 @@ DURATION=${1:-60}
 SCALE=${2:-20}
 CLIENTS=${3:-8}
 VARIANTS=${4:-heap iheap iheap_dm}
-WORKLOADS=${5:-tpcb tpcb_hold select idxupd idxupd4 idxupd_hold idxmix}
+WORKLOADS=${5:-tpcb tpcb_hold select idxupd idxupd4 idxupd_hold idxmix grow grow_hold}
 ROWS=$(( SCALE * 10000 ))
+GROW_ROWS=$(( SCALE * 50000 ))
 OUT=${OUT:-/out}/bench
 DATA=${BUILD:-/build}/bench_data
 PORT=56432
@@ -100,8 +109,12 @@ run_pgbench() {
 	before=$(rel_mb "$table")
 	ibefore=$(idx_mb "$table")
 	lsn=$(wal_lsn)
-	out=$(pgbench -n -p "$PORT" -c "$CLIENTS" -j "$JOBS" -T "$DURATION" "$@" postgres 2>&1)
+	# RUN_LIMIT: a number of transactions per client instead of DURATION
+	out=$(pgbench -n -p "$PORT" -c "$CLIENTS" -j "$JOBS" ${RUN_LIMIT:--T "$DURATION"} "$@" postgres 2>&1)
 	echo "$out" > "$OUT/${tag}_${variant}.log"
+	psqlq -c "SELECT format('updates %s, in place %s, to another page %s',
+		n_tup_upd, n_tup_hot_upd, n_tup_newpage_upd)
+		FROM pg_stat_user_tables WHERE relid = '$table'::regclass" >> "$OUT/${tag}_${variant}.log"
 	tps=$(echo "$out" | sed -nE 's/^tps = ([0-9.]+).*/\1/p' | tail -1)
 	lat=$(echo "$out" | sed -nE 's/^latency average = ([0-9.]+) ms/\1/p')
 	sed -i "/^$tag,$variant,/d" "$CSV"
@@ -136,6 +149,19 @@ idx_table() {
 cat > "$OUT/idxupd.sql" <<SQL
 \set id random(1, $ROWS)
 UPDATE t SET k = k + 1, v = v + 1 WHERE id = :id;
+SQL
+# rows of g in a random order, each once (7919 is a prime)
+grow_table() {
+	psqlq -c "CREATE TABLE g (id int PRIMARY KEY, a int, b text, ts timestamptz) USING $(table_am "$1") WITH (fillfactor = 100)" \
+		-c "CREATE INDEX g_a ON g USING $(index_am "$1") (a)" \
+		-c "INSERT INTO g SELECT i, i, repeat('y', 30), NULL FROM generate_series(1, $GROW_ROWS) i" \
+		-c "VACUUM ANALYZE g" \
+		-c "CREATE SEQUENCE gs"
+}
+
+cat > "$OUT/grow.sql" <<SQL
+SELECT nextval('gs') AS n \\gset
+UPDATE g SET ts = now() WHERE id = (:n::bigint * 7919) % $GROW_ROWS + 1;
 SQL
 cat > "$OUT/idxread.sql" <<SQL
 \set k random(1, $ROWS)
@@ -196,6 +222,19 @@ for variant in $VARIANTS; do
 		run_pgbench idxmix "$variant" t -f "$OUT/idxupd.sql@1" -f "$OUT/idxread.sql@1"
 		stop_cluster
 	fi
+
+	# --- rows growing on full pages (no indexed column changes: dmbtree
+	# changes nothing here) ---------------------------------------------------
+	for w in grow grow_hold; do
+		if [ "$variant" != iheap_dm ] && want "$w"; then
+			start_cluster "${w}_$variant"
+			grow_table "$variant"
+			[ "$w" = grow_hold ] && hold_snapshot
+			RUN_LIMIT="-t $(( GROW_ROWS / CLIENTS ))" \
+				run_pgbench "$w" "$variant" g -f "$OUT/grow.sql"
+			stop_cluster
+		fi
+	done
 done
 
 echo

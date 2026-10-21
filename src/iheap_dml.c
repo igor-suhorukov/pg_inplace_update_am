@@ -9,7 +9,11 @@
  * UPDATE (§7.4) is done in place when no index-covered column changed
  * (rule (b): core indexes cannot cope with two keys for one TID), no AFTER
  * trigger needs OLD by TID (rule 3), and the new tuple fits on the page.
- * Otherwise the row moves to a new TID, leaving a MOVED stub.
+ * Otherwise the row moves to a new TID; the old item keeps its body until
+ * every snapshot sees the move (§21 D40), unless the row leaves a page
+ * whose bodies a snapshot holds (§21 D45).  A move to another page
+ * keeps the old page locked while it locks the new one when the block
+ * order allows, so that it needs no LOCK record (§21 D45).
  *
  * Row locks are LOCK undo records listing the lockers that are still
  * running (§21 D10).  A modification carries non-conflicting lockers (KEY
@@ -230,16 +234,35 @@ ih_unlock_pair(Buffer buffer, Buffer other)
 }
 
 /*
+ * A data page that is in shared buffers, pinned; InvalidBuffer if it would
+ * have to be read (a prefetch is started then).
+ */
+static Buffer
+ih_pin_if_cached(Relation rel, BlockNumber blk)
+{
+	PrefetchBufferResult pr = PrefetchBuffer(rel, MAIN_FORKNUM, blk);
+
+	if (BufferIsValid(pr.recent_buffer) &&
+		ReadRecentBuffer(rel->rd_locator, MAIN_FORKNUM, blk, pr.recent_buffer))
+		return pr.recent_buffer;
+	return InvalidBuffer;
+}
+
+/*
  * Return a pinned, exclusively locked data page with room for a tuple of
- * "len" bytes.  If "otherbuf" is given (pinned, not locked, different
- * page), it is locked too, in block order.  *page_init is set when the page
- * was freshly initialized in memory (the caller's WAL record must use
+ * "len" bytes.  If "otherbuf" is given (pinned, different page), it is
+ * locked too: in block order if it comes unlocked.  If it comes locked
+ * ("other_locked"), it stays locked throughout (§21 D45): a page after it
+ * is locked as the block order allows, one before it only if its lock is
+ * free at once, and a page is not read from disk with otherbuf locked;
+ * when that leaves no page, InvalidBuffer is returned, and the caller lets
+ * go of otherbuf and asks again.  *page_init is set when the page was
+ * freshly initialized in memory (the caller's WAL record must use
  * REGBUF_WILL_INIT).
  */
-Buffer
-iheap_get_buffer_for_tuple(Relation rel, Size len,
-						   BulkInsertStateData *bistate, Buffer otherbuf,
-						   bool *page_init)
+static Buffer
+ih_get_buffer(Relation rel, Size len, BulkInsertStateData *bistate,
+			  Buffer otherbuf, bool other_locked, bool *page_init)
 {
 	Size		need = len + sizeof(ItemIdData) + MAXIMUM_ALIGNOF;
 	Size		saveFreeSpace = RelationGetTargetPageFreeSpace(rel, HEAP_DEFAULT_FILLFACTOR);
@@ -287,9 +310,26 @@ iheap_get_buffer_for_tuple(Relation rel, Size len,
 			continue;
 		}
 
-		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, target, RBM_NORMAL,
-									strategy);
-		ih_lock_pair(buffer, otherbuf);
+		if (!other_locked)
+		{
+			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, target, RBM_NORMAL,
+										strategy);
+			ih_lock_pair(buffer, otherbuf);
+		}
+		else
+		{
+			/* waiting for an earlier page could deadlock */
+			buffer = ih_pin_if_cached(rel, target);
+			if (!BufferIsValid(buffer))
+				return InvalidBuffer;
+			if (target > otherblk)
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			else if (!ConditionalLockBuffer(buffer))
+			{
+				ReleaseBuffer(buffer);
+				return InvalidBuffer;
+			}
+		}
 		page = BufferGetPage(buffer);
 		type = IHeapPageGetType(page);
 
@@ -318,14 +358,17 @@ iheap_get_buffer_for_tuple(Relation rel, Size len,
 			return buffer;
 		}
 
-		ih_unlock_pair(buffer, otherbuf);
+		if (other_locked)
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		else
+			ih_unlock_pair(buffer, otherbuf);
 		ReleaseBuffer(buffer);
 		target = RecordAndGetPageWithFreeSpace(rel, target, freespace,
 											   want_space);
 	}
 
 	/* extend the relation */
-	if (BufferIsValid(otherbuf))
+	if (BufferIsValid(otherbuf) && !other_locked)
 		LockBuffer(otherbuf, BUFFER_LOCK_EXCLUSIVE);
 	buffer = ExtendBufferedRel(BMR_REL(rel), MAIN_FORKNUM, strategy,
 							   EB_LOCK_FIRST);
@@ -333,6 +376,14 @@ iheap_get_buffer_for_tuple(Relation rel, Size len,
 	*page_init = true;
 	RelationSetTargetBlock(rel, BufferGetBlockNumber(buffer));
 	return buffer;
+}
+
+Buffer
+iheap_get_buffer_for_tuple(Relation rel, Size len,
+						   BulkInsertStateData *bistate, Buffer otherbuf,
+						   bool *page_init)
+{
+	return ih_get_buffer(rel, len, bistate, otherbuf, false, page_init);
 }
 
 /*
@@ -1789,6 +1840,7 @@ iheap_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 		nh.hoff += IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
 		ih_hdr_write(tup, &nh);
 		ItemIdSetNormal(lp, ItemIdGetOffset(lp), IHEAP_TUPHDR_SIZE);
+		iheap_page_note_room(page, xid);
 	}
 	else
 		ih_hdr_write(tup, &nh);
@@ -2527,6 +2579,7 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		int			ncarried = plan.key_changed ? 0 : c.nlockers;
 		uint32		curhs;
 		bool		compact;
+		bool		tobody;
 
 		same_page = iheap_page_free_space(page) >= newlen + sizeof(ItemIdData) + MAXIMUM_ALIGNOF;
 		if (!same_page && (IHeapPageGetOpaque(page)->ihp_flags & IHP_PRUNABLE))
@@ -2536,6 +2589,39 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		}
 
 		if (!same_page)
+		{
+			/*
+			 * Look for the new page with the old one still locked (§21 D45):
+			 * nobody can change the row meanwhile, so it needs no LOCK
+			 * record.  A new page whose VM page would have to be pinned is
+			 * given up, since pinning may read, unless the old page's VM
+			 * page, pinned already, covers it.
+			 */
+			newbuf = ih_get_buffer(rel, newlen, NULL, buf, true, &new_init);
+			if (BufferIsValid(newbuf) &&
+				PageIsAllVisible(BufferGetPage(newbuf)) &&
+				!BufferIsValid(newvm.vmbuf))
+			{
+				if (BufferIsValid(vm.vmbuf) &&
+					visibilitymap_pin_ok(BufferGetBlockNumber(newbuf), vm.vmbuf))
+				{
+					IncrBufferRefCount(vm.vmbuf);
+					newvm.vmbuf = vm.vmbuf;
+				}
+				else
+				{
+					Assert(!new_init);
+					UnlockReleaseBuffer(newbuf);
+					newbuf = InvalidBuffer;
+				}
+			}
+		}
+
+		if (same_page)
+			newpage = page;
+		else if (BufferIsValid(newbuf))
+			newpage = BufferGetPage(newbuf);
+		else
 		{
 			/* keep the row ours while the page lock is released */
 			if (!c.we_lock || c.our_mode < mode)
@@ -2559,8 +2645,6 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 				elog(ERROR, "iheap: row changed while locked for update");
 			ncarried = plan.key_changed ? 0 : c.nlockers;
 		}
-		else
-			newpage = page;
 
 		lp = PageGetItemId(page, off);
 		tup = (char *) page + ItemIdGetOffset(lp);
@@ -2575,15 +2659,19 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		/*
 		 * The old version's body stays on the page until no snapshot can see
 		 * it any more (§21 D40): the MOVE record carries the new TID only.
-		 * A compact header has no room for the mover's xid (§21 D43): then
-		 * the body goes along, and the old item becomes a stub.
+		 * The body goes along to undo, and the old item becomes a stub, when
+		 * the old row has a compact header, which has no room for the
+		 * mover's xid (§21 D43), and when the row leaves a page whose bodies
+		 * a snapshot holds: then its room comes back when the move ends,
+		 * not when the snapshot does (§21 D45).
 		 */
 		curhs = ih_hdr_size(tup);
 		compact = (c.h.infomask & IHT_COMPACT) != 0;
-		mpayload_len = sizeof(ItemPointerData) + (compact ? curlen - curhs : 0);
+		tobody = compact || (!same_page && iheap_page_bodies_held(rel, page));
+		mpayload_len = sizeof(ItemPointerData) + (tobody ? curlen - curhs : 0);
 		mpayload = palloc(mpayload_len);
 		memcpy(mpayload, &newtid, sizeof(ItemPointerData));
-		if (compact)
+		if (tobody)
 			memcpy(mpayload + sizeof(ItemPointerData), tup + curhs, curlen - curhs);
 
 		memset(&muh, 0, sizeof(muh));
@@ -2630,12 +2718,14 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 		oh.urec = murp;
 		oh.infomask = (c.h.infomask & IHT_DATA_FLAGS) | IHT_MOVED |
 			(plan.key_changed ? IHT_KEYS_UPDATED : 0);
-		if (compact)
+		if (tobody)
 		{
 			oh.infomask |= IHT_STUB;
-			oh.hoff += IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
+			if (compact)
+				oh.hoff += IHEAP_TUPHDR_SIZE - IHEAP_COMPACT_HDRSZ;
 			ih_hdr_write(tup, &oh);
 			ItemIdSetNormal(lp, ItemIdGetOffset(lp), IHEAP_TUPHDR_SIZE);
+			iheap_page_note_room(page, xid);
 		}
 		else
 			ih_hdr_write(tup, &oh);
@@ -2683,9 +2773,9 @@ iheap_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 			 * update on the same page.  Not with a full-page image (the
 			 * block's data does not go then), nor for logical decoding (it
 			 * reads the new tuple from the record alone), nor when the old
-			 * row had a compact header (its body is in undo now).
+			 * body went to undo (a compact header).
 			 */
-			if (same_page && !logical && !compact &&
+			if (same_page && !logical && !tobody &&
 				!XLogCheckBufferNeedsBackup(buf))
 			{
 				ih_delta(tup + curhs, curlen - curhs, newtup + newhs,

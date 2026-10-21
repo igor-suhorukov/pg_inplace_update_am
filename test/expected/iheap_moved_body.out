@@ -135,3 +135,53 @@ blkno|offnum|msg
 -----+------+---
 (0 rows)
 
+
+starting permutation: s1rr s2fp1 s2fp2 s2fp3 s2fpstat s1fp s1fpidx s2fp s2fpcheck s1c
+step s1rr: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM other;
+count
+-----
+    0
+(1 row)
+
+step s2fp1: UPDATE fp SET k = -k WHERE id = 1;
+step s2fp2: UPDATE fp SET k = -k WHERE id = 2;
+step s2fp3: UPDATE fp SET k = -k WHERE id = 3;
+step s2fpstat: SELECT deleted_items, stub_items FROM iheap_relation_stats('fp');
+deleted_items|stub_items
+-------------+----------
+            2|         1
+(1 row)
+
+step s1fp: SELECT id, k FROM fp WHERE id <= 4 ORDER BY id;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+(4 rows)
+
+step s1fpidx: SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT id, k FROM fp WHERE k BETWEEN -10 AND 4 ORDER BY k; RESET enable_seqscan; RESET enable_bitmapscan;
+id|k
+--+-
+ 1|1
+ 2|2
+ 3|3
+ 4|4
+(4 rows)
+
+step s2fp: SELECT id, k, (ctid::text::point)[0] = 1 AS first_page FROM fp WHERE id <= 4 ORDER BY id;
+id| k|first_page
+--+--+----------
+ 1|-1|f         
+ 2|-2|f         
+ 3|-3|t         
+ 4| 4|t         
+(4 rows)
+
+step s2fpcheck: SELECT * FROM iheap_check('fp');
+blkno|offnum|msg
+-----+------+---
+(0 rows)
+
+step s1c: COMMIT;

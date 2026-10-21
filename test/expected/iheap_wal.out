@@ -308,7 +308,115 @@ SELECT * FROM iheap_check('wi');
 -------+--------+-----
 (0 rows)
 
-DROP TABLE mv, wi, wh, holder;
+-- ------------------------------------------------------------------------
+-- D. Moves while a snapshot is held (§21 D45).  A move to another page
+--    keeps the old page locked while it locks the new one: no LOCK record.
+--    A row that leaves a page whose bodies a snapshot holds takes its body
+--    to undo, and the room it leaves comes back when the move commits.
+-- ------------------------------------------------------------------------
+CREATE TABLE fm (id int PRIMARY KEY, k int, pad text)
+  USING iheap WITH (autovacuum_enabled = off);
+CREATE INDEX fm_k ON fm USING btree (k);
+INSERT INTO fm SELECT g, g, repeat('f', 100) FROM generate_series(1, 100) g;
+VACUUM fm;
+SELECT (ctid::text::point)[0]::int AS fmblk FROM fm WHERE id = 1 \gset
+BEGIN;
+INSERT INTO holder VALUES (3);
+PREPARE TRANSACTION 'hold_fm';
+SELECT pg_current_wal_insert_lsn() AS lsn4 \gset
+-- the first move off the full page leaves its body there; at the second,
+-- the page waits for the first mover, committed, whom the prepared
+-- transaction's snapshot holds: its body goes to undo, its item is a stub
+UPDATE fm SET k = -k WHERE id = 1;
+UPDATE fm SET k = -k WHERE id = 2;
+-- that move committed: its room is back, and the next row moves on the page
+UPDATE fm SET k = -k WHERE id = 3;
+SELECT id, (ctid::text::point)[0] = :fmblk AS same_page
+FROM fm WHERE id <= 3 ORDER BY id;
+ id | same_page 
+----+-----------
+  1 | f
+  2 | f
+  3 | t
+(3 rows)
+
+SELECT target_offset, len > 50 AS with_body
+FROM undo_records('fm') WHERE type = 'MOVE' ORDER BY target_offset;
+ target_offset | with_body 
+---------------+-----------
+             1 | f
+             2 | t
+             3 | f
+(3 rows)
+
+SELECT live_items, deleted_items, stub_items FROM iheap_relation_stats('fm');
+ live_items | deleted_items | stub_items 
+------------+---------------+------------
+        100 |             2 |          1
+(1 row)
+
+SELECT record_type, n FROM wal_records_of(:'lsn4', 'fm')
+WHERE resource_manager = 'iheap' AND record_type IN ('LOCK', 'MOVE', 'PRUNE');
+ record_type | n 
+-------------+---
+ MOVE        | 3
+ PRUNE       | 1
+(2 rows)
+
+-- a move off the page that rolls back gets its body back from undo
+BEGIN;
+UPDATE fm SET k = -k WHERE id = 4;
+SELECT (ctid::text::point)[0] = :fmblk AS same_page FROM fm WHERE id = 4;
+ same_page 
+-----------
+ f
+(1 row)
+
+ROLLBACK;
+SELECT id, k, (ctid::text::point)[0] = :fmblk AS same_page FROM fm WHERE id = 4;
+ id | k | same_page 
+----+---+-----------
+  4 | 4 | t
+(1 row)
+
+SELECT live_items, deleted_items, stub_items FROM iheap_relation_stats('fm');
+ live_items | deleted_items | stub_items 
+------------+---------------+------------
+        100 |             2 |          1
+(1 row)
+
+SELECT * FROM iheap_check('fm');
+ blkno | offnum | msg 
+-------+--------+-----
+(0 rows)
+
+-- without a snapshot holding them, the bodies a statement leaves on a full
+-- page are its own: rows it moves off the page keep theirs there
+COMMIT PREPARED 'hold_fm';
+VACUUM fm;
+BEGIN;
+UPDATE fm SET k = k + 1000 WHERE id BETWEEN 5 AND 30;
+SELECT pg_current_xact_id()::xid AS bulkxid \gset
+COMMIT;
+SELECT count(*) AS moves, count(*) FILTER (WHERE len > 50) AS with_body
+FROM undo_records('fm') WHERE type = 'MOVE' AND xid = :'bulkxid';
+ moves | with_body 
+-------+-----------
+    26 |         0
+(1 row)
+
+SELECT count(*), sum(k) FROM fm;
+ count |  sum  
+-------+-------
+   100 | 31038
+(1 row)
+
+SELECT * FROM iheap_check('fm');
+ blkno | offnum | msg 
+-------+--------+-----
+(0 rows)
+
+DROP TABLE mv, wi, wh, fm, holder;
 DROP PROCEDURE wal_round(regclass);
 DROP FUNCTION undo_records(regclass);
 DROP FUNCTION wal_sizes(pg_lsn, text);

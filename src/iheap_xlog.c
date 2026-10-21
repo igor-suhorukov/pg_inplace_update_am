@@ -356,12 +356,18 @@ redo_apply_change(Page page, OffsetNumber off, const char *change,
 	ih_hdr_read(tup, &old);
 	iheap_walchange_get(change, &old, &h, lpage, xid);
 	ih_hdr_write(tup, &h);
-	if ((old.infomask & IHT_COMPACT) && !(h.infomask & IHT_COMPACT))
+	if ((old.infomask & IHT_COMPACT) && !(h.infomask & (IHT_COMPACT | IHT_STUB)))
+		elog(PANIC, "iheap redo: compact header grows outside a stub");
+	if ((h.infomask & IHT_STUB) && !(old.infomask & IHT_STUB))
 	{
-		/* a compact tuple deleted or moved: a stub, its body in undo */
-		if (!(h.infomask & IHT_STUB) || ItemIdGetLength(lp) < IHEAP_TUPHDR_SIZE)
-			elog(PANIC, "iheap redo: compact header grows outside a stub");
+		/*
+		 * A row deleted or moved with its body in undo (a compact header, or
+		 * a move off a page whose bodies a snapshot holds, §21 D45): a stub
+		 */
+		if (ItemIdGetLength(lp) < IHEAP_TUPHDR_SIZE)
+			elog(PANIC, "iheap redo: stub longer than its item");
 		ItemIdSetNormal(lp, ItemIdGetOffset(lp), IHEAP_TUPHDR_SIZE);
+		iheap_page_note_room(page, h.xid);
 	}
 }
 
@@ -1049,6 +1055,7 @@ iheap_mask(char *pagedata, BlockNumber blkno)
 		bool		covered[BLCKSZ];
 
 		IHeapPageGetOpaque(page)->ihp_flags &= ~IHP_PRUNABLE;
+		IHeapPageGetOpaque(page)->ihp_room_xid = MASK_MARKER;
 		memset(covered, 0, sizeof(covered));
 		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
 		{

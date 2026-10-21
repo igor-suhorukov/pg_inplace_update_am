@@ -48,7 +48,14 @@ typedef struct IHeapPageOpaqueData
 {
 	uint16		ihp_type;		/* IHEAP_PAGE_* */
 	uint16		ihp_flags;		/* IHP_* (data pages) or IHU_* (undo pages) */
-	uint32		ihp_reserved;
+
+	/*
+	 * Data pages, a hint like pd_prune_xid: the newest writer whose stub
+	 * keeps its storage reserved until that writer ends (a deletion or a
+	 * move whose body went to undo, §21 D43, D45).  Pruning gives the room
+	 * back once it has, without waiting for the horizon.
+	 */
+	TransactionId ihp_room_xid;
 } IHeapPageOpaqueData;
 
 typedef IHeapPageOpaqueData *IHeapPageOpaque;
@@ -866,6 +873,9 @@ extern bool iheap_page_prune(Relation rel, Buffer buffer, bool force,
 extern bool iheap_page_prune_opt(Relation rel, Buffer buffer);
 extern bool iheap_page_prune_grow(Relation rel, Buffer buffer,
 								  OffsetNumber off, uint32 len);
+extern bool iheap_page_prune_waits(Relation rel, Page page);
+extern bool iheap_page_bodies_held(Relation rel, Page page);
+extern void iheap_page_note_room(Page page, TransactionId xid);
 extern void iheap_page_compact(Relation rel, Page page,
 							   const uint32 *reserve);
 extern void iheap_compute_reservations(Relation rel, Page page,

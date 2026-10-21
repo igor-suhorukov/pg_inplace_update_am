@@ -94,10 +94,39 @@ UPDATE tc SET v = v + 1 WHERE id % 19 = 0;
 DELETE FROM tc WHERE id % 23 = 0;
 });
 
+# rows moving off full pages while a prepared transaction holds the horizon
+# (§21 D45): once a page's bodies wait for a committed mover, the next rows
+# to leave it take their bodies to undo and leave stubs at once, whose room
+# the page gets back by compaction when the moves commit; moves to other
+# pages write no LOCK record.  Some of them roll back.
+$primary->safe_psql('postgres', q{
+CREATE TABLE tv (id int PRIMARY KEY, k int, s text) USING iheap;
+CREATE INDEX tv_k ON tv USING btree (k);
+INSERT INTO tv SELECT g, g, repeat('v', 100) FROM generate_series(1, 2000) g;
+BEGIN;
+INSERT INTO tv VALUES (0, 0, 'held');
+PREPARE TRANSACTION 'held_tv';
+});
+for my $i (1 .. 20)
+{
+	$primary->safe_psql('postgres',
+		"UPDATE tv SET k = k + 10000 WHERE id % 20 = $i % 20");
+}
+$primary->safe_psql('postgres', q{
+BEGIN;
+UPDATE tv SET k = -k WHERE id % 7 = 0;
+DELETE FROM tv WHERE id % 11 = 0;
+ROLLBACK;
+VACUUM tv;
+COMMIT PREPARED 'held_tv';
+VACUUM tv;
+UPDATE tv SET k = k + 1 WHERE id % 3 = 0;
+});
+
 $primary->wait_for_catchup($standby);
 
 # the structure checks, on both sides (the standby replays every page)
-for my $t (qw(ti tf tt tu tc))
+for my $t (qw(ti tf tt tu tc tv))
 {
 	is(iheap_verify($primary, $t), '', "structure checks of $t on the primary");
 	is(iheap_verify($standby, $t), '', "structure checks of $t on the standby");
@@ -113,6 +142,11 @@ is($standby->safe_psql('postgres', 'SELECT count(*), sum(v) FROM tf'),
 is($standby->safe_psql('postgres', 'SELECT count(*), sum(k), sum(v) FROM tc'),
 	$primary->safe_psql('postgres', 'SELECT count(*), sum(k), sum(v) FROM tc'),
 	'table with compact headers replicated');
+is($standby->safe_psql('postgres', q{
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SELECT count(*), sum(k) FROM tv WHERE k > -1000000}),
+	$primary->safe_psql('postgres', 'SELECT count(*), sum(k) FROM tv'),
+	'rows moved off full pages under a held horizon replicated');
 is($standby->safe_psql('postgres', q{
 SET enable_seqscan = off; SET enable_bitmapscan = off;
 SELECT count(*) FROM ti WHERE k > -1000000}),

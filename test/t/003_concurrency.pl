@@ -223,7 +223,83 @@ WHERE (SELECT count(*) FROM codes c2 WHERE c2.code = c.code) <> 1}),
 $node->safe_psql('postgres', 'VACUUM codes');
 is($node->safe_psql('postgres', 'SELECT tids, marked FROM dmbtree_index_stats(\'codes_code\')'),
 	'100|0', 'marked entries cleaned up');
-for my $t (qw(acct hist codes))
+
+# rows moving to other pages while a snapshot is held (§21 D45): a writer
+# keeps the old page locked while it locks the new one, a later page as the
+# block order allows, an earlier one only if its lock is free at once.  The
+# free space VACUUM leaves all over the table sends rows to pages before and
+# after their own; rows leaving pages whose bodies the snapshot holds take
+# their bodies to undo.  A deadlock among buffer locks would hang the run:
+# the alarm fails the test instead.
+$node->safe_psql('postgres', q{
+CREATE TABLE mvt (id int PRIMARY KEY, k int, v int, pad text) USING iheap;
+CREATE INDEX mvt_k ON mvt USING btree (k);
+INSERT INTO mvt SELECT g, g, 100, repeat('t', 100) FROM generate_series(1, 3000) g;
+UPDATE mvt SET pad = 't' WHERE id % 3 = 0;
+VACUUM mvt;
+CREATE FUNCTION check_mvt() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE s bigint; c bigint;
+BEGIN
+  SELECT sum(v), count(*) INTO s, c FROM mvt;
+  IF s <> 300000 OR c <> 3000 THEN
+    RAISE EXCEPTION 'inconsistent snapshot: sum %, count %', s, c;
+  END IF;
+END $$;
+});
+my $old = $node->background_psql('postgres');
+$old->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+my $before = $old->query_safe('SELECT count(*), sum(v), sum(k) FROM mvt');
+{
+	local $SIG{ALRM} = sub { die "moves under a held snapshot hang: a deadlock?\n" };
+	alarm(3 * $PostgreSQL::Test::Utils::timeout_default);
+	$node->pgbench(
+		'--no-vacuum --client=8 --jobs=4 --transactions=400 --max-tries=100',
+		0,
+		[qr{processed: 3200/3200}],
+		[qr{^$}],
+		'moves to pages before and after, a snapshot held',
+		{
+			'017_move_pair' => q{
+\set a random(1, 3000)
+\set b random(1, 3000)
+BEGIN;
+UPDATE mvt SET k = k + 3000, v = v - 1 WHERE id = :a;
+UPDATE mvt SET k = k + 3000, v = v + 1 WHERE id = :b;
+COMMIT;
+},
+			'018_grow_move' => q{
+\set a random(1, 3000)
+\set n random(1, 200)
+UPDATE mvt SET k = -k, pad = repeat('g', :n) WHERE id = :a;
+},
+			'019_abort' => q{
+\set a random(1, 3000)
+BEGIN;
+UPDATE mvt SET k = k + 100000, v = v + 1000 WHERE id = :a;
+ROLLBACK;
+},
+			'020_check' => q{
+SELECT check_mvt();
+},
+			'021_verify' => q{
+SELECT iheap_verify_strict('mvt');
+}
+		});
+	alarm(0);
+}
+is($old->query_safe('SELECT count(*), sum(v), sum(k) FROM mvt'), $before,
+	'the held snapshot still sees the rows before the moves');
+$old->query_safe('COMMIT');
+$old->quit;
+is($node->safe_psql('postgres', 'SELECT count(*), sum(v) FROM mvt'),
+	'3000|300000', 'moves under a held snapshot keep the sum');
+is($node->safe_psql('postgres', q{
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SELECT count(*) FROM mvt WHERE k > -100000000}), '3000',
+	'the moved rows found through their index');
+$node->safe_psql('postgres', 'VACUUM mvt');
+
+for my $t (qw(acct hist codes mvt))
 {
 	is(iheap_verify($node, $t), '', "structure checks of $t after the workloads");
 }

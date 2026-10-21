@@ -9,12 +9,16 @@
  *	- A deleted or moved row keeps its body on the page until every
  *	  snapshot sees the deletion, as heap's does: old snapshots read it there.
  *	  Then it shrinks to a 16-byte stub, and the prune record carries the
- *	  deleter as conflict horizon for standbys.  (A deletion of a row with a
- *	  compact header stubs it at once, its body in undo; its storage stays
- *	  reserved until the deletion commits.)  Once the stub is frozen it
+ *	  deleter as conflict horizon for standbys.  Once the stub is frozen it
  *	  becomes LP_DEAD (no storage) until index vacuum frees the line pointer.
  *	  Until the horizon passes, pd_prune_xid holds what a prune waits for,
  *	  and writers looking for room do not prune before (as heap).
+ *	- A row with a compact header that is deleted or moved, and a row that
+ *	  moves off a page whose bodies a snapshot holds (§21 D45), becomes
+ *	  a stub at once, its body in undo.  Its storage stays reserved until
+ *	  the writer ends; ihp_room_xid names the newest such writer, and once
+ *	  it has ended, writers looking for room compact the page without
+ *	  waiting for the horizon.
  *	- Compaction needs only an exclusive content lock: readers never touch
  *	  page memory without holding the content lock (§21 D11).
  *
@@ -29,6 +33,7 @@
 #include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/procarray.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -225,14 +230,16 @@ iheap_page_place_item_ext(Page page, OffsetNumber off, const char *tuple,
 /*
  * Reservation needed by one item: the largest old length among the
  * uncommitted in-place updates in its chain, and the length of a version
- * an uncommitted deletion or move put in undo (one with a compact header,
- * whose item became a stub at once), 0 if none.  Rollback of those changes
- * restores the old, longer tuple at the item's location.
+ * an uncommitted deletion or move put in undo (a compact row's, or one
+ * that moved off a page whose bodies a snapshot holds, whose item became a
+ * stub at once), 0 if none.  Rollback of those changes restores the old,
+ * longer tuple at the item's location.
  */
 uint32
 iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
 {
 	ItemId		lp = PageGetItemId(page, off);
+	char	   *tup;
 	IHeapHdr	h;
 	UndoRecPtr	urp;
 	UndoRecPtr	discard;
@@ -242,11 +249,18 @@ iheap_item_reservation(Relation rel, Page page, OffsetNumber off)
 	if (!ItemIdIsNormal(lp))
 		return 0;
 
-	ih_hdr_read((char *) page + ItemIdGetOffset(lp), &h);
+	tup = (char *) page + ItemIdGetOffset(lp);
+	ih_hdr_read(tup, &h);
 	discard = iheap_discard_ptr(rel);
 	if (h.urec < discard)
 		return 0;
-	if (iheap_xid_status(h.xid, InvalidBuffer, NULL) == IHX_COMMITTED)
+
+	/*
+	 * The tuple's hint first: while a snapshot holds discard back, every
+	 * prune asks this of each item changed since, mostly by writers long
+	 * committed (§21 D45).
+	 */
+	if (iheap_xid_status(h.xid, InvalidBuffer, tup) == IHX_COMMITTED)
 		return 0;
 
 	urp = h.urec;
@@ -436,6 +450,22 @@ compaction_fits(Page page, const bool *gone, const bool *stubbed,
 }
 
 /*
+ * Has the writer that the page's room hint names ended (§21 D45)?  Then
+ * the storage it kept reserved for its stubs can be given back.  A value
+ * that is not a recent xid, left long ago, counts as ended.
+ */
+static bool
+room_writer_ended(Page page)
+{
+	TransactionId xid = IHeapPageGetOpaque(page)->ihp_room_xid;
+
+	if (!TransactionIdIsNormal(xid))
+		return false;
+	return !TransactionIdPrecedes(xid, ReadNextTransactionId()) ||
+		!TransactionIdIsInProgress(xid);
+}
+
+/*
  * Prune a data page held with an exclusive lock: roll back aborted changes,
  * shrink deletions every snapshot sees to stubs, turn frozen deletions into
  * LP_DEAD, and compact.  With grow_off, the item there gets storage for
@@ -463,6 +493,7 @@ prune_page(Relation rel, Buffer buffer, bool force, OffsetNumber *deadoffs,
 	GlobalVisState *vistest;
 	TransactionId conflict = InvalidTransactionId;
 	TransactionId wait_xid = InvalidTransactionId;
+	TransactionId room_xid = InvalidTransactionId;
 
 	if (ndead_out)
 		*ndead_out = 0;
@@ -475,6 +506,13 @@ prune_page(Relation rel, Buffer buffer, bool force, OffsetNumber *deadoffs,
 	/* first, apply undo of aborted transactions */
 	(void) iheap_rollback_page(rel, buffer);
 	iheap_stat_rollback_report(RelationGetRelid(rel), IHEAP_ROLLBACK_LAZY);
+
+	/*
+	 * Stubs whose writer has ended give back the storage kept for them:
+	 * compact, even if nothing else changes (§21 D45).
+	 */
+	if (room_writer_ended(page))
+		force = true;
 
 	discard = iheap_discard_ptr(rel);
 	vistest = GlobalVisTestFor(rel);
@@ -521,10 +559,20 @@ prune_page(Relation rel, Buffer buffer, bool force, OffsetNumber *deadoffs,
 			}
 			else if (h.infomask & IHT_STUB)
 			{
-				/* a compact row's deletion, its body in undo: keep its room */
+				/*
+				 * The body in undo (a compact row's, or one that moved off a
+				 * page whose bodies a snapshot holds, §21 D45): its room
+				 * stays reserved until the writer ends, which the room hint
+				 * then names.
+				 */
 				reserve[off] = iheap_item_reservation(rel, page, off);
 				if (reserve[off] > 0)
+				{
 					nreserve++;
+					if (!TransactionIdIsValid(room_xid) ||
+						TransactionIdFollows(h.xid, room_xid))
+						room_xid = h.xid;
+				}
 				stubs_wait = true;
 			}
 			else if (!TransactionIdIsValid(wait_xid) ||
@@ -574,6 +622,7 @@ prune_page(Relation rel, Buffer buffer, bool force, OffsetNumber *deadoffs,
 	 */
 	if (!TransactionIdIsValid(wait_xid) && stubs_wait)
 		wait_xid = ReadNextTransactionId();
+	IHeapPageGetOpaque(page)->ihp_room_xid = room_xid;
 
 	if (ndead == 0 && nstub == 0 && !force)
 	{
@@ -663,28 +712,69 @@ iheap_page_prune(Relation rel, Buffer buffer, bool force,
 }
 
 /*
- * Prune for a writer that wants room on the page, unless the horizon has
- * not passed what the last prune waited for (pd_prune_xid): pruning would
- * free nothing, and while a long snapshot holds the horizon every write to
- * a full page would walk its items again (§21 D40).  As with heap's hint,
- * the changes of a writer that aborted wait too (writers roll back what
- * they touch, readers pass over it, VACUUM prunes regardless), and a value
- * that is not a recent xid, left long ago, is not trusted.
+ * Does the last prune of the page wait for the horizon to pass one of its
+ * deleters (pd_prune_xid)?  Until then pruning frees no body of a deleted
+ * or moved row there (§21 D40).  As with heap's hint, the changes of a
+ * writer that aborted wait too (writers roll back what they touch, readers
+ * pass over it, VACUUM prunes regardless), and a value that is not a recent
+ * xid, left long ago, is not trusted.
+ */
+bool
+iheap_page_prune_waits(Relation rel, Page page)
+{
+	TransactionId hint = ((PageHeader) page)->pd_prune_xid;
+
+	return TransactionIdIsNormal(hint) &&
+		TransactionIdPrecedes(hint, ReadNextTransactionId()) &&
+		!GlobalVisTestIsRemovableXid(GlobalVisTestFor(rel), hint, true);
+}
+
+/*
+ * Does the prune wait for the horizon to pass a writer that has committed?
+ * Then a snapshot older than that commit holds the page's bodies, and it
+ * would hold the body of a row that moves off the page now as well (§21
+ * D45).  Waiting only for running writers, such as the current transaction
+ * moving row after row, says nothing of the snapshots.
+ */
+bool
+iheap_page_bodies_held(Relation rel, Page page)
+{
+	return iheap_page_prune_waits(rel, page) &&
+		TransactionIdDidCommit(((PageHeader) page)->pd_prune_xid);
+}
+
+/*
+ * Prune for a writer that wants room on the page, unless the prune waits
+ * for the horizon: pruning would free nothing, and while a long snapshot
+ * holds the horizon every write to a full page would walk its items again
+ * (§21 D40).  Stubs whose writer has ended since do not wait: compaction
+ * gives back the storage kept for them (§21 D45).
  */
 bool
 iheap_page_prune_opt(Relation rel, Buffer buffer)
 {
 	Page		page = BufferGetPage(buffer);
-	TransactionId hint = ((PageHeader) page)->pd_prune_xid;
 
 	if (!(IHeapPageGetOpaque(page)->ihp_flags & IHP_PRUNABLE))
 		return false;
-	if (TransactionIdIsNormal(hint) &&
-		TransactionIdPrecedes(hint, ReadNextTransactionId()) &&
-		!GlobalVisTestIsRemovableXid(GlobalVisTestFor(rel), hint, true))
+	if (iheap_page_prune_waits(rel, page) && !room_writer_ended(page))
 		return false;
 	return prune_page(rel, buffer, false, NULL, NULL,
 					  InvalidOffsetNumber, 0, NULL);
+}
+
+/*
+ * A stub's storage stays reserved until xid ends (a deletion or a move
+ * whose body went to undo): the room hint names the newest such writer.
+ */
+void
+iheap_page_note_room(Page page, TransactionId xid)
+{
+	IHeapPageOpaque op = IHeapPageGetOpaque(page);
+
+	if (!TransactionIdIsNormal(op->ihp_room_xid) ||
+		TransactionIdFollows(xid, op->ihp_room_xid))
+		op->ihp_room_xid = xid;
 }
 
 /*
