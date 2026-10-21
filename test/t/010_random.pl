@@ -82,9 +82,12 @@ INSERT INTO $tbl SELECT g, g % 97, 3 * g + g % 3, g, 's' || g, NULL
 $node->safe_psql('postgres', 'SET iheap.compact_headers = always; VACUUM FULL r3');
 
 # (a slot: replay with page images checked lags behind, and crashes make
-# checkpoints)
+# checkpoints.  It reserves WAL at once: after a crash it holds what the
+# last checkpoint saved of it, which is nothing for a slot that reserves
+# when the standby connects, until a checkpoint runs with the standby
+# connected)
 $node->safe_psql('postgres',
-	"SELECT pg_create_physical_replication_slot('standby')");
+	"SELECT pg_create_physical_replication_slot('standby', true)");
 $node->backup('b');
 my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init_from_backup($node, 'b', has_streaming => 1);
