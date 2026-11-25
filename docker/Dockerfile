@@ -17,7 +17,22 @@
 
 ARG DEBIAN_IMAGE=debian:trixie-slim
 
-FROM ${DEBIAN_IMAGE} AS pgbuild
+# apt over https: plain http to the Debian mirrors can stall for apt's whole
+# timeout.  The base image has no CA certificates, so ca-certificates alone
+# is fetched without checking the mirror's certificate; apt still checks the
+# signed InRelease files and every package's hash, and those are what
+# protect the packages.  All later apt runs check the certificate.
+FROM ${DEBIAN_IMAGE} AS base
+RUN set -eu; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    sed -i 's|^URIs: http://|URIs: https://|' /etc/apt/sources.list.d/debian.sources; \
+    grep -q '^URIs: https://' /etc/apt/sources.list.d/debian.sources; \
+    apt-get -o Acquire::https::Verify-Peer=false update; \
+    apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends \
+        ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+
+FROM base AS pgbuild
 ARG PG_REPO=https://github.com/postgres/postgres.git
 ARG PG_COMMIT=d68601258e652a3cb034f3f218a63779456ec5f7
 ARG PG_BUILD=debug
@@ -56,7 +71,7 @@ RUN set -eu; \
     if [ "$PG_BUILD" = debug ]; then make -s -C src/test/modules/injection_points install; fi; \
     make -s -C src/test/regress all
 
-FROM ${DEBIAN_IMAGE} AS dev
+FROM base AS dev
 ARG DEV_UID=1000
 ARG PG_BUILD=debug
 

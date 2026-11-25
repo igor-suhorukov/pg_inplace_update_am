@@ -1,8 +1,11 @@
 # Build the extension against PostgreSQL 19rc1 as packaged in the official
 # Docker image, and run its test suites there.  The server headers and the
 # test tools come from the PGDG repository the image is set up with, pinned
-# to the image's own server version.  test/run.sh builds and tests as the
-# postgres user, since initdb refuses to run as root; that user owns the
+# to the image's own server version.  apt uses https, as in docker/Dockerfile:
+# the image has no CA certificates, so ca-certificates alone is fetched
+# without checking the mirror's certificate (apt still checks the signed
+# InRelease files and the packages' hashes).  test/run.sh builds and tests
+# as the postgres user, since initdb refuses to run as root; that user owns the
 # directories the extension installs into.  The suites that need injection
 # points skip themselves: the packaged server is built without them.
 name: build
@@ -28,7 +31,14 @@ jobs:
     steps:
       - name: Install build and test dependencies
         run: |
-          apt-get update
+          sed -i 's|^URIs: http://|URIs: https://|' /etc/apt/sources.list.d/debian.sources
+          sed -i 's|http://apt\.postgresql\.org|https://apt.postgresql.org|' \
+            /etc/apt/sources.list.d/pgdg.list
+          grep -q 'https://apt\.postgresql\.org' /etc/apt/sources.list.d/pgdg.list
+          grep -q '^URIs: https://' /etc/apt/sources.list.d/debian.sources
+          apt-get -o Acquire::https::Verify-Peer=false update
+          apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends \
+            ca-certificates
           apt-get install -y --no-install-recommends \
             build-essential "postgresql-server-dev-$PG_MAJOR=$PG_VERSION" \
             libipc-run-perl python3
