@@ -20,7 +20,6 @@ regress/arrays             order
 regress/case               order
 regress/constraints        order
 regress/copy2              order
-regress/foreign_key        order
 regress/generated_stored   order
 regress/identity           order
 regress/inherit            order
@@ -41,7 +40,6 @@ regress/partition_aggregate plan
 regress/partition_join     plan
 regress/predicate          plan
 regress/select_views       plan, order
-regress/subselect          plan
 regress/updatable_views    plan, order
 
 # --- regress: other
@@ -52,6 +50,7 @@ regress/combocid           layout (TIDs); no combo command ids: cmin comes from 
 regress/create_am          pg_am lists iheap
 regress/amutils            lists the properties of every index AM: dmbtree's too
 regress/create_index       pg_depend lists each table's dependency on access method iheap (it is not pinned); plan
+regress/foreign_key        order; an in-place update of a referencing row leaves no old version at its TID, so the OLD row trigger.c refetches is the new one, inserted by the current transaction as far as RI_FKey_fk_upd_check_required() can tell: the FK check fires although the key is unchanged, and the keys are never compared through the cast function (no "permission denied for function fk_acl_enum_to_int4")
 regress/insert             largest row is 7660 bytes (heap: 8160); relation sizes include the metapage and undo extent
 regress/namespace          CLUSTER copies in index order without a sort, so the index expression is evaluated fewer times
 regress/portals            order: cursors see rows in physical order, updated rows keep their place
@@ -69,7 +68,7 @@ regress/tidscan            layout
 regress/triggers           order: per-row trigger notices; the self-referencing DELETE meets the parent first and no longer fails with "already modified"
 regress/tuplesort          layout: ORDER BY ctid
 regress/update             order; RETURNING xmax after ON CONFLICT DO UPDATE is 0 (heap's own test calls its nonzero value "probably not good")
-regress/vacuum             layout: truncation leaves the metapage
+regress/vacuum             layout: truncation leaves the metapage; reltuples: no on-access VM setting, so VACUUM scans every page and counts the rows where heap's estimate stays unknown (-1), and after growth the old density is reltuples over relpages, which count the metapage and undo pages, so the skipped pages' rows come out short (7476 of 8000)
 
 # --- isolation
 isolation/eval-plan-qual   layout: rows start at block 1, steps updating WHERE ctid = '(0,1)' find nothing

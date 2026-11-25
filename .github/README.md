@@ -59,7 +59,7 @@ UPDATE accounts SET branch = 2 WHERE id = 1;              -- in place too
 ## Building and testing
 
 Builds and tests run only in Docker containers; nothing is compiled on the
-host. The image builds PostgreSQL 19 from a pinned `REL_19_STABLE` commit.
+host. The image builds PostgreSQL 19.0 from source (tag `REL_19_0`).
 
 ```
 scripts/docker.sh image            # debug image (assertions, injection points)
@@ -80,7 +80,7 @@ The suites:
 Results go to `out/`.
 
 On every push and pull request, GitHub Actions builds the extension with
-`-Werror` against the official `postgres:19rc1-trixie` image, then runs the
+`-Werror` against the official `postgres:19.0-trixie` image, then runs the
 regression, isolation and TAP suites and the model check there
 (`.github/workflows/build.yml`). The tests that need injection points skip
 themselves, because the packaged server is built without them.

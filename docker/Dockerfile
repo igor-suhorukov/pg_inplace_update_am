@@ -3,11 +3,11 @@
 # pg_inplace_update_am development image.
 #
 # Everything is built and tested inside containers; nothing is compiled or
-# installed on the host.  This image builds PostgreSQL 19 from source at a
-# pinned REL_19_STABLE commit and carries the toolchain needed to build the
+# installed on the host.  This image builds PostgreSQL 19 from source at the
+# 19.0 release (tag REL_19_0) and carries the toolchain needed to build the
 # extension through PGXS and run its regression, isolation and TAP tests.
 #
-#   PG_COMMIT   REL_19_STABLE commit to build (default: the pinned one)
+#   PG_COMMIT   commit to build (default: REL_19_0's)
 #   PG_BUILD    debug   --enable-cassert --enable-debug --enable-injection-points,
 #                       -O1; used by every test run
 #               release -O2, no assertions; used by benchmarks only
@@ -34,7 +34,8 @@ RUN set -eu; \
 
 FROM base AS pgbuild
 ARG PG_REPO=https://github.com/postgres/postgres.git
-ARG PG_COMMIT=d68601258e652a3cb034f3f218a63779456ec5f7
+# REL_19_0, "Stamp 19.0."
+ARG PG_COMMIT=5c839a2a08b9b87a349be97371fac6c5a2873b10
 ARG PG_BUILD=debug
 
 RUN set -eu; \

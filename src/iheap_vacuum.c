@@ -387,6 +387,7 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	int			nskip;
 	int			nextskip = 0;
 	BlockNumber vm_skipped = 0;
+	BlockNumber norows = 1;		/* the metapage, undo, other non-data pages */
 	bool		skip_all_visible =
 		(params->options & VACOPT_DISABLE_PAGE_SKIPPING) == 0;
 
@@ -473,7 +474,10 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 				nextskip++;
 			if (nextskip < nskip && blk >= skip[nextskip].ie_pstart)
 			{
-				blk = skip[nextskip].ie_pstart + skip[nextskip].ie_npages - 1;
+				BlockNumber end = skip[nextskip].ie_pstart + skip[nextskip].ie_npages;
+
+				norows += Min(end, nblocks) - blk;
+				blk = end - 1;
 				continue;
 			}
 
@@ -495,6 +499,7 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 			page = BufferGetPage(buf);
 			if (!IHeapPageIsData(page))
 			{
+				norows++;
 				UnlockReleaseBuffer(buf);
 				continue;
 			}
@@ -600,10 +605,14 @@ iheap_vacuum_rel(Relation rel, const VacuumParams *params,
 	if (params->truncate != VACOPTVALUE_DISABLED)
 		truncate_tail(rel, RelationGetNumberOfBlocks(rel));
 
-	/* rows on skipped pages: estimated from the old density, as heap does */
+	/*
+	 * Rows on skipped pages: estimated from the old density, as heap does.
+	 * Pages that cannot hold rows are left out of the sample, as heap leaves
+	 * out its new pages.
+	 */
 	if (vm_skipped > 0)
 		live_tuples = vac_estimate_reltuples(rel, nblocks, nblocks - vm_skipped,
-											 live_tuples);
+											 norows, live_tuples);
 
 	/* 6. relfrozenxid: oldest xid that live undo may make us look up */
 	frozenxid = iheap_oldest_live_xid(rel, cutoffs.OldestXmin);

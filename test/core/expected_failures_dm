@@ -25,6 +25,7 @@
 #             the index's family)
 
 # --- regress: only in core-dm
+regress/alter_column_type  name (pg_get_indexdef of an expression index)
 regress/cluster            order (updates of the clustering column); name
 regress/collate            name
 regress/compression        name

@@ -1,4 +1,4 @@
-# Build the extension against PostgreSQL 19rc1 as packaged in the official
+# Build the extension against PostgreSQL 19.0 as packaged in the official
 # Docker image, and run its test suites there.  The server headers and the
 # test tools come from the PGDG repository the image is set up with, pinned
 # to the image's own server version.  apt uses https, as in docker/Dockerfile:
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
-      image: postgres:19rc1-trixie
+      image: postgres:19.0-trixie
       # dynamic shared memory for parallel workers, as scripts/docker.sh gives
       options: --shm-size=1g
     env:
